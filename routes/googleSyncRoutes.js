@@ -10,9 +10,13 @@ const router = express.Router();
 router.get('/google-url', (req, res) => {
     const supabaseUrl = process.env.SUPABASE_URL;
     // The redirect_to should point to your ADMIN Frontend Login page
-    // Using 8080 as default for Admin Hub based on vite.config.ts
-    const frontendUrl = process.env.ADMIN_FRONTEND_URL || 'http://localhost:8080';
-    const redirectUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${frontendUrl}/login`;
+    const frontendUrl = process.env.ADMIN_FRONTEND_URL;
+    if (!frontendUrl) {
+        console.error("CRITICAL: ADMIN_FRONTEND_URL is not defined in .env");
+        return res.status(500).json({ error: "Server misconfiguration" });
+    }
+
+    const redirectUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${frontendUrl}`;
 
     res.json({ url: redirectUrl });
 });
@@ -32,12 +36,12 @@ router.post('/sync', async (req, res) => {
             return res.status(401).json({ error: 'Invalid token' });
         }
 
-        // 2. CHECK IF USER ALREADY EXISTS
+        // 2. CHECK IF USER ALREADY EXISTS (By ID or Email)
         const { data: existingUser } = await supabaseAdmin
             .from('users')
             .select('*')
-            .eq('id', user.id)
-            .single();
+            .or(`id.eq.${user.id},email.eq.${user.email}`)
+            .maybeSingle();
 
         // Robust Name Parsing
         const meta = user.user_metadata || {};
@@ -67,9 +71,10 @@ router.post('/sync', async (req, res) => {
                     name: fullName,
                     photos: photoUrl,
                     avatar: photoUrl,
-                    google_id: googleId
+                    google_id: googleId,
+                    role: 'admin' // Force role to admin for this specialized admin-login route
                 })
-                .eq('id', user.id)
+                .eq('id', existingUser.id) // Use the FOUND ID, not user.id
                 .select()
                 .single();
 
