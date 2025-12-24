@@ -64,6 +64,10 @@ router.post('/create', verifyAdmin, async (req, res) => {
             assigned_to,
         } = req.body;
 
+        // Sanitize Dates
+        const cleanStartDate = start_date === "" ? null : start_date;
+        const cleanEndDate = end_date === "" ? null : end_date;
+
         // req.user is populated by verifyAdmin
         const created_by = req.user.id;
 
@@ -109,8 +113,8 @@ router.post('/create', verifyAdmin, async (req, res) => {
                 sport,
                 location,
                 venue,
-                start_date,
-                end_date,
+                start_date: cleanStartDate,
+                end_date: cleanEndDate,
                 start_time,
                 banner_url,
                 payment_qr_image: req.body.payment_qr_image ? await uploadBase64(req.body.payment_qr_image, 'event-assets', 'payment-qrs') : null,
@@ -130,7 +134,8 @@ router.post('/create', verifyAdmin, async (req, res) => {
         // 5. Generate and Upload QR Code
         try {
             const eventId = data.id;
-            const link = `http://localhost:8081/events/${eventId}`;
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:8081';
+            const link = `${frontendUrl}/events/${eventId}`;
             const qrDataUrl = await QRCode.toDataURL(link);
             const qrPublicUrl = await uploadBase64(qrDataUrl, 'event-assets', 'qrcodes');
 
@@ -162,8 +167,8 @@ router.get('/list', async (req, res) => {
 
         let query = supabaseAdmin
             .from('events')
-            .select('*')
-            .order('created_at', { ascending: false });
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, registration_deadline:end_date, sponsors, document_url, document_description, payment_qr_image')
+            .order('start_date', { ascending: true });
 
         // Filter by Creator (Legacy support)
         if (created_by) {
@@ -182,6 +187,9 @@ router.get('/list', async (req, res) => {
         res.json({ success: true, events: data });
     } catch (err) {
         console.error("Fetch Events Error:", err);
+        // LOG DETAIL FOR DEBUGGING
+        if (err.details) console.error("DB Details:", err.details);
+        if (err.hint) console.error("DB Hint:", err.hint);
         res.status(500).json({ message: err.message || "Internal Server Error" });
     }
 });
@@ -193,12 +201,25 @@ router.get('/:id', async (req, res) => {
         // Fetch Event Details
         const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
-            .select('*')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, registration_deadline:end_date, sponsors, document_url, document_description, payment_qr_image')
             .eq('id', id)
             .single();
 
         if (eventError) throw eventError;
         if (!eventData) return res.status(404).json({ success: false, message: "Event not found" });
+
+        // Manual fetch for assigned user due to missing FK
+        if (eventData.assigned_to) {
+            const { data: assignedUser } = await supabaseAdmin
+                .from('users')
+                .select('id, name, email')
+                .eq('id', eventData.assigned_to)
+                .single();
+
+            if (assignedUser) {
+                eventData.assigned_user = assignedUser;
+            }
+        }
 
         // Fetch Event News
         const { data: newsData, error: newsError } = await supabaseAdmin
@@ -265,6 +286,11 @@ router.put('/:id', verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
+
+        // Sanitize Date Fields (Postgres fails on empty strings)
+        ['start_date', 'end_date', 'registration_deadline'].forEach(field => {
+            if (updates[field] === "") updates[field] = null;
+        });
 
         console.log(`Updating event ${id}`);
 

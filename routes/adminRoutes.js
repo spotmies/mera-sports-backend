@@ -10,7 +10,7 @@ router.get("/list-admins", verifyAdmin, async (req, res) => {
     try {
         const { data: admins, error } = await supabaseAdmin
             .from("users")
-            .select("*")
+            .select("id, name, email, role")
             .eq("role", "admin");
 
         if (error) throw error;
@@ -286,16 +286,17 @@ router.post("/transactions/bulk-update", verifyAdmin, async (req, res) => {
 
 // GET /api/admin/registrations
 // Fetch all event registrations
+// Route to get all registrations for an event (with optional category select)
 router.get("/registrations", verifyAdmin, async (req, res) => {
     try {
         const { eventId } = req.query;
         let query = supabaseAdmin
             .from("event_registrations")
             .select(`
-                *,
+                id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events ( id, name, sport, start_date, start_time, location, venue, categories ),
-                users:player_id ( id, first_name, last_name, player_id, email, mobile ),
-                player_teams:team_id ( id, team_name, captain_name, captain_mobile, members )
+                users:player_id ( id, first_name, last_name, player_id, mobile ),
+                player_teams ( id, team_name, captain_name, captain_mobile, members )
             `)
             .order('created_at', { ascending: false });
 
@@ -321,9 +322,9 @@ router.get("/transactions", verifyAdmin, async (req, res) => {
         let query = supabaseAdmin
             .from("event_registrations")
             .select(`
-                *,
+                id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events!inner ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, email, mobile )
+                users:player_id ( id, first_name, last_name, player_id, mobile )
             `)
             .order('created_at', { ascending: false });
 
@@ -648,6 +649,27 @@ router.delete("/brackets/:id", verifyAdmin, async (req, res) => {
     } catch (err) {
         console.error("DELETE BRACKET ERROR:", err);
         res.status(500).json({ message: "Failed to delete bracket" });
+    }
+});
+
+// POST /api/admin/upload
+// Generic upload endpoint
+router.post("/upload", verifyAdmin, async (req, res) => {
+    try {
+        const { image, folder } = req.body; // image = base64 string
+        if (!image) return res.status(400).json({ message: "No image data provided" });
+
+        const targetFolder = folder || 'misc';
+        const url = await uploadBase64(image, 'admin-assets', targetFolder);
+
+        if (url) {
+            res.json({ success: true, url });
+        } else {
+            res.status(400).json({ message: "Upload failed or invalid image format" });
+        }
+    } catch (err) {
+        console.error("UPLOAD ENDPOINT ERROR:", err);
+        res.status(500).json({ message: "Server error during upload" });
     }
 });
 

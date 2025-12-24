@@ -1,6 +1,5 @@
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken";
-import { supabaseAdmin } from "../config/supabaseClient.js";
 
 dotenv.config();
 
@@ -19,31 +18,24 @@ export const verifyAdmin = async (req, res, next) => {
 
         const token = authHeader.split(" ")[1];
 
-        // A. Verify with Supabase Auth
-        const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+        // VERIFY BACKEND JWT (Not Supabase Session)
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-        if (error || !user) {
-            return res.status(401).json({ error: "Invalid admin token" });
-        }
-
-        // B. Check Role in Public Users Table
-        // We use 'id' from auth.users which should match public.users.id
-        const { data: profile } = await supabaseAdmin
-            .from("users")
-            .select("role")
-            .eq("id", user.id)
-            .single();
-
-        if (!profile || (profile.role !== 'admin' && profile.role !== 'superadmin')) {
+        // Check Role
+        if (decoded.role !== 'admin' && decoded.role !== 'superadmin') {
             return res.status(403).json({ error: "Access denied: Admins only" });
         }
 
-        // Attach role to req.user for use in routes
-        req.user = { ...user, role: profile.role };
+        // Attach user info to request
+        req.user = decoded;
         next();
+
     } catch (err) {
         console.error("ADMIN AUTH ERROR:", err.message);
-        return res.status(500).json({ error: "Internal Server Error" });
+        if (err.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: "Token expired" });
+        }
+        return res.status(401).json({ error: "Invalid admin token" });
     }
 };
 

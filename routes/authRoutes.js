@@ -332,4 +332,99 @@ router.post("/login", async (req, res) => {
     }
 });
 
+/* ================= LOGIN ADMIN ================= */
+router.post("/login-admin", async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({ message: "Missing credentials" });
+        }
+
+        // 1. Find User by Email
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .select("*")
+            .eq("email", email)
+            .single();
+
+        if (error || !user) {
+            return res.status(401).json({ message: "Invalid credentials" });
+        }
+
+        // 2. Role Check: Must be Admin or Superadmin
+        if (user.role !== 'admin' && user.role !== 'superadmin') {
+            return res.status(403).json({
+                message: "Access Denied. This login is for Administrators only."
+            });
+        }
+
+        // 3. Compare Password (PLAINTEXT as per current pattern)
+        if (user.password !== password) {
+            return res.status(401).json({ message: "Invalid credentials" });
+        }
+
+        // 4. Generate Token
+        const token = jwt.sign(
+            { id: user.id, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: "12h" } // 12 hour session for admins
+        );
+
+        res.json({
+            success: true,
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                avatar: user.photos
+            },
+        });
+    } catch (err) {
+        console.error("ADMIN LOGIN ERROR:", err);
+        res.status(500).json({ message: "Server error during login" });
+    }
+});
+
+/* ================= GET CURRENT USER (SESSION RESTORE) ================= */
+router.get("/me", async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return res.status(401).json({ message: "No token provided" });
+
+        const token = authHeader.split(" ")[1];
+        if (!token) return res.status(401).json({ message: "No token provided" });
+
+        // Verify Token
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        // Fetch User
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .select("id, name, email, role, photos")
+            .eq("id", decoded.id)
+            .single();
+
+        if (error || !user) return res.status(404).json({ message: "User not found" });
+
+        res.json({
+            success: true,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                avatar: user.photos
+            }
+        });
+
+    } catch (err) {
+        console.error("SESSION RESTORE ERROR:", err.message);
+        console.error("Received Token:", req.headers.authorization); // LOGGING
+        res.status(401).json({ message: "Invalid or expired token" });
+    }
+});
+
 export default router;
