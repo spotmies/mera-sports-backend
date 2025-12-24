@@ -1,4 +1,5 @@
-import crypto from "crypto"; // Added for UUID generation
+import axios from "axios";
+import crypto from "crypto";
 import express from "express";
 import jwt from "jsonwebtoken";
 // import bcrypt from "bcrypt"; // REMOVED per user request
@@ -54,6 +55,61 @@ async function uploadImageToSupabase(base64Data) {
     }
 }
 
+/* ================= OTP ROUTES (2FACTOR) ================= */
+router.post("/send-otp", async (req, res) => {
+    try {
+        const { mobile } = req.body;
+        if (!mobile) return res.status(400).json({ message: "Mobile number is required" });
+
+        const apiKey = process.env.TWO_FACTOR_API_KEY;
+        if (!apiKey) {
+            console.error("Missing TWO_FACTOR_API_KEY in env");
+            return res.status(500).json({ message: "Server configuration error" });
+        }
+
+        // Generate 6-digit OTP manually to enforce SMS channel (AUTOGEN sometimes defaults to voice)
+        const otp = Math.floor(100000 + Math.random() * 900000);
+
+        // Use the manual OTP endpoint: .../SMS/{mobile}/{otp}
+        // This sends the specific OTP via SMS and returns a session ID for verification
+        const url = `https://2factor.in/API/V1/${apiKey}/SMS/${mobile}/${otp}`;
+        console.log(`Sending Manual OTP ${otp} to ${mobile}`);
+
+        const response = await axios.get(url);
+
+        if (response.data && response.data.Status === "Success") {
+            res.json({ success: true, sessionId: response.data.Details });
+        } else {
+            console.error("2Factor API Error:", response.data);
+            res.status(400).json({ success: false, message: "Failed to send OTP" });
+        }
+    } catch (err) {
+        console.error("SEND OTP ERROR:", err.message);
+        res.status(500).json({ success: false, message: "Failed to send OTP" });
+    }
+});
+
+router.post("/verify-otp", async (req, res) => {
+    try {
+        const { sessionId, otp } = req.body;
+        if (!sessionId || !otp) return res.status(400).json({ message: "Session ID and OTP are required" });
+
+        const apiKey = process.env.TWO_FACTOR_API_KEY;
+        const url = `https://2factor.in/API/V1/${apiKey}/SMS/VERIFY/${sessionId}/${otp}`;
+
+        const response = await axios.get(url);
+
+        if (response.data && response.data.Status === "Success") {
+            res.json({ success: true, message: "OTP Verified Successfully" });
+        } else {
+            res.status(400).json({ success: false, message: "Invalid OTP" });
+        }
+    } catch (err) {
+        console.error("VERIFY OTP ERROR:", err.message);
+        res.status(400).json({ success: false, message: "Invalid OTP or Session Expired" });
+    }
+});
+
 /* ================= REGISTER PLAYER ================= */
 router.post("/register-player", async (req, res) => {
     try {
@@ -70,7 +126,8 @@ router.post("/register-player", async (req, res) => {
             country,
             aadhaar,
             schoolDetails,
-            photos
+            photos,
+            isVerified
         } = req.body;
 
         if (!firstName || !lastName || !mobile || !dob) {
@@ -146,7 +203,8 @@ router.post("/register-player", async (req, res) => {
                 photos: photoUrl,
                 password: password, // PLAINTEXT
                 role: 'player',
-                verification: 'pending' // Explicitly set status
+                role: 'player',
+                verification: isVerified ? 'verified' : 'pending' // Set based on OTP status
             })
             .select()
             .single();

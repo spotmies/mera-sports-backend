@@ -33,7 +33,39 @@ router.get("/dashboard", verifyPlayer, async (req, res) => {
             player.schoolDetails = schoolDetails;
         }
 
-        res.json({ success: true, player });
+        // Fetch Event Registrations with Details
+        // Fetch Event Registrations
+        const { data: registrations, error: regError } = await supabaseAdmin
+            .from("event_registrations")
+            .select(`*, events ( id, name, sport, start_date, location )`)
+            .eq("player_id", userId)
+            .order('created_at', { ascending: false });
+
+        if (regError) {
+            console.error("Error fetching registrations:", regError);
+        }
+
+        // Fetch Transactions (Manual Merge to avoid FK issues)
+        const { data: transactions, error: txError } = await supabaseAdmin
+            .from("transactions")
+            .select("*")
+            .eq("user_id", userId);
+
+        // Merge Data
+        const detailedRegistrations = (registrations || []).map(reg => {
+            // Try matching by transaction_id first, then fallback to event_id
+            const txn = (transactions || []).find(t =>
+                (reg.transaction_id && t.id === reg.transaction_id) ||
+                (t.event_id === reg.event_id)
+            );
+            return {
+                ...reg,
+                transactions: txn || null
+            };
+        });
+
+        res.json({ success: true, player, registrations: detailedRegistrations });
+
     } catch (err) {
         console.error("DASHBOARD ERROR:", err);
         res.status(500).json({ message: "Failed to load dashboard" });
@@ -131,6 +163,84 @@ router.put("/change-password", verifyPlayer, async (req, res) => {
     } catch (err) {
         console.error("PASSWORD UPDATE ERROR:", err);
         res.status(500).json({ message: "Failed to update password" });
+    }
+});
+
+// --------------------------------------------------------------------------
+// DELETE ACCOUNT
+// Used by: Player App -> Delete Account
+// --------------------------------------------------------------------------
+router.delete("/delete-account", verifyPlayer, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        console.log(`⚠️ User ${userId} requested account deletion`);
+
+        // 1. Delete School Details
+        const { error: schoolError } = await supabaseAdmin
+            .from("player_school_details")
+            .delete()
+            .eq("player_id", userId);
+
+        if (schoolError) {
+            console.error("Error deleting school details:", schoolError);
+            return res.status(500).json({ message: "Failed to clean up profile data" });
+        }
+
+        // 2. Delete Transactions (Must be done before registrations or independent?)
+        // Actually, logic is: Registrations might point to Transactions.
+        // If we delete registrations first, transactions are safe to delete.
+        // Let's delete Registrations first as per previous plan.
+
+        // 2a. Delete Event Registrations
+        const { error: regError } = await supabaseAdmin
+            .from("event_registrations")
+            .delete()
+            .eq("player_id", userId);
+
+        if (regError) {
+            console.error("Error deleting registrations:", regError);
+            return res.status(500).json({ message: "Failed to delete event registrations" });
+        }
+
+        // 2b. Delete Transactions
+        const { error: txError } = await supabaseAdmin
+            .from("transactions")
+            .delete()
+            .eq("user_id", userId);
+
+        if (txError) {
+            console.error("Error deleting transactions:", txError);
+            return res.status(500).json({ message: "Failed to delete transactions" });
+        }
+
+        // 2c. Delete Teams (where user is captain)
+        const { error: teamError } = await supabaseAdmin
+            .from("player_teams")
+            .delete()
+            .eq("captain_id", userId);
+
+        if (teamError) {
+            console.error("Error deleting teams:", teamError);
+            return res.status(500).json({ message: "Failed to delete created teams" });
+        }
+
+        // 3. Delete User Record
+        const { error: userError } = await supabaseAdmin
+            .from("users")
+            .delete()
+            .eq("id", userId);
+
+        if (userError) {
+            console.error("Error deleting user:", userError);
+            return res.status(500).json({ message: "Failed to delete user account" });
+        }
+
+        console.log(`✅ User ${userId} deleted successfully`);
+        res.json({ success: true, message: "Account deleted permanently" });
+
+    } catch (err) {
+        console.error("DELETE ACCOUNT ERROR:", err);
+        res.status(500).json({ message: "Failed to delete account" });
     }
 });
 

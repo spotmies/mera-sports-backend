@@ -61,6 +61,7 @@ router.post('/create', verifyAdmin, async (req, res) => {
             document_description,
             sponsors,
             categories,
+            assigned_to,
         } = req.body;
 
         // req.user is populated by verifyAdmin
@@ -112,11 +113,13 @@ router.post('/create', verifyAdmin, async (req, res) => {
                 end_date,
                 start_time,
                 banner_url,
+                payment_qr_image: req.body.payment_qr_image ? await uploadBase64(req.body.payment_qr_image, 'event-assets', 'payment-qrs') : null,
                 document_url: uploadedDocUrl,
                 document_description,
                 sponsors: processedSponsors,
                 categories,
                 created_by, // Secured ID
+                assigned_to,
                 status: 'upcoming'
             })
             .select()
@@ -155,15 +158,21 @@ router.post('/create', verifyAdmin, async (req, res) => {
 /* ================= FETCH ALL EVENTS (PUBLIC) ================= */
 router.get('/list', async (req, res) => {
     try {
-        const { created_by } = req.query;
+        const { created_by, admin_id } = req.query;
 
         let query = supabaseAdmin
             .from('events')
             .select('*')
             .order('created_at', { ascending: false });
 
+        // Filter by Creator (Legacy support)
         if (created_by) {
             query = query.eq('created_by', created_by);
+        }
+
+        // Filter by Admin ID (Created BY OR Assigned TO)
+        if (admin_id) {
+            query = query.or(`created_by.eq.${admin_id},assigned_to.eq.${admin_id}`);
         }
 
         const { data, error } = await query;
@@ -181,18 +190,52 @@ router.get('/list', async (req, res) => {
 router.get('/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { data, error } = await supabaseAdmin
+        // Fetch Event Details
+        const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
             .select('*')
             .eq('id', id)
             .single();
 
-        if (error) throw error;
-        if (!data) return res.status(404).json({ success: false, message: "Event not found" });
+        if (eventError) throw eventError;
+        if (!eventData) return res.status(404).json({ success: false, message: "Event not found" });
 
-        res.json({ success: true, event: data });
+        // Fetch Event News
+        const { data: newsData, error: newsError } = await supabaseAdmin
+            .from('event_news')
+            .select('*')
+            .eq('event_id', id)
+            .order('created_at', { ascending: false });
+
+        // Attach news to event object (even if empty or error, don't fail the whole request)
+        if (newsData) {
+            eventData.news = newsData;
+        } else {
+            eventData.news = [];
+        }
+
+        res.json({ success: true, event: eventData });
     } catch (err) {
         console.error("Fetch Event Error:", err);
+        res.status(500).json({ message: err.message || "Internal Server Error" });
+    }
+});
+
+/* ================= FETCH EVENT BRACKETS (PUBLIC) ================= */
+router.get('/:id/brackets', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { data, error } = await supabaseAdmin
+            .from('event_brackets')
+            .select('*')
+            .eq('event_id', id)
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+
+        res.json({ success: true, brackets: data || [] });
+    } catch (err) {
+        console.error("Fetch Brackets Error:", err);
         res.status(500).json({ message: err.message || "Internal Server Error" });
     }
 });
@@ -229,7 +272,17 @@ router.put('/:id', verifyAdmin, async (req, res) => {
         if (updates.banner_image) {
             const bannerUrl = await uploadBase64(updates.banner_image, 'event-assets', 'banners');
             updates.banner_url = bannerUrl;
+            updates.banner_url = bannerUrl;
             delete updates.banner_image;
+        }
+
+        // 1b. Handle Payment QR Image
+        if (updates.payment_qr_image && updates.payment_qr_image.startsWith('data:')) {
+            const qrUrl = await uploadBase64(updates.payment_qr_image, 'event-assets', 'payment-qrs');
+            updates.payment_qr_image = qrUrl;
+        } else if (updates.payment_qr_image === null) {
+            // Explicit removal if user cleared it?
+            // updates.payment_qr_image = null; 
         }
 
         // 2. Handle Document (PDF)

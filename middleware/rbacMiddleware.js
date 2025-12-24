@@ -34,11 +34,12 @@ export const verifyAdmin = async (req, res, next) => {
             .eq("id", user.id)
             .single();
 
-        if (!profile || profile.role !== 'admin') {
+        if (!profile || (profile.role !== 'admin' && profile.role !== 'superadmin')) {
             return res.status(403).json({ error: "Access denied: Admins only" });
         }
 
-        req.user = user; // Attach Supabase user object
+        // Attach role to req.user for use in routes
+        req.user = { ...user, role: profile.role };
         next();
     } catch (err) {
         console.error("ADMIN AUTH ERROR:", err.message);
