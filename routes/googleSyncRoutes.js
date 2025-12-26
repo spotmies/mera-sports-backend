@@ -97,7 +97,7 @@ router.post('/sync', async (req, res) => {
                 avatar: photoUrl,
                 google_id: googleId,
                 role: 'admin',
-                verification: 'verified', // Admins are auto-verified via Google
+                verification: 'pending', // Pending SuperAdmin approval as per new policy
 
                 // ROBUST DUMMY DATA STRATEGY
                 mobile: `9${Date.now().toString().slice(-9)}`,

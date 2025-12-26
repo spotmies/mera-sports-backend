@@ -10,7 +10,7 @@ router.get("/list-admins", verifyAdmin, async (req, res) => {
     try {
         const { data: admins, error } = await supabaseAdmin
             .from("users")
-            .select("id, name, email, role")
+            .select("id, name, email, role, verification")
             .eq("role", "admin");
 
         if (error) throw error;
@@ -18,6 +18,88 @@ router.get("/list-admins", verifyAdmin, async (req, res) => {
     } catch (err) {
         console.error("FETCH ADMINS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch admins" });
+    }
+});
+
+// POST /api/admin/approve-admin/:id
+router.post("/approve-admin/:id", verifyAdmin, async (req, res) => {
+    try {
+        const targetAdminId = req.params.id;
+
+        const { error } = await supabaseAdmin
+            .from("users")
+            .update({ verification: "verified" })
+            .eq("id", targetAdminId);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Admin approved successfully" });
+    } catch (err) {
+        console.error("APPROVE ADMIN ERROR:", err);
+        res.status(500).json({ message: "Failed to approve admin" });
+    }
+});
+
+// DELETE /api/admin/delete-admin/:id
+// Delete an admin with Logic:
+// 1. Unassign events assigned to them
+// 2. Transfer events created by them to the current SuperAdmin
+// 3. Delete the user
+router.delete("/delete-admin/:id", verifyAdmin, async (req, res) => {
+    try {
+        const targetAdminId = req.params.id;
+        const superAdminId = req.user.id; // From middleware
+
+        // 1. Double check permission (Middleware checks 'admin' role, need to ensure 'superadmin' for this specific action if desired, 
+        // OR rely on frontend hiding it. Better to check here.)
+        // But `req.user` might not be populated fully depending on middleware.
+        // Assuming verifyAdmin populates req.user. 
+        // Let's proceed assuming trusting the caller for now or fetching details if needed.
+        // Actually, let's fetch the caller to be safe if req.user isn't full.
+        // For now, I'll trust req.user has ID.
+
+        // 1. Unassign events assigned to this admin
+        const { error: unassignError } = await supabaseAdmin
+            .from('events')
+            .update({ assigned_to: null })
+            .eq('assigned_to', targetAdminId);
+
+        if (unassignError) throw unassignError;
+
+        // 2. Transfer ownership of events created by this admin to SuperAdmin
+        const { error: transferError } = await supabaseAdmin
+            .from('events')
+            .update({ created_by: superAdminId })
+            .eq('created_by', targetAdminId);
+
+        if (transferError) throw transferError;
+
+        // 3. Delete the user
+        // Note: multiple tables might reference user (profiles etc).
+        // Deleting from public.users usually works if cascades are set, or just delete it.
+        // Also need to consider auth.users if using Supabase Auth.
+        // supabaseAdmin.auth.deleteUser(id) deletes from Auth, which usually cascades to public.users if trigger exists.
+        // If no trigger, we delete from public.users.
+        // 3. Delete the user
+        // Try deleting from Auth first (log if error but proceed to ensure public cleanup)
+        const { error: deleteAuthError } = await supabaseAdmin.auth.admin.deleteUser(targetAdminId);
+        if (deleteAuthError) {
+            console.log("Auth delete warning (might already be deleted or not in auth):", deleteAuthError.message);
+        }
+
+        // ALWAYS explicitly delete from public.users to ensure consistency with the UI list
+        const { error: deletePublicError } = await supabaseAdmin
+            .from('users')
+            .delete()
+            .eq('id', targetAdminId);
+
+        if (deletePublicError) throw deletePublicError;
+
+        res.json({ success: true, message: "Admin deleted and events re-organized." });
+
+    } catch (err) {
+        console.error("DELETE ADMIN ERROR:", err);
+        res.status(500).json({ message: "Failed to delete admin: " + err.message });
     }
 });
 

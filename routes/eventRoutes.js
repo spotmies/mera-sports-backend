@@ -167,7 +167,7 @@ router.get('/list', async (req, res) => {
 
         let query = supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, registration_deadline:end_date, sponsors, document_url, document_description, payment_qr_image')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image')
             .order('start_date', { ascending: true });
 
         // Filter by Creator (Legacy support)
@@ -201,7 +201,7 @@ router.get('/:id', async (req, res) => {
         // Fetch Event Details
         const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, registration_deadline:end_date, sponsors, document_url, document_description, payment_qr_image')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image')
             .eq('id', id)
             .single();
 
@@ -234,6 +234,29 @@ router.get('/:id', async (req, res) => {
         } else {
             eventData.news = [];
         }
+
+        // Fetch Registration Counts (Verified only, or Verified + Approved?)
+        // User asked for "successful registrations". Usually "verified".
+        const { data: regStats, error: regStatsError } = await supabaseAdmin
+            .from("event_registrations")
+            .select("categories")
+            .eq("event_id", id)
+            .eq("status", "verified");
+
+        const registrationCounts = {};
+        if (regStats) {
+            regStats.forEach(reg => {
+                if (Array.isArray(reg.categories)) {
+                    reg.categories.forEach(cat => {
+                        registrationCounts[cat] = (registrationCounts[cat] || 0) + 1;
+                    });
+                } else if (typeof reg.categories === 'string') {
+                    // Handle case where it might be a single string
+                    registrationCounts[reg.categories] = (registrationCounts[reg.categories] || 0) + 1;
+                }
+            });
+        }
+        eventData.registration_counts = registrationCounts;
 
         res.json({ success: true, event: eventData });
     } catch (err) {
