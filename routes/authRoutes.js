@@ -127,7 +127,8 @@ router.post("/register-player", async (req, res) => {
             aadhaar,
             schoolDetails,
             photos,
-            isVerified
+            isVerified,
+            gender // Added Gender field
         } = req.body;
 
         if (!firstName || !lastName || !mobile || !dob) {
@@ -203,8 +204,8 @@ router.post("/register-player", async (req, res) => {
                 photos: photoUrl,
                 password: password, // PLAINTEXT
                 role: 'player',
-                role: 'player',
-                verification: isVerified ? 'verified' : 'pending' // Set based on OTP status
+                verification: isVerified ? 'verified' : 'pending', // Set based on OTP status
+                gender: gender || null // Save gender
             })
             .select()
             .single();
@@ -332,6 +333,52 @@ router.post("/login", async (req, res) => {
     }
 });
 
+/* ================= REGISTER ADMIN ================= */
+router.post("/register-admin", async (req, res) => {
+    try {
+        const { name, email, mobile, password } = req.body;
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: "Missing required fields" });
+        }
+
+        // 1. Check Existing
+        const { data: existing } = await supabaseAdmin
+            .from("users")
+            .select("id")
+            .eq("email", email)
+            .maybeSingle();
+
+        if (existing) {
+            return res.status(400).json({ message: "Admin with this email already exists." });
+        }
+
+        // 2. Insert User (Pending Approval)
+        const newUserId = crypto.randomUUID();
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .insert({
+                id: newUserId,
+                name,
+                email,
+                mobile,
+                password, // Plaintext
+                role: 'admin',
+                verification: 'pending' // Pending SuperAdmin approval
+            })
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Registration successful. Please wait for Super Admin approval." });
+
+    } catch (err) {
+        console.error("ADMIN REGISTER ERROR:", err);
+        res.status(500).json({ message: "Registration failed: " + err.message });
+    }
+});
+
 /* ================= LOGIN ADMIN ================= */
 router.post("/login-admin", async (req, res) => {
     try {
@@ -364,7 +411,10 @@ router.post("/login-admin", async (req, res) => {
             return res.status(401).json({ message: "Invalid credentials" });
         }
 
-        // 4. Generate Token
+        // 4. Approval Check - REMOVED to allow "Pending Page" access
+        // logic moved to frontend AdminLayout
+
+        // 5. Generate Token
         const token = jwt.sign(
             { id: user.id, role: user.role },
             process.env.JWT_SECRET,
@@ -375,11 +425,9 @@ router.post("/login-admin", async (req, res) => {
             success: true,
             token,
             user: {
-                id: user.id,
-                name: user.name,
-                email: user.email,
                 role: user.role,
-                avatar: user.photos
+                avatar: user.photos,
+                verification: user.verification // Added verification
             },
         });
     } catch (err) {
@@ -403,7 +451,7 @@ router.get("/me", async (req, res) => {
         // Fetch User
         const { data: user, error } = await supabaseAdmin
             .from("users")
-            .select("id, name, email, role, photos")
+            .select("id, name, email, role, photos, verification")
             .eq("id", decoded.id)
             .single();
 
@@ -416,7 +464,8 @@ router.get("/me", async (req, res) => {
                 name: user.name,
                 email: user.email,
                 role: user.role,
-                avatar: user.photos
+                avatar: user.photos,
+                verification: user.verification
             }
         });
 

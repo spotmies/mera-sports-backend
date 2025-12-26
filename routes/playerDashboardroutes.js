@@ -5,6 +5,55 @@ import { verifyPlayer } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
 
+/* ================= HELPER: UPLOAD BASE64 TO SUPABASE ================= */
+async function uploadImageToSupabase(base64Data) {
+    try {
+        if (!base64Data || typeof base64Data !== 'string') {
+            return null;
+        }
+
+        // If it's already a URL, return it
+        if (base64Data.startsWith('http')) {
+            return base64Data;
+        }
+
+        const matches = base64Data.match(/^data:image\/([a-zA-Z]+);base64,(.+)$/);
+        if (!matches || matches.length !== 3) {
+            console.log("❌ UploadImage: Regex match failed.");
+            return null;
+        }
+
+        const extension = matches[1] === 'jpeg' ? 'jpg' : matches[1];
+        const rawBase64 = matches[2];
+        const buffer = Buffer.from(rawBase64, 'base64');
+        const filename = `user_${Date.now()}_${Math.floor(Math.random() * 10000)}.${extension}`;
+
+        const { data, error: uploadError } = await supabaseAdmin
+            .storage
+            .from('player-photos')
+            .upload(filename, buffer, {
+                contentType: `image/${extension}`,
+                upsert: true
+            });
+
+        if (uploadError) {
+            console.error("❌ UploadImage: Supabase Upload Error:", uploadError);
+            throw uploadError;
+        }
+
+        const { data: urlData } = supabaseAdmin
+            .storage
+            .from('player-photos')
+            .getPublicUrl(filename);
+
+        return urlData.publicUrl;
+
+    } catch (error) {
+        console.error("❌ UPLOAD EXCEPTION:", error.message);
+        return null;
+    }
+}
+
 // --------------------------------------------------------------------------
 // GET PLAYER PROFILE
 // Used by: Player App -> Dashboard
@@ -87,8 +136,21 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             city,
             state,
             pincode,
-            country
+            country,
+            photos
         } = req.body;
+
+        // Handle Photo Upload
+        let finalPhotoUrl = photos;
+        if (photos && photos.startsWith('data:image')) {
+            console.log("📸 Detected Base64 Image. Uploading to Supabase...");
+            const uploadedUrl = await uploadImageToSupabase(photos);
+            if (uploadedUrl) {
+                finalPhotoUrl = uploadedUrl;
+            } else {
+                console.warn("⚠️ Failed to upload image, keeping existing or null.");
+            }
+        }
 
         const { data: updatedPlayer, error } = await supabaseAdmin
             .from("users")
@@ -100,7 +162,8 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
                 city,
                 state,
                 pincode,
-                country
+                country,
+                photos: finalPhotoUrl // Updated photo URL
             })
             .eq("id", userId)
             .select()
