@@ -40,6 +40,25 @@ router.post("/approve-admin/:id", verifyAdmin, async (req, res) => {
     }
 });
 
+// POST /api/admin/reject-admin/:id
+router.post("/reject-admin/:id", verifyAdmin, async (req, res) => {
+    try {
+        const targetAdminId = req.params.id;
+
+        const { error } = await supabaseAdmin
+            .from("users")
+            .update({ verification: "rejected" })
+            .eq("id", targetAdminId);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Admin application rejected" });
+    } catch (err) {
+        console.error("REJECT ADMIN ERROR:", err);
+        res.status(500).json({ message: "Failed to reject admin" });
+    }
+});
+
 // DELETE /api/admin/delete-admin/:id
 // Delete an admin with Logic:
 // 1. Unassign events assigned to them
@@ -376,7 +395,7 @@ router.get("/registrations", verifyAdmin, async (req, res) => {
             .from("event_registrations")
             .select(`
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
-                events ( id, name, sport, start_date, start_time, location, venue, categories ),
+                events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
                 users:player_id ( id, first_name, last_name, player_id, mobile ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
             `)
@@ -754,5 +773,95 @@ router.post("/upload", verifyAdmin, async (req, res) => {
         res.status(500).json({ message: "Server error during upload" });
     }
 });
+
+// ================= TRANSACTIONS =================
+
+// GET /api/admin/transactions
+// Fetch all transactions (event_registrations)
+router.get("/transactions", verifyAdmin, async (req, res) => {
+    try {
+        const { admin_id } = req.query;
+
+        let query = supabaseAdmin
+            .from("event_registrations")
+            .select(`
+                *,
+                users:user_id ( id, first_name, last_name, email, mobile, player_id ),
+                events:event_id ( id, name )
+            `)
+            .order("created_at", { ascending: false });
+
+        // Filter for specific admin's events logic if needed
+        // For now, returning all for SuperAdmin, or filtered if admin_id passed
+        // (Logic to filter by admin assigned events would be complex here without joining events table properly)
+
+        const { data, error } = await query;
+
+        if (error) throw error;
+        res.json({ success: true, transactions: data });
+    } catch (err) {
+        console.error("FETCH TRANSACTIONS ERROR:", err);
+        res.status(500).json({ message: "Failed to fetch transactions" });
+    }
+});
+
+// PUT /api/admin/transactions/:id/verify
+router.put("/transactions/:id/verify", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { error } = await supabaseAdmin
+            .from("event_registrations")
+            .update({ status: "verified" })
+            .eq("id", id);
+
+        if (error) throw error;
+        res.json({ success: true, message: "Transaction verified" });
+    } catch (err) {
+        console.error("VERIFY TXN ERROR:", err);
+        res.status(500).json({ message: "Failed to verify transaction" });
+    }
+});
+
+// PUT /api/admin/transactions/:id/reject
+router.put("/transactions/:id/reject", verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { error } = await supabaseAdmin
+            .from("event_registrations")
+            .update({ status: "rejected" })
+            .eq("id", id);
+
+        if (error) throw error;
+        res.json({ success: true, message: "Transaction rejected" });
+    } catch (err) {
+        console.error("REJECT TXN ERROR:", err);
+        res.status(500).json({ message: "Failed to reject transaction" });
+    }
+});
+
+// POST /api/admin/transactions/bulk-update
+router.post("/transactions/bulk-update", verifyAdmin, async (req, res) => {
+    try {
+        const { ids, status } = req.body;
+        if (!ids || !Array.isArray(ids) || !status) {
+            return res.status(400).json({ message: "Invalid request" });
+        }
+
+        const { data, error } = await supabaseAdmin
+            .from("event_registrations")
+            .update({ status })
+            .in("id", ids)
+            .select();
+
+        if (error) throw error;
+        res.json({ success: true, message: "Bulk update successful" });
+    } catch (err) {
+        console.error("BULK UPDATE ERROR:", err);
+        res.status(500).json({ message: "Failed to update transactions" });
+    }
+});
+
+
+// ================= END TRANSACTIONS =================
 
 export default router;

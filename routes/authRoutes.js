@@ -7,6 +7,135 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 
 const router = express.Router();
 
+// --------------------------------------------------------------------------
+/* ================= SECURITY VERIFICATION (PROFILE UPDATE / PASSWORD CHANGE) ================= */
+// --------------------------------------------------------------------------
+
+router.post("/send-verification-otp", async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return res.status(401).json({ message: "No token provided" });
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const userId = decoded.id;
+
+        const { method } = req.body; // 'email' or 'mobile'
+
+        // Fetch User to get current Mobile/Email (SECURITY: Use stored values, not input)
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .select("email, mobile")
+            .eq("id", userId)
+            .single();
+
+        if (error || !user) return res.status(404).json({ message: "User not found" });
+
+        if (method === 'mobile') {
+            // EXISTING MOBILE LOGIC (2Factor)
+            if (!user.mobile) return res.status(400).json({ message: "No mobile number registered" });
+
+            const apiKey = process.env.TWO_FACTOR_API_KEY;
+            const otp = Math.floor(100000 + Math.random() * 900000);
+            const url = `https://2factor.in/API/V1/${apiKey}/SMS/${user.mobile}/${otp}`;
+
+            console.log(`Sending Mobile Verification OTP to ${user.mobile}`);
+            const response = await axios.get(url);
+            if (response.data && response.data.Status === "Success") {
+                res.json({ success: true, method: 'mobile', sessionId: response.data.Details });
+            } else {
+                console.error("2Factor Error:", response.data);
+                throw new Error("Failed to send SMS OTP");
+            }
+
+        } else if (method === 'email') {
+            // SUPABASE EMAIL LOGIC
+            if (!user.email) return res.status(400).json({ message: "No email registered" });
+
+            console.log(`Sending Email Verification OTP to ${user.email} via Supabase `);
+            // Use Supabase Auth for Email OTP
+            const { error: otpError } = await supabaseAdmin.auth.signInWithOtp({
+                email: user.email,
+                // options: { shouldCreateUser: false } // REMOVED: Allow "Shadow" user creation for OTP delivery
+            });
+
+            if (otpError) {
+                console.error("Supabase Auth Error:", otpError);
+                throw otpError;
+            }
+
+            res.json({ success: true, method: 'email' });
+        } else {
+            res.status(400).json({ message: "Invalid verification method" });
+        }
+
+    } catch (err) {
+        console.error("SEND VERIFICATION OTP ERROR:", err.message);
+        res.status(500).json({ message: "Failed to send verification OTP" });
+    }
+});
+
+router.post("/verify-verification-otp", async (req, res) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader) return res.status(401).json({ message: "No token provided" });
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const userId = decoded.id;
+
+        const { method, otp, sessionId } = req.body;
+
+        const { data: user } = await supabaseAdmin
+            .from("users")
+            .select("email")
+            .eq("id", userId)
+            .single();
+
+        let verified = false;
+
+        if (method === 'mobile') {
+            if (!sessionId || !otp) return res.status(400).json({ message: "Missing OTP details" });
+            const apiKey = process.env.TWO_FACTOR_API_KEY;
+            const url = `https://2factor.in/API/V1/${apiKey}/SMS/VERIFY/${sessionId}/${otp}`;
+
+            const response = await axios.get(url);
+            if (response.data && response.data.Status === "Success") {
+                verified = true;
+            }
+        } else if (method === 'email') {
+            if (!otp) return res.status(400).json({ message: "Missing OTP" });
+
+            // Verify with Supabase Auth
+            const { data: verifyData, error: verifyError } = await supabaseAdmin.auth.verifyOtp({
+                email: user.email,
+                token: otp,
+                type: 'magiclink'
+            });
+
+            if (!verifyError && verifyData.session) {
+                verified = true;
+            } else {
+                console.error("Supabase Verify Error:", verifyError);
+            }
+        }
+
+        if (verified) {
+            // Generate SHORT-LIVED Verification Token (5 Minutes)
+            const verificationToken = jwt.sign(
+                { id: userId, type: 'verification' },
+                process.env.JWT_SECRET,
+                { expiresIn: "5m" }
+            );
+            res.json({ success: true, verificationToken });
+        } else {
+            res.status(400).json({ message: "Invalid OTP" });
+        }
+
+    } catch (err) {
+        console.error("VERIFY VERIFICATION OTP ERROR:", err);
+        res.status(500).json({ message: "Verification failed" });
+    }
+});
+
 /* ================= HELPER: UPLOAD BASE64 TO SUPABASE ================= */
 async function uploadImageToSupabase(base64Data) {
     try {
@@ -110,6 +239,42 @@ router.post("/verify-otp", async (req, res) => {
     }
 });
 
+/* ================= CHECK CONFLICT (PRE-OTP) ================= */
+router.post("/check-conflict", async (req, res) => {
+    try {
+        const { mobile, email, aadhaar } = req.body;
+        if (!mobile || !email) {
+            return res.status(400).json({ message: "Mobile and Email are required for check." });
+        }
+
+        let query = supabaseAdmin
+            .from("users")
+            .select("id")
+            .or(`mobile.eq.${mobile},email.eq.${email}`);
+
+        if (aadhaar) {
+            query = supabaseAdmin
+                .from("users")
+                .select("id")
+                .or(`mobile.eq.${mobile},email.eq.${email},aadhaar.eq.${aadhaar}`);
+        }
+
+        const { data: existing, error } = await query.maybeSingle();
+
+        if (error) throw error;
+
+        if (existing) {
+            return res.json({ conflict: true, message: "User with this Mobile, Email, or Aadhaar already exists." });
+        }
+
+        res.json({ conflict: false });
+
+    } catch (err) {
+        console.error("CHECK CONFLICT ERROR:", err);
+        res.status(500).json({ message: "Server error checking conflicts" });
+    }
+});
+
 /* ================= REGISTER PLAYER ================= */
 router.post("/register-player", async (req, res) => {
     try {
@@ -117,6 +282,7 @@ router.post("/register-player", async (req, res) => {
             firstName,
             lastName,
             mobile,
+            email, // Added email
             dob,
             apartment,
             street,
@@ -131,7 +297,7 @@ router.post("/register-player", async (req, res) => {
             gender // Added Gender field
         } = req.body;
 
-        if (!firstName || !lastName || !mobile || !dob) {
+        if (!firstName || !lastName || !mobile || !dob || !email) {
             return res.status(400).json({ message: "Missing required fields" });
         }
 
@@ -153,15 +319,15 @@ router.post("/register-player", async (req, res) => {
         const password = `${day}${month}${year}`;
         // const hashedPassword = await bcrypt.hash(plainPassword, 10); // REMOVED
 
-        // 3. Duplicate Check (Mobile OR Aadhaar)
+        // 3. Duplicate Check (Mobile OR Aadhaar OR Email)
         const { data: existing } = await supabaseAdmin
             .from("users")
             .select("id")
-            .or(`mobile.eq.${mobile},aadhaar.eq.${aadhaar}`)
+            .or(`mobile.eq.${mobile},aadhaar.eq.${aadhaar},email.eq.${email}`)
             .maybeSingle();
 
         if (existing) {
-            return res.status(400).json({ message: "User with this Mobile or Aadhaar already exists." });
+            return res.status(400).json({ message: "User with this Mobile, Email, or Aadhaar already exists." });
         }
 
         // 4. Upload Image
@@ -190,7 +356,7 @@ router.post("/register-player", async (req, res) => {
                 first_name: firstName,
                 last_name: lastName,
                 name: `${firstName} ${lastName}`.trim(),
-                email: `${mobile}@merasports.com`,
+                email, // Use provided email
                 mobile,
                 dob,
                 age,
@@ -214,6 +380,7 @@ router.post("/register-player", async (req, res) => {
 
         console.log("✅ Registration Successful for:", user.email, "| Player ID:", user.player_id);
 
+
         // 7. Insert School Details (optional)
         if (schoolDetails) {
             console.log("Inserting School Details for:", user.id);
@@ -229,12 +396,36 @@ router.post("/register-player", async (req, res) => {
 
             if (schoolError) {
                 console.error("SCHOOL DETAILS ERROR:", schoolError);
-                // We don't throw here to avoid failing the whole registration if school details fail,
-                // but you could change this depending on requirements.
             }
         }
 
-        // 8. Generate Token
+        // 8. Insert Family Members (Optional)
+        const familyMembers = req.body.familyMembers;
+        if (familyMembers && Array.isArray(familyMembers) && familyMembers.length > 0) {
+            console.log("Inserting Family Members for:", user.id);
+            const familyData = familyMembers.map(member => ({
+                user_id: user.id,
+                name: member.name,
+                relation: member.relation || 'Child',
+                // dob: member.dob, // REMOVED: Column does not exist
+                gender: member.gender,
+                // Calculate age from DOB if not provided, or rely on frontend? Better to store DOB primarily.
+                // Assuming schema has age column, we can calculate it or just store DOB.
+                // Schema has 'age' (int) and 'dob' (date). Let's calculate age.
+                age: member.dob ? Math.floor((new Date() - new Date(member.dob)) / 31557600000) : null
+            }));
+
+            const { error: familyError } = await supabaseAdmin
+                .from("family_members")
+                .insert(familyData);
+
+            if (familyError) {
+                console.error("FAMILY MEMBERS INSERT ERROR:", familyError);
+                // Non-critical, so we log but don't fail registration
+            }
+        }
+
+        // 9. Generate Token
         const token = jwt.sign(
             { id: user.id, role: 'player' },
             process.env.JWT_SECRET,
@@ -411,6 +602,22 @@ router.post("/login-admin", async (req, res) => {
             return res.status(401).json({ message: "Invalid credentials" });
         }
 
+        // 4. Verification Check
+        if (user.role === 'admin' && user.verification !== 'verified') {
+            if (user.verification === 'rejected') {
+                return res.status(403).json({
+                    success: false,
+                    code: 'ADMIN_REJECTED',
+                    message: "Your admin application has been rejected."
+                });
+            }
+            return res.status(403).json({
+                success: false,
+                code: 'ADMIN_PENDING',
+                message: "Account pending approval from Super Admin."
+            });
+        }
+
         // 4. Approval Check - REMOVED to allow "Pending Page" access
         // logic moved to frontend AdminLayout
 
@@ -471,8 +678,55 @@ router.get("/me", async (req, res) => {
 
     } catch (err) {
         console.error("SESSION RESTORE ERROR:", err.message);
-        console.error("Received Token:", req.headers.authorization); // LOGGING
         res.status(401).json({ message: "Invalid or expired token" });
+    }
+});
+
+// POST /api/auth/reapply-google-admin
+router.post("/reapply-google-admin", async (req, res) => {
+    const { token } = req.body;
+
+    if (!token) return res.status(400).json({ message: "No token provided" });
+
+    try {
+        // 1. Verify Google Token via Supabase
+        const { data: { user: authUser }, error: authError } = await supabaseAdmin.auth.getUser(token);
+
+        if (authError || !authUser) {
+            return res.status(401).json({ message: "Invalid Google Session" });
+        }
+
+        const email = authUser.email;
+
+        // 2. Find User in DB
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .select("*")
+            .eq("email", email)
+            .single();
+
+        if (error || !user) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        // 3. Check Eligibility (Must be rejected)
+        if (user.verification !== 'rejected') {
+            return res.status(400).json({ message: "Account is not in rejected state." });
+        }
+
+        // 4. Update Status to Pending
+        const { error: updateError } = await supabaseAdmin
+            .from("users")
+            .update({ verification: 'pending' })
+            .eq("id", user.id);
+
+        if (updateError) throw updateError;
+
+        res.json({ success: true, message: "Re-application submitted successfully." });
+
+    } catch (err) {
+        console.error("Re-apply Error:", err);
+        res.status(500).json({ message: "Server error during re-application" });
     }
 });
 

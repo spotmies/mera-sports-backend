@@ -1,5 +1,6 @@
 import express from "express";
 // import bcrypt from "bcrypt"; // REMOVED
+import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { verifyPlayer } from "../middleware/rbacMiddleware.js";
 
@@ -83,37 +84,143 @@ router.get("/dashboard", verifyPlayer, async (req, res) => {
         }
 
         // Fetch Event Registrations with Details
-        // Fetch Event Registrations
-        const { data: registrations, error: regError } = await supabaseAdmin
-            .from("event_registrations")
-            .select(`*, events ( id, name, sport, start_date, location )`)
-            .eq("player_id", userId)
-            .order('created_at', { ascending: false });
+        // Fetch Event Registrations with Details (Individual + Team Based)
 
-        if (regError) {
-            console.error("Error fetching registrations:", regError);
+        // 1. Get User Details needed for matching team members
+        const { data: userDetails } = await supabaseAdmin
+            .from("users")
+            .select("mobile, player_id")
+            .eq("id", userId)
+            .single();
+
+        const userMobile = userDetails?.mobile;
+        const userPlayerId = userDetails?.player_id; // Human readable ID
+
+        console.log("DEBUG DASHBOARD 1: User Identity", { userId, userMobile, userPlayerId });
+
+        // 2. Find IDs of teams where user is Captain OR Member
+        let relevantTeamIds = [];
+
+        // 2a. Teams where Captain
+        const { data: captainTeams } = await supabaseAdmin
+            .from("player_teams")
+            .select("id")
+            .eq("captain_id", userId);
+
+        if (captainTeams) relevantTeamIds.push(...captainTeams.map(t => t.id));
+
+        // 2b. Teams where Member (if mobile or player_id matches in JSONB)
+        if (userMobile) {
+            const { data: memberTeamsMobile } = await supabaseAdmin
+                .from("player_teams")
+                .select("id")
+                .contains("members", [{ mobile: userMobile }]); // Assuming members array has objects with mobile
+            if (memberTeamsMobile) relevantTeamIds.push(...memberTeamsMobile.map(t => t.id));
         }
 
-        // Fetch Transactions (Manual Merge to avoid FK issues)
+        if (userPlayerId) {
+            // FALLBACK: Fetch all teams and filter in JS (to avoid JSON type errors)
+            const { data: allTeams, error: teamsError } = await supabaseAdmin
+                .from("player_teams")
+                .select("id, members");
+
+            if (teamsError) {
+
+            } else if (allTeams) {
+                // Filter in Memory
+                const joinedTeams = allTeams.filter(team => {
+                    const members = team.members;
+                    if (Array.isArray(members)) {
+                        return members.some(m => m.player_id === userPlayerId);
+                    }
+                    return false;
+                });
+
+                if (joinedTeams.length > 0) {
+                    relevantTeamIds.push(...joinedTeams.map(t => t.id));
+                }
+            }
+        }
+        // Deduplicate Team IDs
+        relevantTeamIds = [...new Set(relevantTeamIds)];
+
+        // 3. Fetch Registrations (User's OR User's Teams)
+        let query = supabaseAdmin
+            .from("event_registrations")
+            .select(`*, events ( id, name, sport, start_date, location )`)
+            .order('created_at', { ascending: false });
+
+        if (relevantTeamIds.length > 0) {
+            // OR logic: player_id == userId OR team_id IN relevantTeamIds
+            // Supabase .or() syntax: "player_id.eq.UID,team_id.in.(TID1,TID2)"
+            const teamIdsString = relevantTeamIds.join(',');
+            query = query.or(`player_id.eq.${userId},team_id.in.(${teamIdsString})`);
+        } else {
+            query = query.eq("player_id", userId);
+        }
+
+        const { data: registrations, error: regError } = await query;
+        console.log("🔍 Debug Dashboard Teams:", {
+            userId,
+            userMobile,
+            userPlayerId,
+            relevantTeamIds,
+            regCount: registrations?.length,
+            regError
+        });
+
+        // Fetch Transactions (Manual Merge to avoid FK issues) - Fetch for User AND Teams potentially?
+        // Transactions are usually user-linked. Team exams might be paid by captain. 
+        // If I am a member, I might not see the transaction if I didn't pay. 
+        // But I should see the key 'registered' status.
+        // For now, keep transaction fetch limited to user_id to avoid leaking captain's transaction data to member?
+        // Or fetch if related to the registration?
+        // Let's stick to user_id for transactions for now. Team members just need to see they are registered.
+
         const { data: transactions, error: txError } = await supabaseAdmin
             .from("transactions")
             .select("*")
             .eq("user_id", userId);
 
+        // Fetch Family Members
+        const { data: familyMembers, error: familyError } = await supabaseAdmin
+            .from("family_members")
+            .select("*")
+            .eq("user_id", userId);
+
+        if (familyError) {
+            console.error("Error fetching family members:", familyError);
+        }
+
         // Merge Data
-        const detailedRegistrations = (registrations || []).map(reg => {
+        const detailedRegistrations = await Promise.all((registrations || []).map(async (reg) => {
             // Try matching by transaction_id first, then fallback to event_id
             const txn = (transactions || []).find(t =>
                 (reg.transaction_id && t.id === reg.transaction_id) ||
                 (t.event_id === reg.event_id)
             );
+
+            // Fetch Team Details if team_id exists
+            let teamDetails = null;
+            if (reg.team_id) {
+                const { data: team } = await supabaseAdmin
+                    .from("player_teams")
+                    .select("*")
+                    .eq("id", reg.team_id)
+                    .single();
+                if (team) {
+                    teamDetails = team;
+                }
+            }
+
             return {
                 ...reg,
-                transactions: txn || null
+                transactions: txn || null,
+                team_details: teamDetails // Attach detailed team info
             };
-        });
+        }));
 
-        res.json({ success: true, player, registrations: detailedRegistrations });
+        res.json({ success: true, player, registrations: detailedRegistrations, familyMembers: familyMembers || [] });
 
     } catch (err) {
         console.error("DASHBOARD ERROR:", err);
@@ -122,56 +229,202 @@ router.get("/dashboard", verifyPlayer, async (req, res) => {
 });
 
 // --------------------------------------------------------------------------
-// UPDATE PLAYER PROFILE
-// Used by: Player App -> Edit Profile
+// CHECK CONFLICT (Pre-verification)
 // --------------------------------------------------------------------------
+router.post("/check-conflict", verifyPlayer, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { email, mobile } = req.body;
+
+        if (email) {
+            const { data: conflictEmail } = await supabaseAdmin
+                .from("users")
+                .select("id")
+                .eq("email", email)
+                .neq("id", userId)
+                .maybeSingle(); // Changed to maybeSingle to handle no rows gracefully
+            if (conflictEmail) return res.status(409).json({ conflict: true, field: 'email', message: "Email already taken" });
+        }
+
+        if (mobile) {
+            const { data: conflictMobile } = await supabaseAdmin
+                .from("users")
+                .select("id")
+                .eq("mobile", mobile)
+                .neq("id", userId)
+                .maybeSingle();
+            if (conflictMobile) return res.status(409).json({ conflict: true, field: 'mobile', message: "Mobile already taken" });
+        }
+
+        res.json({ conflict: false });
+    } catch (err) {
+        console.error("CHECK CONFLICT ERROR:", err);
+        res.status(500).json({ message: "Server error" });
+    }
+});
+
+// --------------------------------------------------------------------------
+// CHECK PASSWORD (Pre-verification)
+// --------------------------------------------------------------------------
+router.post("/check-password", verifyPlayer, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { currentPassword } = req.body;
+
+        if (!currentPassword) return res.status(400).json({ message: "Password required" });
+
+        const { data: user } = await supabaseAdmin
+            .from("users")
+            .select("password")
+            .eq("id", userId)
+            .single();
+
+        if (!user || user.password !== currentPassword) {
+            return res.status(401).json({ correct: false, message: "Incorrect password" });
+        }
+
+        res.json({ correct: true });
+    } catch (err) {
+        console.error("CHECK PASSWORD ERROR:", err);
+        res.status(500).json({ message: "Server error" });
+    }
+});
+
+// ... inside route ...
 router.put("/update-profile", verifyPlayer, async (req, res) => {
     try {
         const userId = req.user.id;
+
         const {
-            email, // Added Email
+            email,
             mobile,
+            photos,
             apartment,
             street,
             city,
             state,
             pincode,
-            country,
-            photos
+            country
         } = req.body;
+
+        // --- SECURITY: Require Verification Token if Email or Mobile is changing ---
+        // 1. Fetch current data (ALL fields) to ensure safe UPSERT later
+        const { data: currentUser, error: userError } = await supabaseAdmin
+            .from("users")
+            .select("*")
+            .eq("id", userId)
+            .single();
+
+        if (userError || !currentUser) return res.status(404).json({ message: "User not found" });
+
+        const isSensitiveChange = (email && email.toLowerCase().trim() !== currentUser.email.toLowerCase().trim()) || (mobile && mobile !== currentUser.mobile);
+
+        if (isSensitiveChange) {
+            const verificationToken = req.headers['x-verification-token'];
+            if (!verificationToken) {
+                return res.status(403).json({
+                    message: "Verification required for updating Email or Mobile.",
+                    requiresVerification: true
+                });
+            }
+            try {
+                // Verify the SHORT-LIVED token
+                const decoded = jwt.verify(verificationToken, process.env.JWT_SECRET);
+                if (decoded.id !== userId || decoded.type !== 'verification') {
+                    throw new Error("Invalid token type");
+                }
+            } catch (tokenErr) {
+                return res.status(403).json({ message: "Invalid or expired verification token." });
+            }
+        }
+        // --------------------------------------------------------------------------
+
+        // --- CONFLICT CHECK: Ensure Email/Mobile is unique ---
+        // (Same logic as before)
+        if (email && email.toLowerCase().trim() !== currentUser.email.toLowerCase().trim()) {
+            const { data: conflictEmail } = await supabaseAdmin
+                .from("users")
+                .select("id")
+                .eq("email", email)
+                .neq("id", userId)
+                .maybeSingle();
+
+            if (conflictEmail) return res.status(409).json({ message: "Email is already in use." });
+        }
+
+        if (mobile && mobile !== currentUser.mobile) {
+            const { data: conflictMobile } = await supabaseAdmin
+                .from("users")
+                .select("id")
+                .eq("mobile", mobile)
+                .neq("id", userId)
+                .maybeSingle();
+
+            if (conflictMobile) return res.status(409).json({ message: "Mobile number is already in use." });
+        }
+        // -----------------------------------------------------
 
         // Handle Photo Upload
         let finalPhotoUrl = photos;
         if (photos && photos.startsWith('data:image')) {
-            console.log("📸 Detected Base64 Image. Uploading to Supabase...");
             const uploadedUrl = await uploadImageToSupabase(photos);
-            if (uploadedUrl) {
-                finalPhotoUrl = uploadedUrl;
-            } else {
-                console.warn("⚠️ Failed to upload image, keeping existing or null.");
-            }
+            if (uploadedUrl) finalPhotoUrl = uploadedUrl;
         }
 
+        // --- ORCHESTRATION: Update Supabase Auth if Email Changes ---
+        // REMOVED: Custom Auth architecture does not sync with Supabase Auth users.
+        // OTPs will handle "shadow" user creation if needed.
+        // -------------------------------------------------------------
+
+        // STRICT UPDATE STRATEGY
+        // Only include fields that are actually allowed to be updated.
+        const updatePayload = {
+            email: email || currentUser.email,
+            mobile: mobile || currentUser.mobile,
+            apartment: apartment !== undefined ? apartment : currentUser.apartment,
+            street: street !== undefined ? street : currentUser.street,
+            city: city !== undefined ? city : currentUser.city,
+            state: state !== undefined ? state : currentUser.state,
+            pincode: pincode !== undefined ? pincode : currentUser.pincode,
+            country: country !== undefined ? country : currentUser.country,
+            photos: finalPhotoUrl || currentUser.photos
+        };
+
+        console.log("🛠️ DEBUG: Update Profile Payload:", updatePayload);
+
+        // Check if user exists before update (Debug RLS/Existence)
+        const { data: checkUser, error: checkError } = await supabaseAdmin
+            .from("users")
+            .select("id, email")
+            .eq("id", userId);
+
+        console.log("🔎 Debug Fetch User:", checkUser ? `Found ${checkUser.length}` : "Not Found", checkError || "");
+
+        // Perform Update
         const { data: updatedPlayer, error } = await supabaseAdmin
             .from("users")
-            .update({
-                email, // Added Email
-                mobile,
-                apartment,
-                street,
-                city,
-                state,
-                pincode,
-                country,
-                photos: finalPhotoUrl // Updated photo URL
-            })
+            .update(updatePayload)
             .eq("id", userId)
-            .select()
-            .single();
+            .select();
 
-        if (error) throw error;
+        if (error) {
+            console.error("❌ Update Error Details:", error);
+            throw error;
+        }
 
-        res.json({ success: true, player: updatedPlayer, message: "Profile updated successfully" });
+        console.log("🛠️ DEBUG Update Result:", updatedPlayer ? updatedPlayer.length : "null");
+
+        // If no rows returned, it means either:
+        // 1. User not found (unlikely as we checked)
+        // 2. No fields actually changed (Supabase/Postgres might return empty)
+        // In this case, we return the currentUser merged with updates.
+        let playerObj = (updatedPlayer && updatedPlayer.length > 0) ? updatedPlayer[0] : { ...currentUser, ...updatePayload };
+
+        if (!updatedPlayer || updatedPlayer.length === 0) {
+            console.warn("⚠️ Warning: Update returned 0 rows. This might mean no values changed or RLS/Trigger blocked it.");
+        }
+
+        res.json({ success: true, player: playerObj, message: "Profile updated successfully" });
 
     } catch (err) {
         console.error("UPDATE ERROR:", err);
@@ -191,6 +444,24 @@ router.put("/change-password", verifyPlayer, async (req, res) => {
         if (!currentPassword || !newPassword) {
             return res.status(400).json({ message: "All fields are required" });
         }
+
+        // --- SECURITY: Require Verification Token ALWAYS for Password Change ---
+        const verificationToken = req.headers['x-verification-token'];
+        if (!verificationToken) {
+            return res.status(403).json({
+                message: "Verification required for changing password.",
+                requiresVerification: true
+            });
+        }
+        try {
+            const decoded = jwt.verify(verificationToken, process.env.JWT_SECRET);
+            if (decoded.id !== userId || decoded.type !== 'verification') {
+                throw new Error("Invalid token type");
+            }
+        } catch (tokenErr) {
+            return res.status(403).json({ message: "Invalid or expired verification token." });
+        }
+        // -----------------------------------------------------------------------
 
         // 1. Fetch current password
         const { data: player, error: fetchError } = await supabaseAdmin
@@ -224,7 +495,7 @@ router.put("/change-password", verifyPlayer, async (req, res) => {
         res.json({ success: true, message: "Password updated successfully" });
 
     } catch (err) {
-        console.error("PASSWORD UPDATE ERROR:", err);
+
         res.status(500).json({ message: "Failed to update password" });
     }
 });
@@ -304,6 +575,90 @@ router.delete("/delete-account", verifyPlayer, async (req, res) => {
     } catch (err) {
         console.error("DELETE ACCOUNT ERROR:", err);
         res.status(500).json({ message: "Failed to delete account" });
+    }
+});
+
+// --------------------------------------------------------------------------
+// FAMILY MEMBER MANAGEMENT
+// --------------------------------------------------------------------------
+
+// Add Family Member
+router.post("/add-family-member", verifyPlayer, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { name, relation, age, gender } = req.body;
+
+        if (!name || !relation) {
+            return res.status(400).json({ message: "Name and Relation are required" });
+        }
+
+        const { data, error } = await supabaseAdmin
+            .from("family_members")
+            .insert({
+                user_id: userId,
+                name,
+                relation,
+                age: age ? parseInt(age) : null,
+                gender
+            })
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.json({ success: true, familyMember: data, message: "Family member added" });
+
+    } catch (err) {
+        console.error("ADD FAMILY ERROR:", err);
+        res.status(500).json({ message: "Failed to add family member" });
+    }
+});
+
+// Update Family Member
+router.put("/update-family-member/:id", verifyPlayer, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, relation, age, gender } = req.body;
+
+        const { data, error } = await supabaseAdmin
+            .from("family_members")
+            .update({
+                name,
+                relation,
+                age: age ? parseInt(age) : null,
+                gender
+            })
+            .eq("id", id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.json({ success: true, familyMember: data, message: "Family member updated" });
+
+    } catch (err) {
+        console.error("UPDATE FAMILY ERROR:", err);
+        res.status(500).json({ message: "Failed to update family member" });
+    }
+});
+
+// Delete Family Member
+router.delete("/delete-family-member/:id", verifyPlayer, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const { error } = await supabaseAdmin
+            .from("family_members")
+            .delete()
+            .eq("id", id);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Family member deleted" });
+
+    } catch (err) {
+        console.error("DELETE FAMILY ERROR:", err);
+        res.status(500).json({ message: "Failed to delete family member" });
     }
 });
 

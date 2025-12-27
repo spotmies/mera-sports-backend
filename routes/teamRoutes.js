@@ -24,6 +24,53 @@ router.get('/my-teams', verifyToken, async (req, res) => {
     }
 });
 
+// Lookup Player by ID (for Team Creation)
+router.get('/player-lookup/:playerId', verifyToken, async (req, res) => {
+    try {
+        const { playerId } = req.params;
+
+        // Case-insensitive lookup on player_id
+        const { data: player, error } = await supabaseAdmin
+            .from('users')
+            .select('id, first_name, last_name, dob, mobile, player_id, aadhaar')
+            .ilike('player_id', playerId) // Using ilike for case-insensitivity if needed, or eq
+            .single();
+
+        if (error || !player) {
+            return res.status(404).json({ success: false, message: "Player ID not found" });
+        }
+
+        // Calculate Age from DOB
+        let age = "";
+        if (player.dob) {
+            // Check if DOB is YYYY-MM-DD or DD MMM YYYY. 
+            // supabaseAdmin usually returns standard format if date column.
+            const dobDate = new Date(player.dob);
+            if (!isNaN(dobDate.getTime())) {
+                const diffMs = Date.now() - dobDate.getTime();
+                const ageDt = new Date(diffMs);
+                age = Math.abs(ageDt.getUTCFullYear() - 1970).toString();
+            }
+        }
+
+        res.json({
+            success: true,
+            player: {
+                id: player.id, // Internal UUID
+                player_id: player.player_id, // Display ID
+                name: `${player.first_name} ${player.last_name}`,
+                age: age,
+                mobile: player.mobile,
+                aadhaar: player.aadhaar
+            }
+        });
+
+    } catch (err) {
+        console.error("Player Lookup Error:", err);
+        res.status(500).json({ success: false, message: "Lookup failed" });
+    }
+});
+
 // Create New Team
 router.post('/create', verifyToken, async (req, res) => {
     try {
