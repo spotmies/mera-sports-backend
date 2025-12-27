@@ -47,8 +47,8 @@ router.post("/submit-manual-payment", verifyToken, async (req, res) => {
         const userId = req.user.id;
 
         // 1. Validation
-        if (!eventId || !amount || !categories || !transactionId || !screenshot) {
-            return res.status(400).json({ message: "All fields are required (Event, Amount, Categories, Transaction ID, Screenshot)" });
+        if (!eventId || !amount || !categories || !screenshot) {
+            return res.status(400).json({ message: "All fields are required (Event, Amount, Categories, Screenshot)" });
         }
 
         if (req.user.role === 'admin') {
@@ -87,12 +87,13 @@ router.post("/submit-manual-payment", verifyToken, async (req, res) => {
         }
 
         // 4. Create Registration Record (Pending Verification)
+        const registrationNo = `REG-${Date.now()}`;
         const { error: regError } = await supabaseAdmin
             .from("event_registrations")
             .insert({
                 event_id: eventId,
                 player_id: userId,
-                registration_no: `REG-${Date.now()}`,
+                registration_no: registrationNo,
                 categories: categories,
                 amount_paid: amount,
                 transaction_id: transaction.id, // Linking to the transaction record
@@ -113,7 +114,8 @@ router.post("/submit-manual-payment", verifyToken, async (req, res) => {
         res.json({
             success: true,
             message: "Payment submitted for verification",
-            transactionId: transaction.id
+            transactionId: transaction.id,
+            registrationNo
         });
 
     } catch (err) {

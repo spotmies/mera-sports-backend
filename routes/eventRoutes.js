@@ -61,7 +61,10 @@ router.post('/create', verifyAdmin, async (req, res) => {
             document_description,
             sponsors,
             categories,
-            assigned_to,
+            pincode,
+            state,
+            city,
+            google_map_link,
         } = req.body;
 
         // Sanitize Dates
@@ -113,6 +116,10 @@ router.post('/create', verifyAdmin, async (req, res) => {
                 sport,
                 location,
                 venue,
+                pincode,
+                state,
+                city,
+                google_map_link,
                 start_date: cleanStartDate,
                 end_date: cleanEndDate,
                 start_time,
@@ -167,7 +174,7 @@ router.get('/list', async (req, res) => {
 
         let query = supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city, created_at')
             .order('start_date', { ascending: true });
 
         // Filter by Creator (Legacy support)
@@ -201,7 +208,7 @@ router.get('/:id', async (req, res) => {
         // Fetch Event Details
         const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city')
             .eq('id', id)
             .single();
 
@@ -387,6 +394,43 @@ router.delete('/:id', verifyAdmin, async (req, res) => {
         const { id } = req.params;
         console.log(`Deleting event ${id}`);
 
+        // 1. Delete Event Registrations
+        const { error: regError } = await supabaseAdmin
+            .from('event_registrations')
+            .delete()
+            .eq('event_id', id);
+
+        if (regError) {
+            console.error("Error deleting registrations:", regError);
+            throw regError;
+        }
+
+        // 2. Delete Event News
+        const { error: newsError } = await supabaseAdmin
+            .from('event_news')
+            .delete()
+            .eq('event_id', id);
+
+        if (newsError) {
+            console.error("Error deleting news:", newsError);
+            throw newsError;
+        }
+
+        // 3. Delete Event Brackets
+        const { error: bracketsError } = await supabaseAdmin
+            .from('event_brackets')
+            .delete()
+            .eq('event_id', id);
+
+        if (bracketsError) {
+            console.error("Error deleting brackets:", bracketsError);
+            throw bracketsError;
+        }
+
+        // 4. Delete Event Groups/Draws if exist (generic catch-all for other potential tables?)
+        // For now, focusing on known relations.
+
+        // 5. Finally, Delete the Event
         const { error } = await supabaseAdmin
             .from('events')
             .delete()
@@ -394,7 +438,7 @@ router.delete('/:id', verifyAdmin, async (req, res) => {
 
         if (error) throw error;
 
-        res.json({ success: true, message: "Event deleted successfully" });
+        res.json({ success: true, message: "Event and all related data deleted successfully" });
     } catch (err) {
         console.error("Delete Event Error:", err);
         res.status(500).json({ message: err.message || "Internal Server Error" });

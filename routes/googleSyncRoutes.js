@@ -62,7 +62,15 @@ router.post('/sync', async (req, res) => {
         let finalUser;
 
         if (existingUser) {
-            // UPDATE ONLY GOOGLE FIELDS (Preserve Mobile/DOB)
+            // STRICT SEPARATION: If email belongs to a PLAYER, block Admin access
+            if (existingUser.role === 'player') {
+                return res.status(403).json({
+                    error: "This email is registered as a Player. To access Admin, please use a different email."
+                });
+            }
+
+            // UPDATE ONLY GOOGLE FIELDS (Preserve Mobile/DOB and ROLE)
+            // DO NOT OVERWRITE ROLE TO 'admin'
             const { data: updatedUser, error: updateError } = await supabaseAdmin
                 .from('users')
                 .update({
@@ -71,8 +79,8 @@ router.post('/sync', async (req, res) => {
                     name: fullName,
                     photos: photoUrl,
                     avatar: photoUrl,
-                    google_id: googleId,
-                    role: 'admin' // Force role to admin for this specialized admin-login route
+                    google_id: googleId
+                    // role: 'admin'  <-- REMOVED: Never overwrite role
                 })
                 .eq('id', existingUser.id) // Use the FOUND ID, not user.id
                 .select()
@@ -96,8 +104,8 @@ router.post('/sync', async (req, res) => {
                 photos: photoUrl,
                 avatar: photoUrl,
                 google_id: googleId,
-                role: 'admin',
-                verification: 'pending', // Pending SuperAdmin approval as per new policy
+                role: 'admin', // ONLY set for NEW users
+                verification: 'pending', // Pending SuperAdmin approval
 
                 // ROBUST DUMMY DATA STRATEGY
                 mobile: `9${Date.now().toString().slice(-9)}`,
@@ -129,14 +137,28 @@ router.post('/sync', async (req, res) => {
             finalUser = savedUser;
         }
 
-        // 4. Generate Backend Token (consistent with login-admin)
+        // 4. VERIFICATION CHECK (Block Access if not verified)
+        if (finalUser.role === 'admin' && finalUser.verification !== 'verified') {
+            if (finalUser.verification === 'rejected') {
+                return res.status(403).json({
+                    error: "Your admin application has been rejected.",
+                    code: "ADMIN_REJECTED"
+                });
+            }
+            return res.status(403).json({
+                error: "Account pending approval from Super Admin.",
+                code: "ADMIN_PENDING"
+            });
+        }
+
+        // 5. Generate Backend Token (consistent with login-admin)
         const backendToken = jwt.sign(
             { id: finalUser.id, role: finalUser.role },
             process.env.JWT_SECRET,
             { expiresIn: "12h" }
         );
 
-        // 5. Return the user data AND token to frontend
+        // 6. Return the user data AND token to frontend
         res.json({ success: true, user: finalUser, token: backendToken });
 
     } catch (error) {
