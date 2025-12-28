@@ -96,7 +96,7 @@ router.get("/dashboard", verifyPlayer, async (req, res) => {
         const userMobile = userDetails?.mobile;
         const userPlayerId = userDetails?.player_id; // Human readable ID
 
-        console.log("DEBUG DASHBOARD 1: User Identity", { userId, userMobile, userPlayerId });
+
 
         // 2. Find IDs of teams where user is Captain OR Member
         let relevantTeamIds = [];
@@ -160,14 +160,7 @@ router.get("/dashboard", verifyPlayer, async (req, res) => {
         }
 
         const { data: registrations, error: regError } = await query;
-        console.log("🔍 Debug Dashboard Teams:", {
-            userId,
-            userMobile,
-            userPlayerId,
-            relevantTeamIds,
-            regCount: registrations?.length,
-            regError
-        });
+
 
         // Fetch Transactions (Manual Merge to avoid FK issues) - Fetch for User AND Teams potentially?
         // Transactions are usually user-linked. Team exams might be paid by captain. 
@@ -390,7 +383,7 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             photos: finalPhotoUrl || currentUser.photos
         };
 
-        console.log("🛠️ DEBUG: Update Profile Payload:", updatePayload);
+
 
         // Check if user exists before update (Debug RLS/Existence)
         const { data: checkUser, error: checkError } = await supabaseAdmin
@@ -398,7 +391,7 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             .select("id, email")
             .eq("id", userId);
 
-        console.log("🔎 Debug Fetch User:", checkUser ? `Found ${checkUser.length}` : "Not Found", checkError || "");
+
 
         // Perform Update
         const { data: updatedPlayer, error } = await supabaseAdmin
@@ -412,7 +405,7 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             throw error;
         }
 
-        console.log("🛠️ DEBUG Update Result:", updatedPlayer ? updatedPlayer.length : "null");
+
 
         // If no rows returned, it means either:
         // 1. User not found (unlikely as we checked)
