@@ -107,7 +107,7 @@ router.get("/", async (req, res) => {
         const { data: apartments, error } = await supabaseAdmin
             .from("apartments")
             .select("*")
-            .order('name', { ascending: true });
+            .order('created_at', { ascending: false });
 
         if (error) throw error;
 
@@ -161,6 +161,63 @@ router.post("/", async (req, res) => {
     } catch (error) {
         console.error("ADD APARTMENT ERROR:", error);
         res.status(500).json({ success: false, message: "Failed to add apartment" });
+    }
+});
+
+// PUT update apartment (DB)
+router.put("/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, pincode, locality, zone } = req.body;
+
+        if (!id) {
+            return res.status(400).json({ success: false, message: "Apartment ID is required" });
+        }
+
+        const updateData = {};
+        if (name) updateData.name = name.trim();
+        if (pincode !== undefined) updateData.pincode = pincode;
+        if (locality !== undefined) updateData.locality = locality;
+        if (zone !== undefined) updateData.zone = zone;
+
+        const { data, error } = await supabaseAdmin
+            .from("apartments")
+            .update(updateData)
+            .eq("id", id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Apartment updated successfully", apartment: data });
+
+    } catch (error) {
+        console.error("UPDATE APARTMENT ERROR:", error);
+        res.status(500).json({ success: false, message: "Failed to update apartment" });
+    }
+});
+
+// DELETE apartment (DB)
+router.delete("/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!id) {
+            return res.status(400).json({ success: false, message: "Apartment ID is required" });
+        }
+
+        const { error } = await supabaseAdmin
+            .from("apartments")
+            .delete()
+            .eq("id", id);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Apartment deleted successfully" });
+
+    } catch (error) {
+        console.error("DELETE APARTMENT ERROR:", error);
+        res.status(500).json({ success: false, message: "Failed to delete apartment" });
     }
 });
 

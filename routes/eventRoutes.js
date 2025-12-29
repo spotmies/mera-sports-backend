@@ -65,6 +65,7 @@ router.post('/create', verifyAdmin, async (req, res) => {
             state,
             city,
             google_map_link,
+            assigned_to
         } = req.body;
 
         // Sanitize Dates
@@ -242,17 +243,36 @@ router.get('/:id', async (req, res) => {
             eventData.news = [];
         }
 
-        // Fetch Registration Counts (Verified only, or Verified + Approved?)
-        // User asked for "successful registrations". Usually "verified".
+        // DIAGNOSTIC: Check what is actually in the DB for this ID
+        const { data: allRegs, error: debugError } = await supabaseAdmin
+            .from("event_registrations")
+            .select("id, status")
+            .eq("event_id", id);
+
+        if (allRegs) {
+            const statuses = allRegs.map(r => r.status);
+            const uniqueStatuses = [...new Set(statuses)];
+            console.log(`[DIAGNOSTIC] EventID: ${id} - Total Rows Found (No Filter): ${allRegs.length}`);
+            console.log(`[DIAGNOSTIC] Unique Statuses Found:`, uniqueStatuses);
+        } else {
+            console.log(`[DIAGNOSTIC] EventID: ${id} - Query returned null/error:`, debugError);
+        }
+
+        // Fetch Registration Counts
+        // Include 'registered' as it is the default status for new registrations
         const { data: regStats, error: regStatsError } = await supabaseAdmin
             .from("event_registrations")
-            .select("categories")
+            .select("categories, status") // Select status to debug
             .eq("event_id", id)
-            .eq("status", "verified");
+            .in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending"]);
 
         const registrationCounts = {};
+        let totalRegCount = 0;
         if (regStats) {
+            totalRegCount = regStats.length;
+            console.log("Found registrations:", regStats.length); // Debug
             regStats.forEach(reg => {
+                // ... (processing)
                 if (Array.isArray(reg.categories)) {
                     reg.categories.forEach(cat => {
                         registrationCounts[cat] = (registrationCounts[cat] || 0) + 1;
@@ -263,7 +283,9 @@ router.get('/:id', async (req, res) => {
                 }
             });
         }
+        console.log("Registration Counts Calculated:", registrationCounts); // Debug
         eventData.registration_counts = registrationCounts;
+        eventData.total_registrations_count = totalRegCount;
 
         res.json({ success: true, event: eventData });
     } catch (err) {
