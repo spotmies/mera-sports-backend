@@ -39,11 +39,13 @@ async function uploadBase64(base64Data, bucket, folder = 'misc') {
     }
 }
 
+import { sendRegistrationEmail } from "../utils/mailer.js"; // Import Mailer
+
 /* ================= SUBMIT MANUAL PAYMENT ================= */
 router.post("/submit-manual-payment", verifyToken, async (req, res) => {
     try {
-        const { eventId, amount, categories, transactionId, screenshot, teamId } = req.body;
-        console.log("DEBUG: Submit Payment Payload", { eventId, teamId, amount }); // DEBUG LOG
+        const { eventId, amount, categories, transactionId, screenshot, teamId, document } = req.body;
+        // console.log("DEBUG: Submit Payment Payload", { eventId, teamId, amount }); 
         const userId = req.user.id;
 
         // 1. Validation
@@ -55,27 +57,31 @@ router.post("/submit-manual-payment", verifyToken, async (req, res) => {
             return res.status(403).json({ message: "Admins cannot register for events." });
         }
 
-        // 2. Upload Screenshot
+        // 2. Upload Screenshot & Document
         let screenshotUrl = null;
+        let documentUrl = null;
         try {
             screenshotUrl = await uploadBase64(screenshot, 'event-assets', 'payment-proofs');
             if (!screenshotUrl) throw new Error("Screenshot upload failed");
+
+            if (document) {
+                documentUrl = await uploadBase64(document, 'event-documents', 'user-docs');
+            }
         } catch (uploadError) {
-            console.error("Screenshot Upload Error:", uploadError);
-            return res.status(500).json({ message: "Failed to upload payment screenshot" });
+            console.error("Upload Error:", uploadError);
+            return res.status(500).json({ message: "Failed to upload files" });
         }
 
         // 3. Create Transaction Record (Pending Verification)
         const { data: transaction, error: txError } = await supabaseAdmin
             .from("transactions")
             .insert({
-                order_id: `MANUAL_${Date.now()}`, // Placeholder since no external order
-                manual_transaction_id: transactionId,
+                order_id: `MANUAL_${Date.now()}`,
+                manual_transaction_id: transactionId || null,
                 payment_mode: 'manual',
                 screenshot_url: screenshotUrl,
                 amount: amount,
                 currency: 'INR',
-                status: "pending_verification", // Use 'pending' if you haven't updated constraints yet, but 'pending_verification' is better
                 user_id: userId
             })
             .select()
@@ -96,20 +102,41 @@ router.post("/submit-manual-payment", verifyToken, async (req, res) => {
                 registration_no: registrationNo,
                 categories: categories,
                 amount_paid: amount,
-                transaction_id: transaction.id, // Linking to the transaction record
-                status: 'pending_verification',
-                screenshot_url: screenshotUrl, // User requested storage here
-                manual_transaction_id: transactionId, // User requested storage here
-                team_id: teamId || null // Save team_id if provided
+                transaction_id: transaction.id,
+                screenshot_url: screenshotUrl,
+                manual_transaction_id: transactionId,
+                team_id: teamId || null,
+                document_url: documentUrl
             });
 
         if (regError) {
             console.error("Registration Init Error:", regError);
-            // Rollback transaction if possible, or just fail (manual cleanup needed)
-            // Ideally we'd delete the just-created transaction here.
+            // Rollback (Best effort)
             await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
             return res.status(500).json({ message: "Failed to create registration record" });
         }
+
+        // 5. Send Email Notification (Async - User doesn't need to wait)
+        (async () => {
+            try {
+                // Fetch User Email & Event Details
+                const { data: userData } = await supabaseAdmin.from("users").select("email, first_name").eq("id", userId).single();
+                const { data: eventData } = await supabaseAdmin.from("events").select("name").eq("id", eventId).single();
+
+                if (userData && userData.email) {
+                    await sendRegistrationEmail(userData.email, {
+                        playerName: userData.first_name || "Athlete",
+                        eventName: eventData?.name || "Sports Event",
+                        registrationNo: registrationNo,
+                        amount: amount,
+                        category: categories,
+                        date: new Date()
+                    });
+                }
+            } catch (emailErr) {
+                console.error("Failed to send email:", emailErr);
+            }
+        })();
 
         res.json({
             success: true,

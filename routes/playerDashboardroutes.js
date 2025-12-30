@@ -297,7 +297,8 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             city,
             state,
             pincode,
-            country
+            country,
+            gender
         } = req.body;
 
         // --- SECURITY: Require Verification Token if Email or Mobile is changing ---
@@ -380,6 +381,7 @@ router.put("/update-profile", verifyPlayer, async (req, res) => {
             state: state !== undefined ? state : currentUser.state,
             pincode: pincode !== undefined ? pincode : currentUser.pincode,
             country: country !== undefined ? country : currentUser.country,
+            gender: gender !== undefined ? gender : currentUser.gender,
             photos: finalPhotoUrl || currentUser.photos
         };
 
