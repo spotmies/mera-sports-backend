@@ -394,7 +394,7 @@ router.get("/registrations", verifyAdmin, async (req, res) => {
         let query = supabaseAdmin
             .from("event_registrations")
             .select(`
-                id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
+                id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
                 users:player_id ( id, first_name, last_name, player_id, mobile ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )

@@ -128,6 +128,7 @@ router.post('/create', verifyAdmin, async (req, res) => {
                 payment_qr_image: req.body.payment_qr_image ? await uploadBase64(req.body.payment_qr_image, 'event-assets', 'payment-qrs') : null,
                 document_url: uploadedDocUrl,
                 document_description,
+                is_document_required: req.body.is_document_required || false, // Default false
                 sponsors: processedSponsors,
                 categories,
                 created_by, // Secured ID
@@ -209,7 +210,7 @@ router.get('/:id', async (req, res) => {
         // Fetch Event Details
         const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, is_document_required, payment_qr_image, google_map_link, pincode, state, city, show_slots')
             .eq('id', id)
             .single();
 
@@ -252,8 +253,7 @@ router.get('/:id', async (req, res) => {
         if (allRegs) {
             const statuses = allRegs.map(r => r.status);
             const uniqueStatuses = [...new Set(statuses)];
-            console.log(`[DIAGNOSTIC] EventID: ${id} - Total Rows Found (No Filter): ${allRegs.length}`);
-            console.log(`[DIAGNOSTIC] Unique Statuses Found:`, uniqueStatuses);
+
         } else {
             console.log(`[DIAGNOSTIC] EventID: ${id} - Query returned null/error:`, debugError);
         }
@@ -264,26 +264,38 @@ router.get('/:id', async (req, res) => {
             .from("event_registrations")
             .select("categories, status") // Select status to debug
             .eq("event_id", id)
-            .in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending"]);
+            .in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]);
 
         const registrationCounts = {};
         let totalRegCount = 0;
         if (regStats) {
             totalRegCount = regStats.length;
-            console.log("Found registrations:", regStats.length); // Debug
             regStats.forEach(reg => {
                 // ... (processing)
                 if (Array.isArray(reg.categories)) {
                     reg.categories.forEach(cat => {
-                        registrationCounts[cat] = (registrationCounts[cat] || 0) + 1;
+                        // Handle both string and object categories
+                        let key = cat;
+                        if (typeof cat === 'object' && cat !== null) {
+                            key = cat.id || cat.name || cat.category; // Try common fields
+                        }
+                        if (key) {
+                            registrationCounts[key] = (registrationCounts[key] || 0) + 1;
+                        }
                     });
                 } else if (typeof reg.categories === 'string') {
                     // Handle case where it might be a single string
                     registrationCounts[reg.categories] = (registrationCounts[reg.categories] || 0) + 1;
+                } else if (typeof reg.categories === 'object' && reg.categories !== null) {
+                    // Single object case
+                    const key = reg.categories.id || reg.categories.name || reg.categories.category;
+                    if (key) {
+                        registrationCounts[key] = (registrationCounts[key] || 0) + 1;
+                    }
                 }
             });
         }
-        console.log("Registration Counts Calculated:", registrationCounts); // Debug
+
         eventData.registration_counts = registrationCounts;
         eventData.total_registrations_count = totalRegCount;
 
