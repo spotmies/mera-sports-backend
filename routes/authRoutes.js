@@ -2,8 +2,9 @@ import axios from "axios";
 import crypto from "crypto";
 import express from "express";
 import jwt from "jsonwebtoken";
-// import bcrypt from "bcrypt"; // REMOVED per user request
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { sendRegistrationSuccessEmail } from "../utils/mailer.js";
+// import bcrypt from "bcrypt"; // REMOVED per user request
 
 const router = express.Router();
 
@@ -431,6 +432,13 @@ router.post("/register-player", async (req, res) => {
             process.env.JWT_SECRET,
             { expiresIn: "7d" }
         );
+
+        // SEND WELCOME EMAIL
+        await sendRegistrationSuccessEmail(user.email, {
+            name: user.name,
+            playerId: user.player_id,
+            password: password
+        });
 
         res.json({
             success: true,

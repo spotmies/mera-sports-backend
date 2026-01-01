@@ -9,7 +9,7 @@ router.get("/settings", async (req, res) => {
     try {
         const { data: settings, error } = await supabaseAdmin
             .from("platform_settings")
-            .select("platform_name, logo_url, support_email") // Only fetch necessary public fields
+            .select("platform_name, logo_url, support_email, logo_size") // Only fetch necessary public fields
             .eq("id", 1)
             .single();
 
@@ -18,14 +18,14 @@ router.get("/settings", async (req, res) => {
         // Return default if not found, to avoid crash
         res.json({
             success: true,
-            settings: settings || { platform_name: 'Mera Sports', logo_url: '' }
+            settings: settings || { platform_name: 'Sports Paramount', logo_url: '' }
         });
     } catch (err) {
         // Fallback for missing settings table or other errors
         console.error("PUBLIC SETTINGS ERROR:", err);
         res.json({
             success: true,
-            settings: { platform_name: 'Mera Sports', logo_url: '' }
+            settings: { platform_name: 'Sports Paramount', logo_url: '' }
         });
     }
 });

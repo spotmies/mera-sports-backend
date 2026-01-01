@@ -176,7 +176,7 @@ router.get('/list', async (req, res) => {
 
         let query = supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city, created_at')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city, created_at, event_registrations(count)')
             .order('start_date', { ascending: true });
 
         // Filter by Creator (Legacy support)

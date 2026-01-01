@@ -245,6 +245,7 @@ router.post("/settings", verifyAdmin, async (req, res) => {
                 support_email: supportEmail,
                 support_phone: supportPhone,
                 logo_url: req.body.logoUrl,
+                logo_size: req.body.logoSize, // Capture logo size
                 updated_at: new Date()
             })
             .eq("id", 1)
@@ -396,7 +397,7 @@ router.get("/registrations", verifyAdmin, async (req, res) => {
             .select(`
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
-                users:player_id ( id, first_name, last_name, player_id, mobile ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, gender, apartment ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
             `)
             .order('created_at', { ascending: false });
@@ -425,7 +426,7 @@ router.get("/transactions", verifyAdmin, async (req, res) => {
             .select(`
                 id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events!inner ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile )
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment )
             `)
             .order('created_at', { ascending: false });
 
@@ -448,9 +449,9 @@ router.get("/transactions", verifyAdmin, async (req, res) => {
     }
 });
 
-// POST /api/admin/transactions/:id/verify
+// PUT /api/admin/transactions/:id/verify
 // Verify a transaction
-router.post("/transactions/:id/verify", verifyAdmin, async (req, res) => {
+router.put("/transactions/:id/verify", verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
@@ -473,9 +474,9 @@ router.post("/transactions/:id/verify", verifyAdmin, async (req, res) => {
     }
 });
 
-// POST /api/admin/transactions/:id/reject
+// PUT /api/admin/transactions/:id/reject
 // Reject a transaction
-router.post("/transactions/:id/reject", verifyAdmin, async (req, res) => {
+router.put("/transactions/:id/reject", verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
@@ -774,94 +775,48 @@ router.post("/upload", verifyAdmin, async (req, res) => {
     }
 });
 
-// ================= TRANSACTIONS =================
-
-// GET /api/admin/transactions
-// Fetch all transactions (event_registrations)
-router.get("/transactions", verifyAdmin, async (req, res) => {
-    try {
-        const { admin_id } = req.query;
-
-        let query = supabaseAdmin
-            .from("event_registrations")
-            .select(`
-                *,
-                users:user_id ( id, first_name, last_name, email, mobile, player_id ),
-                events:event_id ( id, name )
-            `)
-            .order("created_at", { ascending: false });
-
-        // Filter for specific admin's events logic if needed
-        // For now, returning all for SuperAdmin, or filtered if admin_id passed
-        // (Logic to filter by admin assigned events would be complex here without joining events table properly)
-
-        const { data, error } = await query;
-
-        if (error) throw error;
-        res.json({ success: true, transactions: data });
-    } catch (err) {
-        console.error("FETCH TRANSACTIONS ERROR:", err);
-        res.status(500).json({ message: "Failed to fetch transactions" });
-    }
-});
-
-// PUT /api/admin/transactions/:id/verify
-router.put("/transactions/:id/verify", verifyAdmin, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { error } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status: "verified" })
-            .eq("id", id);
-
-        if (error) throw error;
-        res.json({ success: true, message: "Transaction verified" });
-    } catch (err) {
-        console.error("VERIFY TXN ERROR:", err);
-        res.status(500).json({ message: "Failed to verify transaction" });
-    }
-});
-
-// PUT /api/admin/transactions/:id/reject
-router.put("/transactions/:id/reject", verifyAdmin, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { error } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status: "rejected" })
-            .eq("id", id);
-
-        if (error) throw error;
-        res.json({ success: true, message: "Transaction rejected" });
-    } catch (err) {
-        console.error("REJECT TXN ERROR:", err);
-        res.status(500).json({ message: "Failed to reject transaction" });
-    }
-});
-
-// POST /api/admin/transactions/bulk-update
-router.post("/transactions/bulk-update", verifyAdmin, async (req, res) => {
-    try {
-        const { ids, status } = req.body;
-        if (!ids || !Array.isArray(ids) || !status) {
-            return res.status(400).json({ message: "Invalid request" });
-        }
-
-        const { data, error } = await supabaseAdmin
-            .from("event_registrations")
-            .update({ status })
-            .in("id", ids)
-            .select();
-
-        if (error) throw error;
-        res.json({ success: true, message: "Bulk update successful" });
-    } catch (err) {
-        console.error("BULK UPDATE ERROR:", err);
-        res.status(500).json({ message: "Failed to update transactions" });
-    }
-});
-
-
 // ================= END TRANSACTIONS =================
 
 export default router;
+// GET /api/admin/all-categories
+// Fetch all unique categories from all events
+router.get("/all-categories", verifyAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabaseAdmin
+            .from("events")
+            .select("categories");
+
+        if (error) throw error;
+
+        // Extract and flatten unique categories
+        const uniqueCategories = new Set(["All Categories"]);
+
+        data.forEach(event => {
+            let cats = event.categories;
+            // Parse if string
+            if (typeof cats === 'string') {
+                try { if (cats.startsWith('[')) cats = JSON.parse(cats); } catch (e) { }
+            }
+
+            const addCat = (cat) => {
+                const name = cat.name || cat.category || cat.Category || cat.id;
+                if (name) uniqueCategories.add(name);
+                else if (typeof cat === 'string') uniqueCategories.add(cat);
+            };
+
+            if (Array.isArray(cats)) {
+                cats.forEach(addCat);
+            } else if (typeof cats === 'object' && cats !== null) {
+                addCat(cats);
+            } else if (cats) {
+                uniqueCategories.add(String(cats));
+            }
+        });
+
+        res.json({ success: true, categories: Array.from(uniqueCategories).sort() });
+
+    } catch (err) {
+        console.error("Error fetching categories:", err);
+        res.status(500).json({ success: false, message: "Server Error" });
+    }
+});
