@@ -645,6 +645,10 @@ router.post("/login-admin", async (req, res) => {
                 verification: user.verification // Added verification
             },
         });
+
+        // NOTIFICATION: Admin Logged In
+        createNotification(user.id, "Welcome Back!", "Administrator login successful.", "info");
+
     } catch (err) {
         console.error("ADMIN LOGIN ERROR:", err);
         res.status(500).json({ message: "Server error during login" });

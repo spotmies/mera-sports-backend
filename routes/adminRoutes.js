@@ -1,6 +1,7 @@
 import express from "express";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { verifyAdmin } from "../middleware/rbacMiddleware.js";
+import { createNotification } from "./notificationRoutes.js"; // Added Import
 
 const router = express.Router();
 
@@ -366,15 +367,29 @@ router.post("/transactions/bulk-update", verifyAdmin, async (req, res) => {
             return res.status(400).json({ message: "Invalid status" });
         }
 
-        const { error, count } = await supabaseAdmin
+        const { data: updatedRegs, error, count } = await supabaseAdmin
             .from("event_registrations")
             .update({ status })
             .in("id", ids)
-            .select('id', { count: 'exact' });
+            .select('id, player_id, registration_no, events(name)');
 
         if (error) {
             console.error("Supabase Bulk Update Error:", error);
             throw error;
+        }
+
+        // BULK NOTIFICATIONS
+        if (updatedRegs && updatedRegs.length > 0) {
+            updatedRegs.forEach(reg => {
+                const eventName = reg.events?.name || 'Event';
+                const title = status === 'verified' ? "Registration Verified" : "Registration Rejected";
+                const type = status === 'verified' ? "success" : "error";
+                const msg = status === 'verified'
+                    ? `Your registration for ${eventName} (Reg No: ${reg.registration_no}) has been verified.`
+                    : `Your registration for ${eventName} (Reg No: ${reg.registration_no}) was rejected.`;
+
+                createNotification(reg.player_id, title, msg, type);
+            });
         }
 
 
@@ -456,12 +471,25 @@ router.put("/transactions/:id/verify", verifyAdmin, async (req, res) => {
         const { id } = req.params;
 
         // 1. Update event_registrations
-        const { error: regError } = await supabaseAdmin
+        const { data: updatedReg, error: regError } = await supabaseAdmin
             .from("event_registrations")
             .update({ status: "verified" })
-            .eq("id", id);
+            .eq("id", id)
+            .select("player_id, registration_no, events(name)")
+            .single();
 
         if (regError) throw regError;
+
+        // NOTIFICATION
+        if (updatedReg) {
+            const eventName = updatedReg.events?.name || 'Event';
+            createNotification(
+                updatedReg.player_id,
+                "Registration Verified",
+                `Your registration for ${eventName} (Reg No: ${updatedReg.registration_no}) has been verified.`,
+                "success"
+            );
+        }
 
         // 2. We should also verify if there is a linked transaction in "transactions" table?
         // Let's first fetch the registration to see if it has a manual_transaction_id.
@@ -480,12 +508,25 @@ router.put("/transactions/:id/reject", verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
 
-        const { error: regError } = await supabaseAdmin
+        const { data: updatedReg, error: regError } = await supabaseAdmin
             .from("event_registrations")
             .update({ status: "rejected" })
-            .eq("id", id);
+            .eq("id", id)
+            .select("player_id, registration_no, events(name)")
+            .single();
 
         if (regError) throw regError;
+
+        // NOTIFICATION
+        if (updatedReg) {
+            const eventName = updatedReg.events?.name || 'Event';
+            createNotification(
+                updatedReg.player_id,
+                "Registration Rejected",
+                `Your registration for ${eventName} (Reg No: ${updatedReg.registration_no}) was rejected. Please contact support.`,
+                "error"
+            );
+        }
 
         res.json({ success: true, message: "Transaction rejected" });
     } catch (err) {
