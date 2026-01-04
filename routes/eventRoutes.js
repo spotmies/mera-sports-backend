@@ -65,7 +65,8 @@ router.post('/create', verifyAdmin, async (req, res) => {
             state,
             city,
             google_map_link,
-            assigned_to
+            assigned_to,
+            upi_id
         } = req.body;
 
         // Sanitize Dates
@@ -133,7 +134,8 @@ router.post('/create', verifyAdmin, async (req, res) => {
                 categories,
                 created_by, // Secured ID
                 assigned_to,
-                status: 'upcoming'
+                status: 'upcoming',
+                upi_id
             })
             .select()
             .single();
@@ -176,7 +178,7 @@ router.get('/list', async (req, res) => {
 
         let query = supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city, created_at, event_registrations(count)')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, payment_qr_image, google_map_link, pincode, state, city, upi_id, created_at, event_registrations(count)')
             .order('start_date', { ascending: true });
 
         // Filter by Creator (Legacy support)
@@ -210,7 +212,7 @@ router.get('/:id', async (req, res) => {
         // Fetch Event Details
         const { data: eventData, error: eventError } = await supabaseAdmin
             .from('events')
-            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, is_document_required, payment_qr_image, google_map_link, pincode, state, city, show_slots')
+            .select('id, name, sport, start_date, start_time, location, venue, categories, banner_url, created_by, assigned_to, qr_code, status, end_date, sponsors, document_url, document_description, is_document_required, payment_qr_image, google_map_link, pincode, state, city, show_slots, upi_id')
             .eq('id', id)
             .single();
 
