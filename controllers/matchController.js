@@ -994,6 +994,156 @@ export const createMatch = async (req, res) => {
     }
 };
 
+// Create many matches in a single API call
+export const createMatchesBulk = async (req, res) => {
+    const matches = Array.isArray(req.body?.matches) ? req.body.matches : [];
+
+    if (matches.length === 0) {
+        return res.status(400).json({ success: false, message: "matches[] is required" });
+    }
+
+    try {
+        const keyMeta = new Map();
+
+        const resolveBracketId = async ({ event_id, category_id, category_name, providedBracketId }) => {
+            if (providedBracketId) return providedBracketId;
+
+            let bracketData = null;
+
+            if (isUuid(category_id)) {
+                const { data, error } = await supabaseAdmin
+                    .from('event_brackets')
+                    .select('id, mode')
+                    .eq('event_id', event_id)
+                    .eq('category_id', category_id)
+                    .order('created_at', { ascending: false });
+
+                if (!error && data && data.length > 0) {
+                    bracketData = data.find(b => b.mode === 'BRACKET') || data[0];
+                }
+            } else if (category_name) {
+                const { data, error } = await supabaseAdmin
+                    .from('event_brackets')
+                    .select('id, mode')
+                    .eq('event_id', event_id)
+                    .eq('category', category_name)
+                    .order('created_at', { ascending: false });
+
+                if (!error && data && data.length > 0) {
+                    bracketData = data.find(b => b.mode === 'BRACKET') || data[0];
+                }
+            }
+
+            if (bracketData?.id) return bracketData.id;
+
+            const { data: anyBrackets } = await supabaseAdmin
+                .from('event_brackets')
+                .select('id')
+                .eq('event_id', event_id)
+                .limit(1);
+
+            if (anyBrackets && anyBrackets.length > 0) {
+                return anyBrackets[0].id;
+            }
+
+            const { data: placeholderBracket, error: placeholderError } = await supabaseAdmin
+                .from('event_brackets')
+                .insert({
+                    event_id: event_id,
+                    category: category_name || `Manual Scoreboard - ${category_id}`,
+                    category_id: isUuid(category_id) ? category_id : null,
+                    mode: 'MEDIA',
+                    draw_type: 'bracket',
+                    bracket_data: { rounds: [] },
+                    round_name: 'Manual'
+                })
+                .select('id')
+                .single();
+
+            if (placeholderError || !placeholderBracket?.id) {
+                throw new Error("Could not resolve bracket_id for bulk create");
+            }
+
+            return placeholderBracket.id;
+        };
+
+        for (const m of matches) {
+            const event_id = m?.event_id;
+            const category_id = m?.category_id;
+            const category_name = m?.category_name;
+            const round_name = m?.round_name;
+
+            if (!event_id || !category_id || !round_name) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Each match requires event_id, category_id, and round_name"
+                });
+            }
+
+            const key = `${event_id}::${category_id}::${round_name}`;
+            if (!keyMeta.has(key)) {
+                const bracket_id = await resolveBracketId({
+                    event_id,
+                    category_id,
+                    category_name,
+                    providedBracketId: m?.bracket_id
+                });
+
+                const { data: maxIndexData } = await supabaseAdmin
+                    .from('matches')
+                    .select('match_index')
+                    .eq('bracket_id', bracket_id)
+                    .eq('round_name', round_name)
+                    .order('match_index', { ascending: false })
+                    .limit(1);
+
+                const nextIndex = (maxIndexData && maxIndexData.length > 0)
+                    ? (Number(maxIndexData[0].match_index) || 0) + 1
+                    : 0;
+
+                keyMeta.set(key, { bracket_id, nextIndex });
+            }
+        }
+
+        const bulkPayload = matches.map((m) => {
+            const key = `${m.event_id}::${m.category_id}::${m.round_name}`;
+            const meta = keyMeta.get(key);
+            const match_index = meta.nextIndex;
+            meta.nextIndex += 1;
+
+            return {
+                event_id: m.event_id,
+                category_id: m.category_id,
+                bracket_id: meta.bracket_id,
+                round_name: m.round_name,
+                match_index,
+                player_a: m.player_a || {},
+                player_b: m.player_b || {},
+                status: 'SCHEDULED'
+            };
+        });
+
+        const { data, error } = await supabaseAdmin
+            .from('matches')
+            .insert(bulkPayload)
+            .select();
+
+        if (error) {
+            console.error("Bulk Create Matches Insert Error:", error);
+            throw error;
+        }
+
+        return res.status(201).json({
+            success: true,
+            createdCount: Array.isArray(data) ? data.length : 0,
+            matches: data || []
+        });
+    } catch (error) {
+        console.error("Bulk Create Matches Error:", error);
+        return res.status(500).json({ success: false, message: "Failed to create matches in bulk" });
+    }
+};
+
 // Helper: get effective player_a/player_b for a match (from match row or from bracket when empty)
 // Returns null for players that don't exist (never returns {} empty object)
 // allMatchesByBracketId is an optional map of bracket_match_id -> DB match row (used to resolve
@@ -1345,7 +1495,15 @@ export const updateMatchScore = async (req, res) => {
                         } else if (player2SetsWon >= setsToWin) {
                             updatePayload.winner = winnerIdB;
                         } else {
-                            if (player1SetsWon > player2SetsWon) {
+                            const allSetsPlayed = Array.isArray(finalScore.sets)
+                                && finalScore.sets.length >= categorySetsPerMatch;
+
+                            // League: if majority is not reached, only resolve by set lead when all configured
+                            // sets are actually played; otherwise treat as unresolved (draw/null) instead of
+                            // prematurely assigning winner by partial set lead.
+                            if (isLeagueMatch && !allSetsPlayed) {
+                                updatePayload.winner = null;
+                            } else if (player1SetsWon > player2SetsWon) {
                                 updatePayload.winner = winnerIdA;
                             } else if (player2SetsWon > player1SetsWon) {
                                 updatePayload.winner = winnerIdB;
