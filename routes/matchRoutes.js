@@ -2,11 +2,12 @@ import express from "express";
 import {
     clearCategoryScores,
     createMatch,
+    createMatchesBulk,
     deleteCategoryMatches,
     deleteMatch,
     finalizeRoundMatches,
-    generateMatchesFromBracket,
     generateLeagueMatches,
+    generateMatchesFromBracket,
     getMatches,
     updateMatchScore,
     updateRoundSelectedSets
@@ -25,6 +26,10 @@ router.post("/generate-league/:eventId/:categoryId", generateLeagueMatches);
 // Create manual match
 // POST /api/admin/matches
 router.post("/", createMatch);
+
+// Create matches in bulk
+// POST /api/admin/matches/bulk
+router.post("/bulk", createMatchesBulk);
 
 // Finalize all matches in a round (calculate winners and set COMPLETED)
 // POST /api/admin/matches/:eventId/finalize
