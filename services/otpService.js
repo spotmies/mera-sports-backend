@@ -1,6 +1,10 @@
 import axios from "axios";
 import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { sendOtpEmail } from "../utils/mailer.js";
+
+// In-memory store for custom email OTPs 
+const emailOtpStore = new Map();
 
 const TWO_FACTOR_API_KEY = process.env.TWO_FACTOR_API_KEY || "e6b3f27c-da5e-11f0-a6b2-0200cd936042";
 
@@ -54,56 +58,34 @@ export async function verifyMobileOtp(sessionId, otp) {
 }
 
 /**
- * Sends an Email OTP using Supabase Auth (Magic Link logic but used as OTP)
+ * Sends an Email OTP using Custom NodeMailer to avoid rate limits
  * @param {string} email 
  */
 export async function sendEmailOtp(email) {
     if (!email) throw new Error("Email is required");
 
     try {
-
-        // Ensure user exists as "confirmed" so we get the correct OTP template if possible, 
-        // or effectively "sign them in" to generate a token.
-        // NOTE: If user doesn't exist in Supabase Auth, we create them.
-
-        // 1. Try to create (idempotent-ish if we handle error)
-        // We use admin.createUser to auto-confirm so they don't get "Confirm Email" link but "Magic Link" code?
-        // Actually, signInWithOtp handles creation if option is set.
-
-        // Refined Logic from authRoutes:
-        const { error: createError } = await supabaseAdmin.auth.admin.createUser({
-            email: email,
-            email_confirm: true,
-            password: crypto.randomUUID()
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        emailOtpStore.set(email, {
+            otp,
+            expiresAt: Date.now() + 10 * 60 * 1000 // 10 mins expiry
         });
 
-        // Ignore "already registered"
-
-        const { error } = await supabaseAdmin.auth.signInWithOtp({
-            email: email,
-            options: { shouldCreateUser: false }
-        });
-
-        if (error) throw error;
-        return { success: true };
-
+        const success = await sendOtpEmail(email, otp);
+        if (!success) {
+            throw new Error("Failed to deliver OTP email");
+        }
+        
+        return { success: true, message: "OTP sent successfully" };
     } catch (err) {
-        // If create failed because they exist, we just proceed. 
-        // If signInWithOtp failed, we throw.
         console.error("Service: sendEmailOtp Error:", err.message);
-        // Retry signInWithOtp even if createUser failed (user might exist)
-        const { error: retryError } = await supabaseAdmin.auth.signInWithOtp({
-            email: email,
-            options: { shouldCreateUser: false }
-        });
-
-        if (retryError) throw retryError;
-        return { success: true };
+        throw new Error("Failed to send OTP email: " + err.message);
     }
 }
 
 /**
- * Verifies Email OTP using Supabase
+ * Verifies Custom Email OTP
  * @param {string} email 
  * @param {string} otp 
  */
@@ -111,16 +93,20 @@ export async function verifyEmailOtp(email, otp) {
     if (!email || !otp) throw new Error("Email and OTP required");
 
     try {
-        const { data, error } = await supabaseAdmin.auth.verifyOtp({
-            email,
-            token: otp,
-            type: 'magiclink'
-        });
+        const record = emailOtpStore.get(email);
+        if (!record) return false;
 
-        if (error) throw error;
-        if (data.session) return true;
+        if (Date.now() > record.expiresAt) {
+            emailOtpStore.delete(email); // expired
+            return false;
+        }
+
+        if (record.otp === otp) {
+            emailOtpStore.delete(email); // used successfully
+            return true;
+        }
+
         return false;
-
     } catch (err) {
         console.error("Service: verifyEmailOtp Error:", err.message);
         return false;

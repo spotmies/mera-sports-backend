@@ -1,5 +1,5 @@
 import express from "express";
-import { getPublicCategoryDraw, getPublicEventDraws, getPublicLeagueConfig, getPublicSettings, listPublicEvents } from "../controllers/publicController.js";
+import { getPublicCategoryDraw, getPublicEventDraws, getPublicEventSharePreview, getPublicLeagueConfig, getPublicSettings, listPublicEvents } from "../controllers/publicController.js";
 
 const router = express.Router();
 
@@ -12,5 +12,8 @@ router.get("/events/:id/categories/draw", getPublicCategoryDraw); // Alternative
 router.get("/events/:id/draws", getPublicEventDraws); // All published draws for an event
 router.get("/events/:id/categories/:categoryId/league", getPublicLeagueConfig);
 router.get("/events/:id/categories/league", getPublicLeagueConfig); // Alternative with categoryLabel query
+
+// Dynamic OG preview endpoint used for rich link cards in chat apps
+router.get("/events/:id/share", getPublicEventSharePreview);
 
 export default router;

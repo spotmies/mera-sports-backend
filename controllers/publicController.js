@@ -78,6 +78,113 @@ export const getPublicSettings = async (req, res) => {
 };
 
 /**
+ * Public: Dynamic share preview page for messaging crawlers (WhatsApp/Telegram/etc.)
+ * GET /api/public/events/:id/share
+ * Returns HTML with OG tags and client-side redirect to the real event page.
+ */
+export const getPublicEventSharePreview = async (req, res) => {
+        try {
+            const { id: eventIdentifier } = req.params;
+            if (!eventIdentifier) {
+                return res.status(400).send("Missing event id");
+            }
+
+            const eventId = await resolveEventIdByIdentifier(eventIdentifier);
+            if (!eventId) {
+                return res.status(404).send("Event not found");
+            }
+
+            const { data: eventData, error } = await supabaseAdmin
+                .from("events")
+                .select("id, name, venue, city, start_date, end_date, registration_deadline, banner_url, categories")
+                .eq("id", eventId)
+                .maybeSingle();
+
+            if (error || !eventData) {
+                return res.status(404).send("Event not found");
+            }
+
+            const publicEventId = getPublicEventId(eventData);
+
+            const publicBaseUrl = (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "http://localhost:8080").replace(/\/$/, "");
+            const canonicalEventUrl = `${publicBaseUrl}/events/${publicEventId}`;
+
+            const parseDateSafe = (value) => {
+                const d = value ? new Date(value) : null;
+                return d && !Number.isNaN(d.getTime()) ? d : null;
+            };
+
+            const getRegistrationDeadline = () => {
+                const explicit = parseDateSafe(eventData.registration_deadline) || parseDateSafe(eventData.end_date);
+                if (explicit) return explicit;
+
+                if (Array.isArray(eventData.categories)) {
+                    const dates = eventData.categories
+                        .map((cat) => parseDateSafe(cat?.lastDateToRegister || cat?.last_date_to_register))
+                        .filter(Boolean);
+                    if (dates.length > 0) {
+                        return new Date(Math.max(...dates.map((d) => d.getTime())));
+                    }
+                }
+
+                return parseDateSafe(eventData.start_date);
+            };
+
+            const startDate = parseDateSafe(eventData.start_date);
+            const regDeadline = getRegistrationDeadline();
+            const formatDate = (d) => {
+                if (!d) return "N/A";
+                const day = String(d.getDate()).padStart(2, "0");
+                const month = String(d.getMonth() + 1).padStart(2, "0");
+                const year = d.getFullYear();
+                return `${day}-${month}-${year}`;
+            };
+
+            const title = String(eventData.name || "Sports Event");
+            const venue = [eventData.venue, eventData.city].filter(Boolean).join(", ") || "Venue TBD";
+            const description = `Register for ${title}. Event Date: ${formatDate(startDate)}. Registration Ends: ${formatDate(regDeadline)}. Venue: ${venue}.`;
+            const imageUrl = String(eventData.banner_url || `${publicBaseUrl}/default-event-banner.png`);
+
+            const escapeHtml = (value) => String(value || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+
+            const html = `<!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>${escapeHtml(title)}</title>
+        <meta name="description" content="${escapeHtml(description)}" />
+        <meta property="og:type" content="website" />
+        <meta property="og:title" content="${escapeHtml(title)}" />
+        <meta property="og:description" content="${escapeHtml(description)}" />
+        <meta property="og:url" content="${escapeHtml(canonicalEventUrl)}" />
+        <meta property="og:image" content="${escapeHtml(imageUrl)}" />
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="${escapeHtml(title)}" />
+        <meta name="twitter:description" content="${escapeHtml(description)}" />
+        <meta name="twitter:image" content="${escapeHtml(imageUrl)}" />
+        <meta http-equiv="refresh" content="0;url=${escapeHtml(canonicalEventUrl)}" />
+        <script>window.location.replace(${JSON.stringify(canonicalEventUrl)});</script>
+      </head>
+      <body>
+        <p>Redirecting to event page...</p>
+        <a href="${escapeHtml(canonicalEventUrl)}">${escapeHtml(canonicalEventUrl)}</a>
+      </body>
+    </html>`;
+
+            res.setHeader("Content-Type", "text/html; charset=utf-8");
+            return res.status(200).send(html);
+        } catch (err) {
+            console.error("PUBLIC EVENT SHARE PREVIEW ERROR:", err);
+            return res.status(500).send("Failed to build share preview");
+        }
+};
+
+/**
  * Public: Get league config (participants + rules) for a category.
  * GET /api/public/events/:id/categories/:categoryId/league
  * Query: categoryLabel or category (optional fallback when categoryId is not present)
