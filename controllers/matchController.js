@@ -3035,7 +3035,7 @@ export const getPublicMatches = async (req, res) => {
 // Get Matches (Scoreboard)
 export const getMatches = async (req, res) => {
     const { eventId } = req.params;
-    const { categoryId, categoryName, roundName } = req.query;
+    const { categoryId, categoryName, roundName, bracketId } = req.query;
 
     try {
         // Start with base query - fetch all matches for event first
@@ -3065,6 +3065,10 @@ export const getMatches = async (req, res) => {
         // Filter by roundName if provided (do this first as it's most specific)
         if (roundName) {
             query = query.eq('round_name', roundName);
+        }
+
+        if (bracketId) {
+            query = query.eq('bracket_id', bracketId);
         }
 
         // Also try categoryName if provided (treat as category_id)
@@ -3123,6 +3127,14 @@ export const getMatches = async (req, res) => {
                 });
             }
 
+            if (bracketId) {
+                filteredMatches = filteredMatches.filter(m => {
+                    const matchBracketId = m.bracket_id;
+                    if (!matchBracketId) return false;
+                    return matchBracketId == bracketId || String(matchBracketId) === String(bracketId);
+                });
+            }
+
             return res.status(200).json({ success: true, matches: filteredMatches });
         }
 
@@ -3160,6 +3172,14 @@ export const getMatches = async (req, res) => {
             }
 
             finalMatches = filtered;
+        }
+
+        if (bracketId) {
+            finalMatches = finalMatches.filter(m => {
+                const matchBracketId = m.bracket_id;
+                if (!matchBracketId) return false;
+                return matchBracketId == bracketId || String(matchBracketId) === String(bracketId);
+            });
         }
 
         return res.status(200).json({ success: true, matches: finalMatches });
