@@ -2783,23 +2783,29 @@ export const getPublicMatches = async (req, res) => {
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
         if (isLeagueRequest && categoryId) {
-            const isPublished = await isLeagueCategoryPublishedForPublic({
-                eventId,
-                categoryId,
-                categoryLabel: categoryName || categoryId,
-            });
+            // Synthetic round IDs (e.g. <uuid>_R2, <uuid>_R3) are NOT stored in event_brackets.
+            // They inherit publishing status from the base category. Skip the published check for these.
+            const isSyntheticRoundId = String(categoryId).includes('_R') || String(categoryId).includes('_HR');
 
-            if (!isPublished) {
-                return res.status(200).json({
-                    success: true,
-                    matches: []
+            if (!isSyntheticRoundId) {
+                const isPublished = await isLeagueCategoryPublishedForPublic({
+                    eventId,
+                    categoryId,
+                    categoryLabel: categoryName || categoryId,
                 });
+
+                if (!isPublished) {
+                    return res.status(200).json({
+                        success: true,
+                        matches: []
+                    });
+                }
             }
 
             // Fetch League Matches
             let matchQuery = supabaseAdmin
                 .from('matches')
-                .select('id, round_name, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
+                .select('id, round_name, match_index, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
                 .eq('event_id', eventId)
                 .eq('round_name', 'LEAGUE')
                 .order('match_index', { ascending: true });

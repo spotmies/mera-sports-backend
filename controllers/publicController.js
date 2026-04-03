@@ -364,12 +364,17 @@ export const getPublicCategoryDraw = async (req, res) => {
         const eventId = await resolveEventIdByIdentifier(eventIdentifier);
         if (!eventId) return res.status(404).json({ message: "Event not found" });
 
+        const categoryIsUuid = categoryId && isUuid(categoryId);
+
         let query = supabaseAdmin
             .from("event_brackets")
             .select("*")
             .eq("event_id", eventId);
 
-        if (categoryId && isUuid(categoryId)) {
+        if (categoryIsUuid) {
+            // STRICT: UUID-based lookup only — never fall back to label for UUID categories.
+            // This prevents a bracket stored under the SAME display name but a DIFFERENT
+            // category UUID from bleeding into this category's draw view.
             query = query.eq("category_id", categoryId);
         } else if (categoryLabel) {
             query = query.eq("category", categoryLabel);
@@ -379,8 +384,9 @@ export const getPublicCategoryDraw = async (req, res) => {
 
         let { data, error } = await query.order("created_at", { ascending: true });
 
-        // Partial matching fallback when using categoryLabel
-        if ((!data || data.length === 0) && categoryLabel && !categoryId) {
+        // Partial matching fallback — ONLY for label-based lookups (no UUID).
+        // When a UUID categoryId is provided, never attempt a label fallback.
+        if ((!data || data.length === 0) && categoryLabel && !categoryIsUuid) {
             const labelParts = categoryLabel.split(" - ").filter(p => p.trim()).map(p => sanitizeFilterInput(p));
             if (labelParts.length > 0) {
                 const baseCategory = sanitizeFilterInput(labelParts[0]);
@@ -409,14 +415,39 @@ export const getPublicCategoryDraw = async (req, res) => {
             }
         }
 
+        // Additional safety: if we got results via label lookup but one of the rows has a
+        // different UUID category_id, filter those out to prevent cross-category leaking.
+        if (data && data.length > 0 && !categoryIsUuid && categoryId) {
+            const exactIdMatches = data.filter(row =>
+                !row.category_id || !isUuid(row.category_id) || row.category_id === categoryId
+            );
+            if (exactIdMatches.length > 0) {
+                data = exactIdMatches;
+            }
+        }
+
         if (error) throw error;
+
+        // If no rows found at all, return empty draw
+        if (!data || data.length === 0) {
+            return res.json({
+                success: true,
+                draw: {
+                    categoryId: categoryId || null,
+                    categoryLabel: categoryLabel || null,
+                    mode: null,
+                    media: null,
+                    bracket: null,
+                    published: false
+                }
+            });
+        }
 
         // Group by mode
         const mediaDraw = data.find(b => b.mode === 'MEDIA');
         const bracketDraw = data.find(b => b.mode === 'BRACKET');
 
         const hasActualMedia = mediaDraw && ((mediaDraw.media_urls && mediaDraw.media_urls.length > 0) || mediaDraw.pdf_url);
-        const mode = bracketDraw ? 'BRACKET' : (hasActualMedia ? 'MEDIA' : null);
 
         // Only return published data to the public
         const isMediaPublished = mediaDraw && hasActualMedia && mediaDraw.published;
@@ -463,6 +494,7 @@ export const getPublicCategoryDraw = async (req, res) => {
         res.status(500).json({ message: "Failed to fetch category draw", error: err.message });
     }
 };
+
 
 /**
  * Public: Get all published draws for an event
