@@ -26,6 +26,45 @@ const sanitizeFilterInput = (value) => {
         .slice(0, 200);
 };
 
+const normalizeText = (value) => String(value || "").trim().toLowerCase();
+
+const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
+    const { data: publishedRows, error } = await supabaseAdmin
+        .from("event_brackets")
+        .select("category_id, category")
+        .eq("event_id", eventId)
+        .eq("published", true);
+
+    if (error) throw error;
+    if (!Array.isArray(publishedRows) || publishedRows.length === 0) return false;
+
+    const targetId = String(categoryId || "").trim();
+    const targetLabel = String(categoryLabel || "").trim();
+    const targetIdNormalized = normalizeText(targetId);
+    const targetLabelNormalized = normalizeText(targetLabel);
+
+    return publishedRows.some((row) => {
+        const rowCategoryId = String(row?.category_id || "").trim();
+        const rowCategoryLabel = String(row?.category || "").trim();
+        const rowCategoryIdNormalized = normalizeText(rowCategoryId);
+        const rowCategoryLabelNormalized = normalizeText(rowCategoryLabel);
+
+        // 1) Exact UUID category_id match (most reliable)
+        if (targetId && isUuid(targetId) && rowCategoryId && rowCategoryId === targetId) return true;
+
+        // 2) Label match (used for non-UUID category ids and legacy draws)
+        if (targetLabel && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetLabelNormalized) return true;
+
+        // 3) Fallback: when category id is stored in label for non-UUID categories
+        if (targetId && !isUuid(targetId) && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetIdNormalized) return true;
+
+        // 4) Additional fallback: compare normalized category_id text values
+        if (targetId && rowCategoryIdNormalized && rowCategoryIdNormalized === targetIdNormalized) return true;
+
+        return false;
+    });
+};
+
 // GET /api/public/events/list
 export const listPublicEvents = async (_req, res) => {
     try {
@@ -256,6 +295,31 @@ export const getPublicLeagueConfig = async (req, res) => {
             });
         }
 
+        const isPublished = await isLeagueCategoryPublishedForPublic({
+            eventId,
+            categoryId: data.category_id || categoryId,
+            categoryLabel: data.category_label || categoryLabel || categoryId,
+        });
+
+        if (!isPublished) {
+            return res.json({
+                success: true,
+                league: {
+                    format: "LEAGUE",
+                    participants: [],
+                    rules: {
+                        pointsWin: 3,
+                        pointsLoss: 0,
+                        pointsDraw: 1,
+                        win: 3,
+                        loss: 0,
+                        draw: 1,
+                    },
+                },
+                published: false,
+            });
+        }
+
         const rawRules = data.rules || {};
         const pointsWin = Number(rawRules.pointsWin ?? rawRules.win ?? 3);
         const pointsLoss = Number(rawRules.pointsLoss ?? rawRules.loss ?? 0);
@@ -276,6 +340,7 @@ export const getPublicLeagueConfig = async (req, res) => {
                     draw: Number.isFinite(pointsDraw) ? pointsDraw : 1,
                 },
             },
+            published: true,
         });
     } catch (err) {
         console.error("PUBLIC GET LEAGUE CONFIG ERROR:", err);

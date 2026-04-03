@@ -22,6 +22,38 @@ const chunkArray = (arr, size = DB_ID_BATCH_SIZE) => {
     return chunks;
 };
 
+const normalizeText = (value) => String(value || '').trim().toLowerCase();
+
+const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
+    const { data: publishedRows, error } = await supabaseAdmin
+        .from('event_brackets')
+        .select('category_id, category')
+        .eq('event_id', eventId)
+        .eq('published', true);
+
+    if (error) throw error;
+    if (!Array.isArray(publishedRows) || publishedRows.length === 0) return false;
+
+    const targetId = String(categoryId || '').trim();
+    const targetLabel = String(categoryLabel || '').trim();
+    const targetIdNormalized = normalizeText(targetId);
+    const targetLabelNormalized = normalizeText(targetLabel);
+
+    return publishedRows.some((row) => {
+        const rowCategoryId = String(row?.category_id || '').trim();
+        const rowCategoryLabel = String(row?.category || '').trim();
+        const rowCategoryIdNormalized = normalizeText(rowCategoryId);
+        const rowCategoryLabelNormalized = normalizeText(rowCategoryLabel);
+
+        if (targetId && isUuid(targetId) && rowCategoryId && rowCategoryId === targetId) return true;
+        if (targetLabel && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetLabelNormalized) return true;
+        if (targetId && !isUuid(targetId) && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetIdNormalized) return true;
+        if (targetId && rowCategoryIdNormalized && rowCategoryIdNormalized === targetIdNormalized) return true;
+
+        return false;
+    });
+};
+
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
     // Clamp the fallback itself so callers can't accidentally pass an out-of-range default.
     const safeFallback = Number.isInteger(fallback) && fallback >= 1 && fallback <= MAX_SETS_PER_MATCH
@@ -2751,6 +2783,19 @@ export const getPublicMatches = async (req, res) => {
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
         if (isLeagueRequest && categoryId) {
+            const isPublished = await isLeagueCategoryPublishedForPublic({
+                eventId,
+                categoryId,
+                categoryLabel: categoryName || categoryId,
+            });
+
+            if (!isPublished) {
+                return res.status(200).json({
+                    success: true,
+                    matches: []
+                });
+            }
+
             // Fetch League Matches
             let matchQuery = supabaseAdmin
                 .from('matches')
