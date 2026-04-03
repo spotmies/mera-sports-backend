@@ -7,6 +7,16 @@ const isUuid = (str) => {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
 };
 
+const DB_ID_BATCH_SIZE = 500;
+
+const chunkArray = (arr, size = DB_ID_BATCH_SIZE) => {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+    }
+    return chunks;
+};
+
 /**
  * GET league config for a category
  * GET /api/admin/events/:id/categories/:categoryId/league
@@ -599,16 +609,22 @@ export const deleteLeague = async (req, res) => {
 
                 if (matchesToDelete.length > 0) {
                     const matchIds = matchesToDelete.map(m => m.id);
+                    let totalDeleted = 0;
 
-                    // Delete only the filtered matches
-                    const { error: matchDeleteError } = await supabaseAdmin
-                        .from("matches")
-                        .delete()
-                        .in("id", matchIds);
+                    // Delete only the filtered matches, in chunks for large categories.
+                    for (const idChunk of chunkArray(matchIds)) {
+                        const { data: deletedChunk, error: matchDeleteError } = await supabaseAdmin
+                            .from("matches")
+                            .delete()
+                            .in("id", idChunk)
+                            .select("id");
 
-                    if (matchDeleteError) {
-                        // Continue with league deletion even if match deletion fails
-                    } else {
+                        if (matchDeleteError) {
+                            // Continue with league deletion even if match deletion fails
+                            break;
+                        }
+
+                        totalDeleted += deletedChunk?.length || 0;
                     }
                 } else {
                 }

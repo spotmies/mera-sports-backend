@@ -11,6 +11,48 @@ const isUuid = (str) => {
 /** Normalize round name for consistent matching. ALWAYS use for any round_name comparison. */
 const normalizeRoundName = (s) => String(s ?? "").trim().toLowerCase();
 const MAX_SETS_PER_MATCH = 9;
+const DB_ID_BATCH_SIZE = 500;
+const MAX_ROUND_ROBIN_GROUP_SIZE = 16;
+
+const chunkArray = (arr, size = DB_ID_BATCH_SIZE) => {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+    }
+    return chunks;
+};
+
+const normalizeText = (value) => String(value || '').trim().toLowerCase();
+
+const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
+    const { data: publishedRows, error } = await supabaseAdmin
+        .from('event_brackets')
+        .select('category_id, category')
+        .eq('event_id', eventId)
+        .eq('published', true);
+
+    if (error) throw error;
+    if (!Array.isArray(publishedRows) || publishedRows.length === 0) return false;
+
+    const targetId = String(categoryId || '').trim();
+    const targetLabel = String(categoryLabel || '').trim();
+    const targetIdNormalized = normalizeText(targetId);
+    const targetLabelNormalized = normalizeText(targetLabel);
+
+    return publishedRows.some((row) => {
+        const rowCategoryId = String(row?.category_id || '').trim();
+        const rowCategoryLabel = String(row?.category || '').trim();
+        const rowCategoryIdNormalized = normalizeText(rowCategoryId);
+        const rowCategoryLabelNormalized = normalizeText(rowCategoryLabel);
+
+        if (targetId && isUuid(targetId) && rowCategoryId && rowCategoryId === targetId) return true;
+        if (targetLabel && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetLabelNormalized) return true;
+        if (targetId && !isUuid(targetId) && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetIdNormalized) return true;
+        if (targetId && rowCategoryIdNormalized && rowCategoryIdNormalized === targetIdNormalized) return true;
+
+        return false;
+    });
+};
 
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
     // Clamp the fallback itself so callers can't accidentally pass an out-of-range default.
@@ -725,6 +767,26 @@ export const generateLeagueMatches = async (req, res) => {
                 if (!groupsMap.has(groupKey)) groupsMap.set(groupKey, []);
                 groupsMap.get(groupKey).push(p);
             });
+
+            // Hard safety check: block oversized single-group round-robin generation.
+            // n(n-1)/2 growth creates massive match counts for large groups (e.g., 64 => 2016).
+            const oversizedGroups = [];
+            for (const [groupKey, groupParticipants] of groupsMap.entries()) {
+                if (groupParticipants.length > MAX_ROUND_ROBIN_GROUP_SIZE) {
+                    oversizedGroups.push({ groupKey, size: groupParticipants.length });
+                }
+            }
+
+            if (oversizedGroups.length > 0) {
+                const groupSummary = oversizedGroups
+                    .map((g) => `${g.groupKey} (${g.size})`)
+                    .join(", ");
+
+                return res.status(400).json({
+                    success: false,
+                    message: `Cannot generate league matches. Oversized group(s): ${groupSummary}. Maximum ${MAX_ROUND_ROBIN_GROUP_SIZE} players per group is allowed.`
+                });
+            }
 
             for (const [groupKey, groupParticipants] of groupsMap.entries()) {
                 const n = groupParticipants.length;
@@ -2495,6 +2557,21 @@ export const deleteCategoryMatches = async (req, res) => {
             return false;
         });
 
+        // Legacy fallback: if categoryId matched nothing, try exact categoryName match.
+        // Guard: do NOT fallback for synthetic round IDs (e.g., *_R2) to avoid cross-round deletions.
+        if (
+            matchesToDelete.length === 0 &&
+            categoryId &&
+            categoryName &&
+            !String(categoryId).includes('_R')
+        ) {
+            matchesToDelete = allMatches.filter(match => {
+                const matchCategoryId = match.category_id;
+                if (!matchCategoryId) return false;
+                return String(matchCategoryId) === String(categoryName);
+            });
+        }
+
         // Optional: filter by roundName if provided (e.g., LEAGUE only)
         if (effectiveRoundName) {
             // Need to refetch with round_name for filtering, since initial select didn't include it
@@ -2520,20 +2597,24 @@ export const deleteCategoryMatches = async (req, res) => {
             });
         }
 
-        // Delete all matching matches
+        // Delete in chunks so very large categories don't exceed URL/query size limits.
         const matchIds = matchesToDelete.map(m => m.id);
-        const { data: deletedData, error: deleteError } = await supabaseAdmin
-            .from('matches')
-            .delete()
-            .in('id', matchIds)
-            .select();
+        let deletedCount = 0;
 
-        if (deleteError) {
-            console.error("Delete Category Matches Error:", deleteError);
-            throw deleteError;
+        for (const idChunk of chunkArray(matchIds)) {
+            const { data: deletedData, error: deleteError } = await supabaseAdmin
+                .from('matches')
+                .delete()
+                .in('id', idChunk)
+                .select('id');
+
+            if (deleteError) {
+                console.error("Delete Category Matches Error:", deleteError);
+                throw deleteError;
+            }
+
+            deletedCount += deletedData?.length || 0;
         }
-
-        const deletedCount = deletedData?.length || 0;
 
         return res.status(200).json({
             success: true,
@@ -2608,6 +2689,21 @@ export const clearCategoryScores = async (req, res) => {
             return false;
         });
 
+        // Legacy fallback: if categoryId matched nothing, try exact categoryName match.
+        // Guard: do NOT fallback for synthetic round IDs (e.g., *_R2) to avoid cross-round resets.
+        if (
+            matchesToUpdate.length === 0 &&
+            categoryId &&
+            categoryName &&
+            !String(categoryId).includes('_R')
+        ) {
+            matchesToUpdate = allMatches.filter(match => {
+                const matchCategoryId = match.category_id;
+                if (!matchCategoryId) return false;
+                return String(matchCategoryId) === String(categoryName);
+            });
+        }
+
         // Optional: filter by roundName if provided (e.g., LEAGUE only)
         if (effectiveRoundName) {
             matchesToUpdate = matchesToUpdate.filter(
@@ -2624,23 +2720,27 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         const matchIds = matchesToUpdate.map(m => m.id);
+        let updatedCount = 0;
 
-        const { data: updated, error: updateError } = await supabaseAdmin
-            .from("matches")
-            .update({
-                score: null,
-                winner: null,
-                status: "SCHEDULED",
-                updated_at: new Date().toISOString()
-            })
-            .in("id", matchIds)
-            .select("id");
+        // Update in chunks so large rounds/categories don't fail with oversized filters.
+        for (const idChunk of chunkArray(matchIds)) {
+            const { data: updated, error: updateError } = await supabaseAdmin
+                .from("matches")
+                .update({
+                    score: null,
+                    winner: null,
+                    status: "SCHEDULED",
+                    updated_at: new Date().toISOString()
+                })
+                .in("id", idChunk)
+                .select("id");
 
-        if (updateError) {
-            throw updateError;
+            if (updateError) {
+                throw updateError;
+            }
+
+            updatedCount += Array.isArray(updated) ? updated.length : 0;
         }
-
-        const updatedCount = Array.isArray(updated) ? updated.length : 0;
 
         return res.status(200).json({
             success: true,
@@ -2683,10 +2783,29 @@ export const getPublicMatches = async (req, res) => {
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
         if (isLeagueRequest && categoryId) {
+            // Synthetic round IDs (e.g. <uuid>_R2, <uuid>_R3) are NOT stored in event_brackets.
+            // They inherit publishing status from the base category. Skip the published check for these.
+            const isSyntheticRoundId = String(categoryId).includes('_R') || String(categoryId).includes('_HR');
+
+            if (!isSyntheticRoundId) {
+                const isPublished = await isLeagueCategoryPublishedForPublic({
+                    eventId,
+                    categoryId,
+                    categoryLabel: categoryName || categoryId,
+                });
+
+                if (!isPublished) {
+                    return res.status(200).json({
+                        success: true,
+                        matches: []
+                    });
+                }
+            }
+
             // Fetch League Matches
             let matchQuery = supabaseAdmin
                 .from('matches')
-                .select('id, round_name, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
+                .select('id, round_name, match_index, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
                 .eq('event_id', eventId)
                 .eq('round_name', 'LEAGUE')
                 .order('match_index', { ascending: true });
@@ -2916,7 +3035,7 @@ export const getPublicMatches = async (req, res) => {
 // Get Matches (Scoreboard)
 export const getMatches = async (req, res) => {
     const { eventId } = req.params;
-    const { categoryId, categoryName, roundName } = req.query;
+    const { categoryId, categoryName, roundName, bracketId } = req.query;
 
     try {
         // Start with base query - fetch all matches for event first
@@ -2946,6 +3065,10 @@ export const getMatches = async (req, res) => {
         // Filter by roundName if provided (do this first as it's most specific)
         if (roundName) {
             query = query.eq('round_name', roundName);
+        }
+
+        if (bracketId) {
+            query = query.eq('bracket_id', bracketId);
         }
 
         // Also try categoryName if provided (treat as category_id)
@@ -3004,6 +3127,14 @@ export const getMatches = async (req, res) => {
                 });
             }
 
+            if (bracketId) {
+                filteredMatches = filteredMatches.filter(m => {
+                    const matchBracketId = m.bracket_id;
+                    if (!matchBracketId) return false;
+                    return matchBracketId == bracketId || String(matchBracketId) === String(bracketId);
+                });
+            }
+
             return res.status(200).json({ success: true, matches: filteredMatches });
         }
 
@@ -3041,6 +3172,14 @@ export const getMatches = async (req, res) => {
             }
 
             finalMatches = filtered;
+        }
+
+        if (bracketId) {
+            finalMatches = finalMatches.filter(m => {
+                const matchBracketId = m.bracket_id;
+                if (!matchBracketId) return false;
+                return matchBracketId == bracketId || String(matchBracketId) === String(bracketId);
+            });
         }
 
         return res.status(200).json({ success: true, matches: finalMatches });

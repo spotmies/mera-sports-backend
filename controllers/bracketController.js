@@ -2509,6 +2509,13 @@ export const publishCategoryDraw = async (req, res) => {
 
         if (error) throw error;
 
+        if (!Array.isArray(data) || data.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "No draw found for this category. Generate schedule/draw first before publishing."
+            });
+        }
+
         res.json({
             success: true,
             message: published ? "Draw published successfully" : "Draw unpublished",

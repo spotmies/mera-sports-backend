@@ -120,3 +120,44 @@ export const sendRegistrationSuccessEmail = async (toEmail, details) => {
         return false;
     }
 };
+
+/**
+ * Send an OTP Email
+ * @param {string} toEmail 
+ * @param {string} otp 
+ */
+export const sendOtpEmail = async (toEmail, otp) => {
+    if (!toEmail) return;
+
+    const mailOptions = {
+        from: `"SPORTS PARAMOUNT" <${process.env.EMAIL_USER}>`,
+        to: toEmail,
+        subject: `Your Verification Code - Sports Paramount`,
+        html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
+                <div style="background-color: #4F46E5; padding: 20px; text-align: center; color: white;">
+                    <h1 style="margin: 0;">Verification Code</h1>
+                </div>
+                <div style="padding: 30px; text-align: center;">
+                    <p>Your one-time password (OTP) is:</p>
+                    <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #4F46E5; margin: 20px 0;">
+                        ${otp}
+                    </div>
+                    <p style="color: #666; font-size: 14px;">This code will expire in 10 minutes.</p>
+                </div>
+                <div style="background-color: #f3f4f6; padding: 15px; text-align: center; color: #6b7280; font-size: 12px;">
+                    &copy; ${new Date().getFullYear()} Sports Paramount. All rights reserved.
+                </div>
+            </div>
+        `
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        return true;
+    } catch (error) {
+        console.error("Error sending OTP email:", error);
+        return false;
+    }
+};
+
