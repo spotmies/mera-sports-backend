@@ -25,33 +25,74 @@ const chunkArray = (arr, size = DB_ID_BATCH_SIZE) => {
 const normalizeText = (value) => String(value || '').trim().toLowerCase();
 
 const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
-    const { data: publishedRows, error } = await supabaseAdmin
-        .from('event_brackets')
-        .select('category_id, category')
-        .eq('event_id', eventId)
-        .eq('published', true);
-
-    if (error) throw error;
-    if (!Array.isArray(publishedRows) || publishedRows.length === 0) return false;
-
     const targetId = String(categoryId || '').trim();
     const targetLabel = String(categoryLabel || '').trim();
-    const targetIdNormalized = normalizeText(targetId);
-    const targetLabelNormalized = normalizeText(targetLabel);
 
-    return publishedRows.some((row) => {
-        const rowCategoryId = String(row?.category_id || '').trim();
-        const rowCategoryLabel = String(row?.category || '').trim();
-        const rowCategoryIdNormalized = normalizeText(rowCategoryId);
-        const rowCategoryLabelNormalized = normalizeText(rowCategoryLabel);
+    // For sub-round IDs like `uuid_R2`, also check the BASE UUID
+    const subRoundMatch = targetId.match(/^(.+)_R\d+$/i);
+    const baseUUID = subRoundMatch ? subRoundMatch[1].trim() : null;
 
-        if (targetId && isUuid(targetId) && rowCategoryId && rowCategoryId === targetId) return true;
-        if (targetLabel && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetLabelNormalized) return true;
-        if (targetId && !isUuid(targetId) && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetIdNormalized) return true;
-        if (targetId && rowCategoryIdNormalized && rowCategoryIdNormalized === targetIdNormalized) return true;
+    // Build targeted queries instead of fetching ALL published rows
+    // This avoids false positives from unrelated categories
+    const queries = [];
 
-        return false;
-    });
+    if (targetId && isUuid(targetId)) {
+        // Direct UUID match on category_id column
+        queries.push(
+            supabaseAdmin
+                .from('event_brackets')
+                .select('id, category_id, category, published')
+                .eq('event_id', eventId)
+                .eq('category_id', targetId)
+                .eq('published', true)
+                .limit(1)
+        );
+    }
+
+    if (targetId) {
+        // Match category_id stored as text (for synthetic IDs like uuid_R2)
+        queries.push(
+            supabaseAdmin
+                .from('event_brackets')
+                .select('id, category_id, category, published')
+                .eq('event_id', eventId)
+                .eq('category', targetId)
+                .eq('published', true)
+                .limit(1)
+        );
+    }
+
+    // Sub-round fallback: if uuid_R2, check if base uuid is published
+    if (baseUUID) {
+        if (isUuid(baseUUID)) {
+            queries.push(
+                supabaseAdmin
+                    .from('event_brackets')
+                    .select('id, category_id, category, published')
+                    .eq('event_id', eventId)
+                    .eq('category_id', baseUUID)
+                    .eq('published', true)
+                    .limit(1)
+            );
+        }
+        queries.push(
+            supabaseAdmin
+                .from('event_brackets')
+                .select('id, category_id, category, published')
+                .eq('event_id', eventId)
+                .eq('category', baseUUID)
+                .eq('published', true)
+                .limit(1)
+        );
+    }
+
+    // Execute all queries in parallel
+    const results = await Promise.all(queries);
+    const anyPublished = results.some(({ data }) => Array.isArray(data) && data.length > 0);
+
+    console.log(`[isLeagueCategoryPublishedForPublic] categoryId=${targetId}, baseUUID=${baseUUID}, result=${anyPublished}`);
+
+    return anyPublished;
 };
 
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
@@ -2783,23 +2824,26 @@ export const getPublicMatches = async (req, res) => {
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
         if (isLeagueRequest && categoryId) {
-            // Synthetic round IDs (e.g. <uuid>_R2, <uuid>_R3) are NOT stored in event_brackets.
-            // They inherit publishing status from the base category. Skip the published check for these.
-            const isSyntheticRoundId = String(categoryId).includes('_R') || String(categoryId).includes('_HR');
+            // Synthetic round IDs (e.g. <uuid>_R2, <uuid>_R3) are published independently per round.
+            // We now properly check isLeagueCategoryPublishedForPublic for BOTH base rounds and sub-rounds.
+            const isPublished = await isLeagueCategoryPublishedForPublic({
+                eventId,
+                categoryId,
+                categoryLabel: categoryName || categoryId,
+            });
 
-            if (!isSyntheticRoundId) {
-                const isPublished = await isLeagueCategoryPublishedForPublic({
-                    eventId,
-                    categoryId,
-                    categoryLabel: categoryName || categoryId,
+            if (!isPublished) {
+                console.log(`[getPublicMatches] Category ${categoryId} rejected. Not published.`);
+                return res.status(200).json({
+                    success: true,
+                    matches: [],
+                    debugPublishedCheck: {
+                        eventId,
+                        categoryId,
+                        categoryLabel: categoryName || categoryId,
+                        wasPublished: false
+                    }
                 });
-
-                if (!isPublished) {
-                    return res.status(200).json({
-                        success: true,
-                        matches: []
-                    });
-                }
             }
 
             // Fetch League Matches

@@ -271,8 +271,11 @@ export const getCategoryDraw = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            // Synthetic IDs MUST take precedence over categoryLabel to avoid polluting base categories
+            query = query.eq("category", categoryId);
         } else if (categoryLabel) {
-            // Try exact match first
+            // Try exact match last
             query = query.eq("category", categoryLabel);
         } else {
             return res.status(400).json({ message: "Category ID or label required" });
@@ -323,11 +326,22 @@ export const getCategoryDraw = async (req, res) => {
         // Group by mode - prioritize BRACKET over MEDIA if both exist
         const mediaDraw = data.find(b => b.mode === 'MEDIA');
         const bracketDraw = data.find(b => b.mode === 'BRACKET');
+        // LEAGUE_PLACEHOLDER is created by generateLeagueMatches
+        const leaguePlaceholderRow = data.find(b => b.mode === 'LEAGUE_PLACEHOLDER' || b.mode === null || !b.mode);
 
         // Determine mode: BRACKET takes priority if it exists
         // Only return MEDIA mode if the mediaDraw actually has media files (media_urls or pdf_url)
         const hasActualMedia = mediaDraw && ((mediaDraw.media_urls && mediaDraw.media_urls.length > 0) || mediaDraw.pdf_url);
         const mode = bracketDraw ? 'BRACKET' : (hasActualMedia ? 'MEDIA' : null);
+
+        // Top-level published: true if ANY row for this category is published
+        // NOTE: mediaDraw.published is checked regardless of hasActualMedia because
+        // Pool/League publish creates MEDIA rows WITHOUT actual media files.
+        const isAnyPublished = Boolean(
+            (bracketDraw && bracketDraw.published) ||
+            (mediaDraw && mediaDraw.published) ||
+            (leaguePlaceholderRow && leaguePlaceholderRow.published)
+        );
 
         res.json({
             success: true,
@@ -335,6 +349,8 @@ export const getCategoryDraw = async (req, res) => {
                 categoryId: categoryId || null,
                 categoryLabel: categoryLabel || data[0]?.category,
                 mode: mode,
+                // Top-level published flag covers ALL modes (BRACKET, MEDIA, LEAGUE_SCOREBOARD)
+                published: isAnyPublished,
                 media: mediaDraw && hasActualMedia ? {
                     id: mediaDraw.id,
                     urls: mediaDraw.media_urls || [],
@@ -2492,34 +2508,96 @@ export const publishCategoryDraw = async (req, res) => {
             return res.status(400).json({ message: "Published must be boolean" });
         }
 
-        let query = supabaseAdmin
+        let findQuery = supabaseAdmin
             .from("event_brackets")
-            .update({ published, updated_at: new Date().toISOString() })
+            .select("*")
             .eq("event_id", eventId);
 
         if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
+            findQuery = findQuery.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            // Synthetic IDs MUST be isolated from base category label updates
+            findQuery = findQuery.eq("category", categoryId);
         } else if (categoryLabel) {
-            query = query.eq("category", categoryLabel);
+            findQuery = findQuery.eq("category", categoryLabel);
         } else {
             return res.status(400).json({ message: "Valid Category ID or Category Label required" });
         }
 
-        const { data, error } = await query.select();
+        console.log(`[publishCategoryDraw] eventId=${eventId}, categoryId=${categoryId}, categoryLabel=${categoryLabel}, published=${published}`);
 
-        if (error) throw error;
+        // DIRECT APPROACH: Update ALL rows matching this category in one shot.
+        // This covers ALL modes (MEDIA, BRACKET, LEAGUE_SCOREBOARD, etc.)
+        // and prevents ANY stale published=true rows from being missed.
+        
+        let updateCount = 0;
 
-        if (!Array.isArray(data) || data.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: "No draw found for this category. Generate schedule/draw first before publishing."
-            });
+        if (categoryId && isUuid(categoryId)) {
+            // Update by category_id (UUID column)
+            const { data: d1, error: e1 } = await supabaseAdmin
+                .from("event_brackets")
+                .update({ published, updated_at: new Date().toISOString() })
+                .eq("event_id", eventId)
+                .eq("category_id", categoryId)
+                .select("id");
+            if (e1) throw e1;
+            updateCount += (d1 || []).length;
+
+            // Also update rows where category TEXT = UUID string (legacy rows with null category_id)
+            const { data: d2, error: e2 } = await supabaseAdmin
+                .from("event_brackets")
+                .update({ published, updated_at: new Date().toISOString() })
+                .eq("event_id", eventId)
+                .eq("category", categoryId)
+                .select("id");
+            if (e2) throw e2;
+            updateCount += (d2 || []).length;
+        } else if (categoryId) {
+            // Synthetic ID like uuid_R2 — update by category text
+            const { data: d1, error: e1 } = await supabaseAdmin
+                .from("event_brackets")
+                .update({ published, updated_at: new Date().toISOString() })
+                .eq("event_id", eventId)
+                .eq("category", categoryId)
+                .select("id");
+            if (e1) throw e1;
+            updateCount += (d1 || []).length;
+        } else if (categoryLabel) {
+            const { data: d1, error: e1 } = await supabaseAdmin
+                .from("event_brackets")
+                .update({ published, updated_at: new Date().toISOString() })
+                .eq("event_id", eventId)
+                .eq("category", categoryLabel)
+                .select("id");
+            if (e1) throw e1;
+            updateCount += (d1 || []).length;
+        }
+
+        console.log(`[publishCategoryDraw] Updated ${updateCount} rows to published=${published}`);
+
+        // If no rows existed, insert a stub
+        let resultData = null;
+        if (updateCount === 0) {
+            const { data, error } = await supabaseAdmin
+                .from("event_brackets")
+                .insert({
+                    event_id: eventId,
+                    category_id: (categoryId && isUuid(categoryId)) ? categoryId : null,
+                    category: (categoryId && !isUuid(categoryId)) ? categoryId : (categoryLabel || categoryId),
+                    published: published,
+                    mode: 'MEDIA',
+                    round_name: 'LEAGUE',
+                    updated_at: new Date().toISOString()
+                })
+                .select();
+            if (error) throw error;
+            resultData = data;
         }
 
         res.json({
             success: true,
             message: published ? "Draw published successfully" : "Draw unpublished",
-            draws: data
+            draws: resultData
         });
     } catch (err) {
         console.error("PUBLISH DRAW ERROR:", err);

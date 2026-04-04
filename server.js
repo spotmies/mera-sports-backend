@@ -51,7 +51,7 @@ app.use("/api/public", publicRoutes);
 app.use("/api/seed", tempSeedRoutes); // Seed routes (for testing only - remove in production)
 
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });

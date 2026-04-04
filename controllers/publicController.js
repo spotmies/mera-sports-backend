@@ -29,40 +29,65 @@ const sanitizeFilterInput = (value) => {
 const normalizeText = (value) => String(value || "").trim().toLowerCase();
 
 const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
-    const { data: publishedRows, error } = await supabaseAdmin
-        .from("event_brackets")
-        .select("category_id, category")
-        .eq("event_id", eventId)
-        .eq("published", true);
-
-    if (error) throw error;
-    if (!Array.isArray(publishedRows) || publishedRows.length === 0) return false;
-
     const targetId = String(categoryId || "").trim();
-    const targetLabel = String(categoryLabel || "").trim();
-    const targetIdNormalized = normalizeText(targetId);
-    const targetLabelNormalized = normalizeText(targetLabel);
 
-    return publishedRows.some((row) => {
-        const rowCategoryId = String(row?.category_id || "").trim();
-        const rowCategoryLabel = String(row?.category || "").trim();
-        const rowCategoryIdNormalized = normalizeText(rowCategoryId);
-        const rowCategoryLabelNormalized = normalizeText(rowCategoryLabel);
+    // For sub-round IDs like `uuid_R2`, also check the BASE UUID
+    const subRoundMatch = targetId.match(/^(.+)_R\d+$/i);
+    const baseUUID = subRoundMatch ? subRoundMatch[1].trim() : null;
 
-        // 1) Exact UUID category_id match (most reliable)
-        if (targetId && isUuid(targetId) && rowCategoryId && rowCategoryId === targetId) return true;
+    // Build targeted queries instead of fetching ALL published rows
+    const queries = [];
 
-        // 2) Label match (used for non-UUID category ids and legacy draws)
-        if (targetLabel && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetLabelNormalized) return true;
+    if (targetId && isUuid(targetId)) {
+        queries.push(
+            supabaseAdmin
+                .from("event_brackets")
+                .select("id")
+                .eq("event_id", eventId)
+                .eq("category_id", targetId)
+                .eq("published", true)
+                .limit(1)
+        );
+    }
 
-        // 3) Fallback: when category id is stored in label for non-UUID categories
-        if (targetId && !isUuid(targetId) && rowCategoryLabelNormalized && rowCategoryLabelNormalized === targetIdNormalized) return true;
+    if (targetId) {
+        queries.push(
+            supabaseAdmin
+                .from("event_brackets")
+                .select("id")
+                .eq("event_id", eventId)
+                .eq("category", targetId)
+                .eq("published", true)
+                .limit(1)
+        );
+    }
 
-        // 4) Additional fallback: compare normalized category_id text values
-        if (targetId && rowCategoryIdNormalized && rowCategoryIdNormalized === targetIdNormalized) return true;
+    // Sub-round fallback: if uuid_R2, check if base uuid is published
+    if (baseUUID) {
+        if (isUuid(baseUUID)) {
+            queries.push(
+                supabaseAdmin
+                    .from("event_brackets")
+                    .select("id")
+                    .eq("event_id", eventId)
+                    .eq("category_id", baseUUID)
+                    .eq("published", true)
+                    .limit(1)
+            );
+        }
+        queries.push(
+            supabaseAdmin
+                .from("event_brackets")
+                .select("id")
+                .eq("event_id", eventId)
+                .eq("category", baseUUID)
+                .eq("published", true)
+                .limit(1)
+        );
+    }
 
-        return false;
-    });
+    const results = await Promise.all(queries);
+    return results.some(({ data }) => Array.isArray(data) && data.length > 0);
 };
 
 // GET /api/public/events/list
