@@ -103,8 +103,8 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
 // GET /api/events/list
 export const listEvents = async (req, res) => {
     try {
-        const { created_by, admin_id } = req.query;
-        let query = supabaseAdmin.from('events').select('*, event_registrations(count)').order('start_date', { ascending: true });
+        const { created_by, admin_id, page, limit, search } = req.query;
+        let query = supabaseAdmin.from('events').select('*, event_registrations(count)', { count: 'exact' }).order('start_date', { ascending: true });
 
         if (created_by) query = query.eq('created_by', created_by);
         if (admin_id) {
@@ -118,13 +118,25 @@ export const listEvents = async (req, res) => {
             query = query.or(orParts.join(','));
         }
 
-        const { data, error } = await query;
+        if (search) {
+            query = query.ilike('name', `%${search}%`);
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data, count, error } = await query;
         if (error) throw error;
         const events = (data || []).map((event) => ({
             ...event,
             public_id: getPublicEventId(event),
         }));
-        res.json({ success: true, events });
+        res.json({ success: true, events, total_count: count });
     } catch (err) {
         console.error("Fetch Events Error:", err);
         res.status(500).json({ message: "Internal Server Error" });

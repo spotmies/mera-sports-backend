@@ -8,6 +8,7 @@ import {
     deleteCategoryMedia,
     finalizeByes,
     getCategoryDraw,
+    getBulkDrawSummary,
     initBracket,
     notifyBracketPromotions,
     publishCategoryDraw,
@@ -22,6 +23,9 @@ import {
 import { verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
+
+// Bulk get draws summary for multiple events
+router.get("/events/draws/summary", verifyAdmin, getBulkDrawSummary);
 
 // Get draw/bracket for category
 router.get("/events/:id/categories/:categoryId/draw", verifyAdmin, getCategoryDraw);

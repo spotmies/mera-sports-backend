@@ -3,9 +3,24 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 // GET /api/admin/players
 export const listPlayers = async (req, res) => {
     try {
-        const { data: players, error } = await supabaseAdmin.from("users").select("*").eq("role", "player").order('created_at', { ascending: false });
+        const { page, limit, search } = req.query;
+        let query = supabaseAdmin.from("users").select("*", { count: 'exact' }).eq("role", "player").order('created_at', { ascending: false });
+
+        if (search) {
+            query = query.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,mobile.ilike.%${search}%,player_id.ilike.%${search}%`);
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: players, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, players });
+        res.json({ success: true, players, total_count: count });
     } catch (err) {
         console.error("ADMIN PLAYERS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch players" });

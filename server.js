@@ -30,6 +30,12 @@ dotenv.config({ quiet: true });
 const app = express();
 
 app.use(cors());
+
+// Webhook MUST be mounted before express.json() so it receives the raw body
+// Razorpay signature verification requires the exact raw bytes — JSON parsing corrupts it
+import { razorpayWebhook } from "./controllers/paymentController.js";
+app.post("/api/payment/webhook", express.raw({ type: "application/json" }), razorpayWebhook);
+
 app.use(express.json({ limit: "15mb" }));
 app.use(express.urlencoded({ limit: "15mb", extended: true }));
 app.use("/api/player", playerDashboardRoutes);

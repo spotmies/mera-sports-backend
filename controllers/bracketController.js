@@ -3716,3 +3716,67 @@ export const notifyBracketPromotions = async (req, res) => {
         return res.status(500).json({ message: "Failed to send notifications", error: err.message });
     }
 };
+
+/**
+ * Bulk fetch draws summary for multiple events
+ * GET /api/admin/events/draws/summary?eventIds=1,2,3
+ */
+export const getBulkDrawSummary = async (req, res) => {
+    try {
+        const { eventIds } = req.query;
+        if (!eventIds) return res.json({ success: true, summary: {} });
+
+        const ids = eventIds.split(',').filter(Boolean);
+        if (ids.length === 0) return res.json({ success: true, summary: {} });
+
+        const { data, error } = await supabaseAdmin
+            .from("event_brackets")
+            .select("event_id, mode, media_urls, pdf_url, bracket_data, published")
+            .in("event_id", ids);
+
+        if (error) throw error;
+
+        const summary = {};
+        ids.forEach(id => {
+            summary[id] = { drawsCount: 0, roundsCompleted: 0, drawsUploaded: false };
+        });
+
+        if (data) {
+            data.forEach(row => {
+                const eventId = String(row.event_id);
+                if (!summary[eventId]) {
+                    summary[eventId] = { drawsCount: 0, roundsCompleted: 0, drawsUploaded: false };
+                }
+
+                let hasDraw = false;
+
+                if (row.mode === 'MEDIA') {
+                    if ((row.media_urls && row.media_urls.length > 0) || row.pdf_url) {
+                        hasDraw = true;
+                    }
+                } else if (row.mode === 'BRACKET') {
+                    if (row.bracket_data) {
+                        hasDraw = true;
+                        const rounds = row.bracket_data.rounds || [];
+                        const completedRounds = rounds.filter(r =>
+                            r.matches && r.matches.length > 0 && r.matches.every(m => m.isComplete || m.is_complete)
+                        ).length;
+                        summary[eventId].roundsCompleted += completedRounds;
+                    }
+                } else if (row.mode === 'LEAGUE_PLACEHOLDER' || row.mode === 'LEAGUE') {
+                    hasDraw = true;
+                }
+
+                if (hasDraw) {
+                    summary[eventId].drawsCount++;
+                    summary[eventId].drawsUploaded = true;
+                }
+            });
+        }
+
+        res.json({ success: true, summary });
+    } catch (err) {
+        console.error("Bulk Draw Summary Error:", err);
+        res.status(500).json({ success: false, message: "Internal server error" });
+    }
+};

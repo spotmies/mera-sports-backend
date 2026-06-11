@@ -54,9 +54,24 @@ export const migrateApartments = async (req, res) => {
 
 export const getApartments = async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin.from("apartments").select("*").order('created_at', { ascending: false });
+        const { page, limit, search } = req.query;
+        let query = supabaseAdmin.from("apartments").select("*", { count: 'exact' }).order('created_at', { ascending: false });
+
+        if (search) {
+            query = query.or(`name.ilike.%${search}%,locality.ilike.%${search}%,zone.ilike.%${search}%`);
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, apartments: data || [] });
+        res.json({ success: true, apartments: data || [], total_count: count });
     } catch (error) { res.status(500).json({ success: false, message: "Failed to fetch apartments" }); }
 };
 
