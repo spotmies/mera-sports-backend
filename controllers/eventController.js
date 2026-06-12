@@ -104,7 +104,7 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
 export const listEvents = async (req, res) => {
     try {
         const { created_by, admin_id, page, limit, search } = req.query;
-        let query = supabaseAdmin.from('events').select('*, event_registrations(count)', { count: 'exact' }).order('start_date', { ascending: true });
+        let query = supabaseAdmin.from('events').select('*, event_registrations(count)', { count: 'exact' }).order('start_date', { ascending: false });
 
         if (created_by) query = query.eq('created_by', created_by);
         if (admin_id) {
