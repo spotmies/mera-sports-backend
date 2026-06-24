@@ -6,10 +6,13 @@ import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
-const getRazorpayInstance = () => new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const getRazorpayInstance = () => {
+    const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+        throw new Error("Razorpay credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET) are not configured");
+    }
+    return new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+};
 
 /**
  * Batch-resolve team member UUIDs and notify them of event registration.
@@ -96,6 +99,10 @@ export const createRazorpayOrder = async (req, res) => {
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
         if (!eventId || !amount) return res.status(400).json({ message: "Missing fields" });
+        const parsedAmount = parseFloat(amount);
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({ message: "Invalid amount: must be a positive number" });
+        }
         if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
 
         const resolvedEventId = await resolveEventIdByIdentifier(eventId);
@@ -103,7 +110,7 @@ export const createRazorpayOrder = async (req, res) => {
 
         const razorpay = getRazorpayInstance();
         const order = await razorpay.orders.create({
-            amount: Math.round(amount * 100), // paise
+            amount: Math.round(parsedAmount * 100), // paise
             currency: "INR",
             receipt: `rec_${Date.now()}`,
             notes: {
@@ -136,13 +143,20 @@ export const verifyRazorpayPayment = async (req, res) => {
             return res.status(400).json({ message: "Missing fields" });
         }
 
-        // Verify signature
+        // Verify signature (constant-time to prevent timing attacks)
+        const keySecret = process.env.RAZORPAY_KEY_SECRET;
+        if (!keySecret) return res.status(500).json({ message: "Payment verification not configured" });
+
         const expectedSignature = crypto
-            .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+            .createHmac("sha256", keySecret)
             .update(`${razorpay_order_id}|${razorpay_payment_id}`)
             .digest("hex");
 
-        if (expectedSignature !== razorpay_signature) {
+        const expectedBuf = Buffer.from(expectedSignature, "hex");
+        const receivedBuf = Buffer.from(razorpay_signature || "", "hex");
+        const sigValid = receivedBuf.length === expectedBuf.length &&
+            crypto.timingSafeEqual(expectedBuf, receivedBuf);
+        if (!sigValid) {
             return res.status(400).json({ success: false, message: "Payment signature verification failed" });
         }
 
@@ -207,29 +221,59 @@ export const verifyRazorpayPayment = async (req, res) => {
 
 // POST /api/payment/webhook  (raw body — mounted before express.json in server.js)
 export const razorpayWebhook = async (req, res) => {
+    // --- Validate secret is configured ---
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+        console.error("RAZORPAY_WEBHOOK_SECRET is not set");
+        return res.status(500).json({ error: "Webhook secret not configured" });
+    }
+
+    // --- Signature verification (constant-time to prevent timing attacks) ---
+    const rawBody = req.body; // Buffer from express.raw()
+    const receivedSignature = req.headers["x-razorpay-signature"] || "";
+
+    const expectedSignature = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(rawBody)
+        .digest("hex");
+
+    const expectedBuffer = Buffer.from(expectedSignature, "hex");
+    const receivedBuffer = Buffer.from(receivedSignature, "hex");
+    const isValidSignature =
+        receivedBuffer.length === expectedBuffer.length &&
+        crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+
+    if (!isValidSignature) {
+        console.error("Webhook signature mismatch");
+        return res.status(400).json({ error: "Invalid webhook signature" });
+    }
+
+    // --- Parse payload (non-recoverable if malformed — don't retry) ---
+    let payload;
     try {
-        const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-        if (!webhookSecret) {
-            console.error("RAZORPAY_WEBHOOK_SECRET is not set");
-            return res.status(500).json({ error: "Webhook secret not configured" });
-        }
+        payload = JSON.parse(rawBody.toString());
+    } catch (parseErr) {
+        console.error("Webhook payload parse error:", parseErr);
+        return res.status(400).json({ error: "Invalid webhook payload" });
+    }
 
-        // req.body is a Buffer because we used express.raw()
-        const rawBody = req.body;
-        const receivedSignature = req.headers["x-razorpay-signature"];
+    // --- Replay attack prevention: reject events older than 5 minutes ---
+    // Normalize to seconds — Razorpay uses seconds, but guard against ms payloads
+    let webhookTimestampSec = payload.created_at;
+    if (webhookTimestampSec > 1e12) webhookTimestampSec = webhookTimestampSec / 1000;
+    const nowSec = Date.now() / 1000;
+    if (webhookTimestampSec && (nowSec - webhookTimestampSec) > 300) {
+        // Older than 5 minutes — likely a replay; reject with 400 so Razorpay stops retrying
+        console.warn("Webhook rejected: stale event timestamp:", webhookTimestampSec);
+        return res.status(400).json({ error: "Stale webhook event" });
+    }
+    if (!webhookTimestampSec) {
+        // Missing timestamp (test/tool webhooks) — warn but allow through
+        console.warn("Webhook missing created_at timestamp, proceeding with caution");
+    }
 
-        const expectedSignature = crypto
-            .createHmac("sha256", webhookSecret)
-            .update(rawBody) // raw Buffer — NOT JSON.stringify
-            .digest("hex");
-
-        if (expectedSignature !== receivedSignature) {
-            console.error("Webhook signature mismatch");
-            return res.status(400).json({ error: "Invalid webhook signature" });
-        }
-
-        // Parse body now that signature is verified
-        const payload = JSON.parse(rawBody.toString());
+    // --- Process event (DB errors return 500 so Razorpay retries) ---
+    try {
         const event = payload.event;
         const paymentEntity = payload.payload?.payment?.entity;
 
@@ -240,18 +284,20 @@ export const razorpayWebhook = async (req, res) => {
             const notes = paymentEntity?.notes || {};
 
             // Idempotency check — skip if already processed by frontend callback
-            const { data: existing } = await supabaseAdmin
+            const { data: existing, error: existingErr } = await supabaseAdmin
                 .from("transactions")
                 .select("id")
                 .eq("order_id", orderId)
                 .maybeSingle();
+
+            if (existingErr) throw existingErr;
 
             if (!existing && notes.userId && notes.eventId) {
                 // Frontend callback never fired — create registration as fallback
                 const amount = amountPaise / 100;
                 const categories = notes.categories ? JSON.parse(notes.categories) : [];
 
-                const { data: transaction } = await supabaseAdmin.from("transactions").insert({
+                const { data: transaction, error: txErr } = await supabaseAdmin.from("transactions").insert({
                     order_id: orderId,
                     payment_id: paymentId,
                     payment_mode: "razorpay",
@@ -260,9 +306,11 @@ export const razorpayWebhook = async (req, res) => {
                     user_id: notes.userId,
                 }).select().maybeSingle();
 
+                if (txErr) throw txErr;
+
                 if (transaction) {
                     const registrationNo = `REG-${Date.now()}`;
-                    await supabaseAdmin.from("event_registrations").insert({
+                    const { error: regErr } = await supabaseAdmin.from("event_registrations").insert({
                         event_id: notes.eventId,
                         player_id: notes.userId,
                         registration_no: registrationNo,
@@ -271,6 +319,11 @@ export const razorpayWebhook = async (req, res) => {
                         transaction_id: transaction.id,
                         status: "verified",
                     });
+                    if (regErr) {
+                        // Roll back the transaction row so the next retry re-attempts both inserts
+                        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+                        throw regErr;
+                    }
                     console.log("Webhook fallback: registration created", registrationNo);
                 }
             }
@@ -278,15 +331,14 @@ export const razorpayWebhook = async (req, res) => {
 
         if (event === "payment.failed") {
             console.log("Payment failed:", paymentEntity?.id, "for order:", paymentEntity?.order_id);
-            // Optionally create a notification for the player
         }
 
-        // Always respond 200 quickly — Razorpay retries for up to 24h if you don't
+        // Respond 200 — Razorpay retries for up to 24h on non-2xx
         res.json({ received: true });
     } catch (err) {
-        console.error("Webhook Error:", err);
-        // Still return 200 to stop Razorpay retrying a broken payload
-        res.json({ received: true });
+        console.error("Webhook processing error (recoverable):", err);
+        // Return 500 so Razorpay retries transient DB/infra failures
+        res.status(500).json({ error: "Webhook processing failed, will retry" });
     }
 };
 

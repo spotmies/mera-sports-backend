@@ -1,5 +1,9 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
+// Strip PostgREST filter-injection chars and SQL LIKE wildcards (% matches all rows, _ matches any char)
+const sanitizeSearch = (s) =>
+    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+
 // GET /api/admin/players
 export const listPlayers = async (req, res) => {
     try {
@@ -7,7 +11,10 @@ export const listPlayers = async (req, res) => {
         let query = supabaseAdmin.from("users").select("*", { count: 'exact' }).eq("role", "player").order('created_at', { ascending: false });
 
         if (search) {
-            query = query.or(`first_name.ilike.%${search}%,last_name.ilike.%${search}%,email.ilike.%${search}%,mobile.ilike.%${search}%,player_id.ilike.%${search}%`);
+            const safe = sanitizeSearch(search);
+            if (safe) {
+                query = query.or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%`);
+            }
         }
 
         if (page && limit) {
@@ -34,6 +41,7 @@ export const getPlayerDetails = async (req, res) => {
 
         const { data: player, error } = await supabaseAdmin.from("users").select("*").eq("id", id).maybeSingle();
         if (error) throw error;
+        if (!player) return res.status(404).json({ success: false, message: "Player not found" });
 
         const { data: schoolDetails } = await supabaseAdmin.from("player_school_details").select("*").eq("player_id", id).maybeSingle();
         if (schoolDetails) {

@@ -3,6 +3,9 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
+const sanitizeSearch = (s) =>
+    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+
 // Supports both numeric (bigint) and UUID event IDs as used throughout the DB.
 const normalizeEventId = (id) => {
     if (id === null || id === undefined || String(id).trim() === '') return null;
@@ -119,7 +122,8 @@ export const listEvents = async (req, res) => {
         }
 
         if (search) {
-            query = query.ilike('name', `%${search}%`);
+            const safe = sanitizeSearch(search);
+            if (safe) query = query.ilike('name', `%${safe}%`);
         }
 
         if (page && limit) {

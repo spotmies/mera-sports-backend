@@ -4,6 +4,9 @@ import { fileURLToPath } from "url";
 import XLSX from "xlsx";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
+const sanitizeSearch = (s) =>
+    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Adjust path since we are in controllers/ now, not routes/
@@ -58,7 +61,10 @@ export const getApartments = async (req, res) => {
         let query = supabaseAdmin.from("apartments").select("*", { count: 'exact' }).order('created_at', { ascending: false });
 
         if (search) {
-            query = query.or(`name.ilike.%${search}%,locality.ilike.%${search}%,zone.ilike.%${search}%`);
+            const safe = sanitizeSearch(search);
+            if (safe) {
+                query = query.or(`name.ilike.%${safe}%,locality.ilike.%${safe}%,zone.ilike.%${safe}%`);
+            }
         }
 
         if (page && limit) {
