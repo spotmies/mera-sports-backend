@@ -34,14 +34,14 @@ export const getAllCategories = async (req, res) => {
 /* ================= REGISTRATIONS & TRANSACTIONS ================= */
 export const getRegistrations = async (req, res) => {
     try {
-        const { eventId, admin_id } = req.query;
+        const { eventId, admin_id, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
                 users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
-            `)
+            `, { count: 'exact' })
             .order('created_at', { ascending: false });
 
         if (eventId) query = query.eq('event_id', eventId);
@@ -78,9 +78,17 @@ export const getRegistrations = async (req, res) => {
             query = query.in('event_id', eventIds);
         }
 
-        const { data: registrations, error } = await query;
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: registrations, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, registrations });
+        res.json({ success: true, registrations, total_count: count });
     } catch (err) {
         console.error("ADMIN REGISTRATIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch registrations" });
@@ -89,13 +97,14 @@ export const getRegistrations = async (req, res) => {
 
 export const getTransactions = async (req, res) => {
     try {
-        const { eventId, admin_id } = req.query;
+        const { eventId, admin_id, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment )
-            `)
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
+                transactions:transaction_id ( id, payment_mode, payment_id, order_id )
+            `, { count: 'exact' })
             .order('created_at', { ascending: false });
 
         if (eventId) query = query.eq('event_id', eventId);
@@ -127,9 +136,17 @@ export const getTransactions = async (req, res) => {
             query = query.in('event_id', eventIds);
         }
 
-        const { data: transactions, error } = await query;
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: transactions, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, transactions });
+        res.json({ success: true, transactions, total_count: count });
     } catch (err) {
         console.error("ADMIN TRANSACTIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch transactions" });

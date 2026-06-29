@@ -1,8 +1,18 @@
+import crypto from "crypto";
+import Razorpay from "razorpay";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+
+const getRazorpayInstance = () => {
+    const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+        throw new Error("Razorpay credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET) are not configured");
+    }
+    return new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+};
 
 /**
  * Batch-resolve team member UUIDs and notify them of event registration.
@@ -81,6 +91,256 @@ async function notifyTeamMembersOfRegistration(teamId, eventId) {
         console.error('notifyTeamMembersOfRegistration error:', e);
     }
 }
+
+// POST /api/payment/create-razorpay-order
+export const createRazorpayOrder = async (req, res) => {
+    try {
+        const { eventId, amount } = req.body;
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (!eventId || !amount) return res.status(400).json({ message: "Missing fields" });
+        const parsedAmount = parseFloat(amount);
+        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({ message: "Invalid amount: must be a positive number" });
+        }
+        if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+
+        const resolvedEventId = await resolveEventIdByIdentifier(eventId);
+        if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
+
+        const razorpay = getRazorpayInstance();
+        const order = await razorpay.orders.create({
+            amount: Math.round(parsedAmount * 100), // paise
+            currency: "INR",
+            receipt: `rec_${Date.now()}`,
+            notes: {
+                // Stored so webhook fallback can create registration if frontend callback fails
+                userId,
+                eventId: resolvedEventId,
+            },
+        });
+
+        res.json({
+            success: true,
+            order_id: order.id,
+            amount: order.amount,
+            currency: order.currency,
+            key_id: process.env.RAZORPAY_KEY_ID,
+        });
+    } catch (err) {
+        console.error("Razorpay Order Error:", err);
+        res.status(500).json({ message: "Failed to create payment order" });
+    }
+};
+
+// POST /api/payment/verify-razorpay-payment
+export const verifyRazorpayPayment = async (req, res) => {
+    try {
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, eventId, amount, categories, teamId } = req.body;
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId || !amount || !categories) {
+            return res.status(400).json({ message: "Missing fields" });
+        }
+
+        // Verify signature (constant-time to prevent timing attacks)
+        const keySecret = process.env.RAZORPAY_KEY_SECRET;
+        if (!keySecret) return res.status(500).json({ message: "Payment verification not configured" });
+
+        const expectedSignature = crypto
+            .createHmac("sha256", keySecret)
+            .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+            .digest("hex");
+
+        const expectedBuf = Buffer.from(expectedSignature, "hex");
+        const receivedBuf = Buffer.from(razorpay_signature || "", "hex");
+        const sigValid = receivedBuf.length === expectedBuf.length &&
+            crypto.timingSafeEqual(expectedBuf, receivedBuf);
+        if (!sigValid) {
+            return res.status(400).json({ success: false, message: "Payment signature verification failed" });
+        }
+
+        const resolvedEventId = await resolveEventIdByIdentifier(eventId);
+        if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
+
+        // Create verified transaction
+        const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
+            order_id: razorpay_order_id,
+            payment_id: razorpay_payment_id,
+            payment_mode: "razorpay",
+            amount,
+            currency: "INR",
+            user_id: userId,
+        }).select().maybeSingle();
+
+        if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
+
+        // Create registration — immediately verified since payment is confirmed
+        const registrationNo = `REG-${Date.now()}`;
+        const { error: regError } = await supabaseAdmin.from("event_registrations").insert({
+            event_id: resolvedEventId,
+            player_id: userId,
+            registration_no: registrationNo,
+            categories,
+            amount_paid: amount,
+            transaction_id: transaction.id,
+            team_id: teamId || null,
+            status: "verified",
+        });
+
+        if (regError) {
+            await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+            throw regError;
+        }
+
+        // Email (async, non-blocking)
+        (async () => {
+            try {
+                const { data: user } = await supabaseAdmin.from("users").select("email, first_name").eq("id", userId).single();
+                const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
+                if (user?.email) {
+                    await sendRegistrationEmail(user.email, {
+                        playerName: user.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: "Confirmed"
+                    });
+                }
+            } catch (e) { console.error("Email Error:", e); }
+        })();
+
+        if (teamId) {
+            notifyTeamMembersOfRegistration(teamId, resolvedEventId).catch(e =>
+                console.error("Team registration notification error:", e)
+            );
+        }
+
+        res.json({ success: true, message: "Payment verified", registrationNo });
+    } catch (err) {
+        console.error("Razorpay Verify Error:", err);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
+// POST /api/payment/webhook  (raw body — mounted before express.json in server.js)
+export const razorpayWebhook = async (req, res) => {
+    // --- Validate secret is configured ---
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+        console.error("RAZORPAY_WEBHOOK_SECRET is not set");
+        return res.status(500).json({ error: "Webhook secret not configured" });
+    }
+
+    // --- Signature verification (constant-time to prevent timing attacks) ---
+    const rawBody = req.body; // Buffer from express.raw()
+    const receivedSignature = req.headers["x-razorpay-signature"] || "";
+
+    const expectedSignature = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(rawBody)
+        .digest("hex");
+
+    const expectedBuffer = Buffer.from(expectedSignature, "hex");
+    const receivedBuffer = Buffer.from(receivedSignature, "hex");
+    const isValidSignature =
+        receivedBuffer.length === expectedBuffer.length &&
+        crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+
+    if (!isValidSignature) {
+        console.error("Webhook signature mismatch");
+        return res.status(400).json({ error: "Invalid webhook signature" });
+    }
+
+    // --- Parse payload (non-recoverable if malformed — don't retry) ---
+    let payload;
+    try {
+        payload = JSON.parse(rawBody.toString());
+    } catch (parseErr) {
+        console.error("Webhook payload parse error:", parseErr);
+        return res.status(400).json({ error: "Invalid webhook payload" });
+    }
+
+    // --- Replay attack prevention: reject events older than 5 minutes ---
+    // Normalize to seconds — Razorpay uses seconds, but guard against ms payloads
+    let webhookTimestampSec = payload.created_at;
+    if (webhookTimestampSec > 1e12) webhookTimestampSec = webhookTimestampSec / 1000;
+    const nowSec = Date.now() / 1000;
+    if (webhookTimestampSec && (nowSec - webhookTimestampSec) > 300) {
+        // Older than 5 minutes — likely a replay; reject with 400 so Razorpay stops retrying
+        console.warn("Webhook rejected: stale event timestamp:", webhookTimestampSec);
+        return res.status(400).json({ error: "Stale webhook event" });
+    }
+    if (!webhookTimestampSec) {
+        // Missing timestamp (test/tool webhooks) — warn but allow through
+        console.warn("Webhook missing created_at timestamp, proceeding with caution");
+    }
+
+    // --- Process event (DB errors return 500 so Razorpay retries) ---
+    try {
+        const event = payload.event;
+        const paymentEntity = payload.payload?.payment?.entity;
+
+        if (event === "payment.captured") {
+            const orderId = paymentEntity?.order_id;
+            const paymentId = paymentEntity?.id;
+            const amountPaise = paymentEntity?.amount; // in paise
+            const notes = paymentEntity?.notes || {};
+
+            // Idempotency check — skip if already processed by frontend callback
+            const { data: existing, error: existingErr } = await supabaseAdmin
+                .from("transactions")
+                .select("id")
+                .eq("order_id", orderId)
+                .maybeSingle();
+
+            if (existingErr) throw existingErr;
+
+            if (!existing && notes.userId && notes.eventId) {
+                // Frontend callback never fired — create registration as fallback
+                const amount = amountPaise / 100;
+                const categories = notes.categories ? JSON.parse(notes.categories) : [];
+
+                const { data: transaction, error: txErr } = await supabaseAdmin.from("transactions").insert({
+                    order_id: orderId,
+                    payment_id: paymentId,
+                    payment_mode: "razorpay",
+                    amount,
+                    currency: "INR",
+                    user_id: notes.userId,
+                }).select().maybeSingle();
+
+                if (txErr) throw txErr;
+
+                if (transaction) {
+                    const registrationNo = `REG-${Date.now()}`;
+                    const { error: regErr } = await supabaseAdmin.from("event_registrations").insert({
+                        event_id: notes.eventId,
+                        player_id: notes.userId,
+                        registration_no: registrationNo,
+                        categories,
+                        amount_paid: amount,
+                        transaction_id: transaction.id,
+                        status: "verified",
+                    });
+                    if (regErr) {
+                        // Roll back the transaction row so the next retry re-attempts both inserts
+                        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+                        throw regErr;
+                    }
+                    console.log("Webhook fallback: registration created", registrationNo);
+                }
+            }
+        }
+
+        if (event === "payment.failed") {
+            console.log("Payment failed:", paymentEntity?.id, "for order:", paymentEntity?.order_id);
+        }
+
+        // Respond 200 — Razorpay retries for up to 24h on non-2xx
+        res.json({ received: true });
+    } catch (err) {
+        console.error("Webhook processing error (recoverable):", err);
+        // Return 500 so Razorpay retries transient DB/infra failures
+        res.status(500).json({ error: "Webhook processing failed, will retry" });
+    }
+};
 
 // POST /api/payment/submit-manual-payment
 export const submitManualPayment = async (req, res) => {

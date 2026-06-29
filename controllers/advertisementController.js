@@ -3,9 +3,20 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 
 export const getAdvertisements = async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin.from("advertisements").select("*").order("created_at", { ascending: false });
+        const { page, limit } = req.query;
+        let query = supabaseAdmin.from("advertisements").select("*", { count: 'exact' }).order("created_at", { ascending: false });
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, advertisements: data });
+        res.json({ success: true, advertisements: data, total_count: count });
     } catch (err) { res.status(500).json({ message: "Failed to fetch advertisements" }); }
 };
 

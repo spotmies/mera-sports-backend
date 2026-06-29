@@ -1,11 +1,33 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
+// Strip PostgREST filter-injection chars and SQL LIKE wildcards (% matches all rows, _ matches any char)
+const sanitizeSearch = (s) =>
+    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+
 // GET /api/admin/players
 export const listPlayers = async (req, res) => {
     try {
-        const { data: players, error } = await supabaseAdmin.from("users").select("*").eq("role", "player").order('created_at', { ascending: false });
+        const { page, limit, search } = req.query;
+        let query = supabaseAdmin.from("users").select("*", { count: 'exact' }).eq("role", "player").order('created_at', { ascending: false });
+
+        if (search) {
+            const safe = sanitizeSearch(search);
+            if (safe) {
+                query = query.or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%`);
+            }
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: players, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, players });
+        res.json({ success: true, players, total_count: count });
     } catch (err) {
         console.error("ADMIN PLAYERS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch players" });
@@ -19,6 +41,7 @@ export const getPlayerDetails = async (req, res) => {
 
         const { data: player, error } = await supabaseAdmin.from("users").select("*").eq("id", id).maybeSingle();
         if (error) throw error;
+        if (!player) return res.status(404).json({ success: false, message: "Player not found" });
 
         const { data: schoolDetails } = await supabaseAdmin.from("player_school_details").select("*").eq("player_id", id).maybeSingle();
         if (schoolDetails) {
