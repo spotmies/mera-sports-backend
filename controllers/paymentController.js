@@ -2,9 +2,73 @@ import crypto from "crypto";
 import Razorpay from "razorpay";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
-import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+
+// ── Server-side fee computation ──────────────────────────────────────────────
+// The fee shown in the player app is derived from events.categories (jsonb).
+// It is recomputed here from the same data so the charged amount can never be
+// tampered with from the browser. Mirrors EventRegistration.tsx fee logic.
+const TEAM_MATCH_TYPES = ["doubles", "mixed doubles", "team"];
+const DEFAULT_CATEGORY_FEE = 500; // player-app fallback when a category has no fee
+const MAX_TEAM_MEMBERS = 100;
+
+const normalizeEventCategories = (event) => {
+    const raw = Array.isArray(event?.categories) ? event.categories : [];
+    return raw.map((c, idx) => {
+        const isObj = c && typeof c === "object";
+        const name = (isObj ? (c.category || c.Category || c.name || "Unknown") : String(c)).trim();
+        return {
+            id: (isObj && c.id) || `cat-${idx}`,
+            name,
+            gender: (isObj && c.gender) || "Mixed",
+            matchType: (isObj && c.matchType) || "Singles",
+            entryFee: isObj ? (Number(c.entryFee ?? c.fee) || null) : null,
+        };
+    });
+};
+
+// Same matching rules the player app uses when it maps selected ids to categories
+const findEventCategory = (normalizedCategories, catId) =>
+    normalizedCategories.find(
+        (c) => c.id === catId || `${c.name}-${c.gender}` === catId || c.name === catId
+    ) || null;
+
+// Returns { fee, categoryObjects }. Throws (statusCode 400) on unknown category ids.
+const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) => {
+    const normalized = normalizeEventCategories(event);
+    const baseFee = normalized[0]?.entryFee || DEFAULT_CATEGORY_FEE;
+
+    let feeSum = 0;
+    let hasTeamMatchType = false;
+    const categoryObjects = [];
+
+    for (const rawId of requestedCategoryIds) {
+        const catId = String(rawId && typeof rawId === "object" ? rawId.id : rawId);
+        const cat = findEventCategory(normalized, catId);
+        if (!cat) {
+            const err = new Error(`Unknown category for this event: ${catId}`);
+            err.statusCode = 400;
+            throw err;
+        }
+        const fee = cat.entryFee || baseFee;
+        feeSum += fee;
+        if (TEAM_MATCH_TYPES.some((t) => cat.matchType.toLowerCase().includes(t))) {
+            hasTeamMatchType = true;
+        }
+        categoryObjects.push({ id: cat.id, name: cat.name, gender: cat.gender, fee, matchType: cat.matchType });
+    }
+
+    // Team pricing: fee × (captain + members) — members only count for team match types
+    let multiplier = 1;
+    const memberCount = Number.parseInt(teamMemberCount, 10);
+    if (hasTeamMatchType && Number.isInteger(memberCount) && memberCount > 0) {
+        multiplier = 1 + Math.min(memberCount, MAX_TEAM_MEMBERS);
+    }
+
+    return { fee: feeSum * multiplier, categoryObjects };
+};
 
 const getRazorpayInstance = () => {
     const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
@@ -95,28 +159,42 @@ async function notifyTeamMembersOfRegistration(teamId, eventId) {
 // POST /api/payment/create-razorpay-order
 export const createRazorpayOrder = async (req, res) => {
     try {
-        const { eventId, amount } = req.body;
+        const { eventId, amount, categories, teamMemberCount, teamId } = req.body;
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
-        if (!eventId || !amount) return res.status(400).json({ message: "Missing fields" });
-        const parsedAmount = parseFloat(amount);
-        if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-            return res.status(400).json({ message: "Invalid amount: must be a positive number" });
-        }
         if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+        if (!eventId || !Array.isArray(categories) || categories.length === 0) {
+            return res.status(400).json({ message: "Missing fields: eventId and categories are required" });
+        }
 
-        const resolvedEventId = await resolveEventIdByIdentifier(eventId);
-        if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
+        const event = await resolveEventByIdentifier(eventId, "id, categories, payment_gateway");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+        if ((event.payment_gateway || "manual") !== "razorpay") {
+            return res.status(400).json({ message: "This event does not accept Razorpay payments" });
+        }
 
+        // The server-computed fee is authoritative. The client-sent amount is only
+        // compared so a stale or tampered UI fails loudly instead of mischarging.
+        const { fee } = computeRegistrationFee(event, categories, teamMemberCount);
+        if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
+            return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
+        }
+
+        const catIds = categories.map((c) => (c && typeof c === "object" ? c.id : c)).join(",");
         const razorpay = getRazorpayInstance();
         const order = await razorpay.orders.create({
-            amount: Math.round(parsedAmount * 100), // paise
+            amount: Math.round(fee * 100), // paise
             currency: "INR",
             receipt: `rec_${Date.now()}`,
             notes: {
-                // Stored so webhook fallback can create registration if frontend callback fails
+                // Consumed by verify (ownership/event checks) and by the webhook
+                // fallback to rebuild the registration if the browser callback dies.
+                // Razorpay caps note values at 256 chars — skip catIds if oversized.
                 userId,
-                eventId: resolvedEventId,
+                eventId: String(event.id),
+                catIds: catIds.length <= 250 ? catIds : "",
+                teamMemberCount: String(Number.parseInt(teamMemberCount, 10) || 0),
+                teamId: teamId || "",
             },
         });
 
@@ -129,6 +207,7 @@ export const createRazorpayOrder = async (req, res) => {
         });
     } catch (err) {
         console.error("Razorpay Order Error:", err);
+        if (err.statusCode === 400) return res.status(400).json({ message: err.message });
         res.status(500).json({ message: "Failed to create payment order" });
     }
 };
@@ -136,10 +215,11 @@ export const createRazorpayOrder = async (req, res) => {
 // POST /api/payment/verify-razorpay-payment
 export const verifyRazorpayPayment = async (req, res) => {
     try {
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, eventId, amount, categories, teamId } = req.body;
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, eventId, categories, teamId } = req.body;
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId || !amount || !categories) {
+        if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId || !categories) {
             return res.status(400).json({ message: "Missing fields" });
         }
 
@@ -163,12 +243,45 @@ export const verifyRazorpayPayment = async (req, res) => {
         const resolvedEventId = await resolveEventIdByIdentifier(eventId);
         if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
 
+        // Replay protection — one Razorpay order can produce exactly one registration.
+        // Without this, a single genuine payment could be re-submitted with different
+        // eventIds/categories to mint unlimited verified registrations.
+        const { data: existingTx, error: existingTxErr } = await supabaseAdmin
+            .from("transactions")
+            .select("id")
+            .eq("order_id", razorpay_order_id)
+            .maybeSingle();
+        if (existingTxErr) throw existingTxErr;
+        if (existingTx) {
+            return res.status(409).json({ success: false, message: "This payment has already been processed" });
+        }
+
+        // Fetch the order from Razorpay — ties the payment to the user, event and
+        // server-computed amount from order creation. Body values are untrusted.
+        const razorpay = getRazorpayInstance();
+        let order;
+        try {
+            order = await razorpay.orders.fetch(razorpay_order_id);
+        } catch (fetchErr) {
+            console.error("Razorpay order fetch failed:", fetchErr);
+            return res.status(400).json({ success: false, message: "Payment order not found" });
+        }
+        const orderNotes = order?.notes || {};
+        if (orderNotes.userId !== userId) {
+            return res.status(403).json({ success: false, message: "Order does not belong to this user" });
+        }
+        if (String(orderNotes.eventId) !== String(resolvedEventId)) {
+            return res.status(400).json({ success: false, message: "Order does not match this event" });
+        }
+
+        const paidAmount = order.amount / 100; // authoritative — set server-side at order creation
+
         // Create verified transaction
         const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
             order_id: razorpay_order_id,
             payment_id: razorpay_payment_id,
             payment_mode: "razorpay",
-            amount,
+            amount: paidAmount,
             currency: "INR",
             user_id: userId,
         }).select().maybeSingle();
@@ -182,7 +295,7 @@ export const verifyRazorpayPayment = async (req, res) => {
             player_id: userId,
             registration_no: registrationNo,
             categories,
-            amount_paid: amount,
+            amount_paid: paidAmount,
             transaction_id: transaction.id,
             team_id: teamId || null,
             status: "verified",
@@ -200,7 +313,7 @@ export const verifyRazorpayPayment = async (req, res) => {
                 const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
                 if (user?.email) {
                     await sendRegistrationEmail(user.email, {
-                        playerName: user.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: "Confirmed"
+                        playerName: user.first_name, eventName: event?.name, registrationNo, amount: paidAmount, category: categories, date: new Date(), status: "Confirmed"
                     });
                 }
             } catch (e) { console.error("Email Error:", e); }
@@ -295,7 +408,26 @@ export const razorpayWebhook = async (req, res) => {
             if (!existing && notes.userId && notes.eventId) {
                 // Frontend callback never fired — create registration as fallback
                 const amount = amountPaise / 100;
-                const categories = notes.categories ? JSON.parse(notes.categories) : [];
+
+                // Rebuild category objects from the ids stored in order notes,
+                // using the event's own category definitions (fees included).
+                let categories = [];
+                try {
+                    if (notes.catIds) {
+                        const { data: event } = await supabaseAdmin
+                            .from("events")
+                            .select("id, categories")
+                            .eq("id", notes.eventId)
+                            .maybeSingle();
+                        if (event) {
+                            categories = computeRegistrationFee(event, notes.catIds.split(","), 0).categoryObjects;
+                        }
+                    } else if (notes.categories) {
+                        categories = JSON.parse(notes.categories);
+                    }
+                } catch (catErr) {
+                    console.warn("Webhook: could not reconstruct categories:", catErr.message);
+                }
 
                 const { data: transaction, error: txErr } = await supabaseAdmin.from("transactions").insert({
                     order_id: orderId,
@@ -317,6 +449,7 @@ export const razorpayWebhook = async (req, res) => {
                         categories,
                         amount_paid: amount,
                         transaction_id: transaction.id,
+                        team_id: notes.teamId || null,
                         status: "verified",
                     });
                     if (regErr) {

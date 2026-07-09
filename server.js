@@ -23,7 +23,6 @@ import instituteRoutes from "./routes/instituteRoutes.js"; // Added Institute Ro
 import playerDashboardRoutes from "./routes/playerDashboardroutes.js";
 import publicRoutes from "./routes/publicRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
-import tempSeedRoutes from "./routes/tempSeedRoutes.js"; // Seed routes for testing
 
 dotenv.config({ quiet: true });
 
@@ -54,7 +53,6 @@ app.use("/api/teams", teamRoutes);
 app.use("/api/notifications", notificationRoutes); // Mounted Notification Routes
 app.use("/api/institute", instituteRoutes); // Institute endpoints
 app.use("/api/public", publicRoutes);
-app.use("/api/seed", tempSeedRoutes); // Seed routes (for testing only - remove in production)
 
 
 const PORT = process.env.PORT || 5001;
