@@ -1,0 +1,88 @@
+[2026-03-20T08:23:36.403Z] ⚽ Starting Football Event Seeding Script...
+
+[2026-03-20T08:23:36.538Z] 📡 Connecting to: https://mkeytghrgjbnxnhbxdkw.supabase.co
+[2026-03-20T08:23:37.375Z] ✅ Using Super Admin: superadmin_1773743268240@merasports.com
+[2026-03-20T08:23:37.376Z] 
+👥 Ensuring at least 264 test players exist...
+[2026-03-20T08:23:43.265Z] ✅ Ready with 264 test players
+[2026-03-20T08:23:43.267Z] 
+🧹 STEP 3: Cleaning up old football test events...
+[2026-03-20T08:23:43.535Z] ✅ Cleaned up 1 old football event(s)
+[2026-03-20T08:23:43.537Z] 
+📋 STEP 4: Defining football categories...
+[2026-03-20T08:23:43.540Z] ✅ Category A: Open (Male) - Individual Test (64 individual players)
+[2026-03-20T08:23:43.541Z] ✅ Category B: Elite (Male) - Team 24 (24 teams)
+[2026-03-20T08:23:43.542Z] 
+⚽ STEP 5: Creating football event...
+[2026-03-20T08:23:43.681Z] ✅ Event Created: Mera Sports Football Cup 2026 (ID: 24)
+[2026-03-20T08:23:43.682Z] 
+👤 STEP 6A: Registering 64 individual players for Category A...
+[2026-03-20T08:23:47.691Z] ✅ Individual registrations created: 64/64
+[2026-03-20T08:23:47.693Z] 
+🏟️ STEP 6B: Creating 24 teams for Category B...
+[2026-03-20T08:23:47.873Z]    ✅ Registered team: Aurora United (11 players)
+[2026-03-20T08:23:48.080Z]    ✅ Registered team: Titan Rangers (11 players)
+[2026-03-20T08:23:48.282Z]    ✅ Registered team: Coastal Mariners (11 players)
+[2026-03-20T08:23:48.490Z]    ✅ Registered team: Desert Eagles (11 players)
+[2026-03-20T08:23:48.692Z]    ✅ Registered team: Valley Vipers (11 players)
+[2026-03-20T08:23:48.809Z]    ✅ Registered team: Capital Comets (11 players)
+[2026-03-20T08:23:49.003Z]    ✅ Registered team: Riverfront Rovers (11 players)
+[2026-03-20T08:23:49.117Z]    ✅ Registered team: Metro Falcons (11 players)
+[2026-03-20T08:23:49.229Z]    ✅ Registered team: Zenith Wolves (11 players)
+[2026-03-20T08:23:49.410Z]    ✅ Registered team: Harbor Hawks (11 players)
+[2026-03-20T08:23:49.616Z]    ✅ Registered team: Thunderbolts FC (11 players)
+[2026-03-20T08:23:49.827Z]    ✅ Registered team: Royal Spartans (11 players)
+[2026-03-20T08:23:50.030Z]    ✅ Registered team: Frontier Force (11 players)
+[2026-03-20T08:23:50.143Z]    ✅ Registered team: Summit Stars (11 players)
+[2026-03-20T08:23:50.334Z]    ✅ Registered team: City Chargers (11 players)
+[2026-03-20T08:23:50.450Z]    ✅ Registered team: Western Warriors (11 players)
+[2026-03-20T08:23:50.642Z]    ✅ Registered team: Eastern Elites (11 players)
+[2026-03-20T08:23:50.849Z]    ✅ Registered team: Northern Knights (11 players)
+[2026-03-20T08:23:51.054Z]    ✅ Registered team: Southern Strikers (11 players)
+[2026-03-20T08:23:51.255Z]    ✅ Registered team: Iron Panthers (11 players)
+[2026-03-20T08:23:51.373Z]    ✅ Registered team: Glacier Guardians (11 players)
+[2026-03-20T08:23:51.480Z]    ✅ Registered team: Storm Breakers (11 players)
+[2026-03-20T08:23:51.666Z]    ✅ Registered team: Neon Ninjas FC (11 players)
+[2026-03-20T08:23:51.870Z]    ✅ Registered team: Legacy Legends (11 players)
+[2026-03-20T08:23:51.871Z] 
+============================================================
+[2026-03-20T08:23:51.872Z] 🎉 FOOTBALL EVENT SEEDING COMPLETE!
+[2026-03-20T08:23:51.873Z] ============================================================
+[2026-03-20T08:23:51.874Z] ⚽ Event Name:      Mera Sports Football Cup 2026
+[2026-03-20T08:23:51.875Z] 🆔 Event ID:        24
+[2026-03-20T08:23:51.876Z] 🏷️ Sport:            football
+[2026-03-20T08:23:51.876Z] 📋 Category A:       Open (Male) - Individual Test (ID: 12d4c675-bc27-4707-83f7-143400260368)
+[2026-03-20T08:23:51.877Z] 📋 Category B:       Elite (Male) - Team 24 (ID: 6875cc78-a501-4516-9b79-bcbd557c840e)
+[2026-03-20T08:23:51.878Z] 🏟️ Teams (Cat B):    24/24
+[2026-03-20T08:23:51.879Z] 📝 Team Reg (Cat B): 24/24
+[2026-03-20T08:23:51.880Z] 📝 Indv Reg (Cat A): 64/64
+[2026-03-20T08:23:51.881Z] 👥 Players Ready:    264/264
+[2026-03-20T08:23:51.881Z] 
+[2026-03-20T08:23:51.882Z] Category B Teams:
+[2026-03-20T08:23:51.883Z]    🏳️ Aurora United (ID: df88ffa5-64e8-4399-baf1-02ff846c3125)
+[2026-03-20T08:23:51.887Z]    🏳️ Titan Rangers (ID: ac531731-846e-420b-be98-6e55382ccf5c)
+[2026-03-20T08:23:51.888Z]    🏳️ Coastal Mariners (ID: e29d3c74-bb02-4168-9fb7-464ced45c543)
+[2026-03-20T08:23:51.889Z]    🏳️ Desert Eagles (ID: 7c72e66d-ea93-4139-adf6-c40c2684087d)
+[2026-03-20T08:23:51.890Z]    🏳️ Valley Vipers (ID: 2793ac7d-05b9-4301-bd70-c65e3fc20d52)
+[2026-03-20T08:23:51.891Z]    🏳️ Capital Comets (ID: 0a23ec16-5be3-41a3-8e68-af5bad47a933)
+[2026-03-20T08:23:51.891Z]    🏳️ Riverfront Rovers (ID: e0e37db0-28cc-4bf8-806c-1ae30a20ecd5)
+[2026-03-20T08:23:51.892Z]    🏳️ Metro Falcons (ID: 7ec511eb-93df-4c04-9ce8-96408e57614e)
+[2026-03-20T08:23:51.892Z]    🏳️ Zenith Wolves (ID: 5f21b69f-3d01-4d8c-99c3-98c477e49d1d)
+[2026-03-20T08:23:51.893Z]    🏳️ Harbor Hawks (ID: 1a627dfd-e82c-4958-9ab7-8d080bded6f4)
+[2026-03-20T08:23:51.893Z]    🏳️ Thunderbolts FC (ID: 2c3b8545-6fb5-4a45-9381-9feb229f720c)
+[2026-03-20T08:23:51.894Z]    🏳️ Royal Spartans (ID: 604aae70-181e-413e-ab34-7f1a9a20a7ea)
+[2026-03-20T08:23:51.894Z]    🏳️ Frontier Force (ID: c9510479-c0af-438b-9d16-a4eb92e66dfb)
+[2026-03-20T08:23:51.895Z]    🏳️ Summit Stars (ID: 158e8c40-9edb-4b24-8ff3-d775c04725d2)
+[2026-03-20T08:23:51.895Z]    🏳️ City Chargers (ID: 262e2a1c-d59f-4cff-b205-48fca897077c)
+[2026-03-20T08:23:51.896Z]    🏳️ Western Warriors (ID: 7c5dcb26-91f2-4fa4-af4b-5292593d36e0)
+[2026-03-20T08:23:51.896Z]    🏳️ Eastern Elites (ID: 7538afe1-dd35-4951-9a7b-8f65ffa524cd)
+[2026-03-20T08:23:51.897Z]    🏳️ Northern Knights (ID: d3f6e23f-5f9c-4084-9ee0-b2eeffac12ab)
+[2026-03-20T08:23:51.897Z]    🏳️ Southern Strikers (ID: ca7e1d84-f856-4b2b-ba88-9889cbc5da08)
+[2026-03-20T08:23:51.898Z]    🏳️ Iron Panthers (ID: fbee1b0d-7d8b-443b-9ef9-1e892098f938)
+[2026-03-20T08:23:51.898Z]    🏳️ Glacier Guardians (ID: 24f301f0-c2d6-4e76-9d1b-e2f24d6bfa78)
+[2026-03-20T08:23:51.899Z]    🏳️ Storm Breakers (ID: bafd798d-e5f3-440d-9c77-c2d8de47d768)
+[2026-03-20T08:23:51.899Z]    🏳️ Neon Ninjas FC (ID: a13630e3-988f-4afa-b75b-1297da0aef93)
+[2026-03-20T08:23:51.901Z]    🏳️ Legacy Legends (ID: 60abe131-a6ea-4003-800f-2ee8d518e648)
+[2026-03-20T08:23:51.901Z] 
+[2026-03-20T08:23:51.902Z] 📌 Use this event in the admin panel to test bracket/draw features!
+[2026-03-20T08:23:51.902Z] ============================================================

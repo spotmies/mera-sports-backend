@@ -1,6 +1,49 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
 /**
+ * Validates bracket structure before Semifinal/Final propagation.
+ * Ensures: every match has id; rounds 2+ have winnerTo/winnerToSlot; match counts follow 2^(n-r).
+ * Returns { valid: boolean, errors: string[] }. Use before finalize or in admin tools.
+ */
+export function validateBracketIntegrity(bracketData) {
+    const errors = [];
+    const rounds = Array.isArray(bracketData?.rounds) ? bracketData.rounds : [];
+    if (rounds.length === 0) {
+        return { valid: false, errors: ["No rounds in bracket_data"] };
+    }
+
+    const roundCount = rounds.length;
+    const expectedMatchCount = (rIndex) => Math.pow(2, roundCount - 1 - rIndex);
+
+    for (let rIdx = 0; rIdx < rounds.length; rIdx++) {
+        const round = rounds[rIdx];
+        const name = round?.name != null ? String(round.name).trim() : "";
+        const matches = Array.isArray(round.matches) ? round.matches : [];
+        const expected = expectedMatchCount(rIdx);
+
+        if (matches.length !== expected) {
+            errors.push(`Round "${name || rIdx}" has ${matches.length} matches, expected ${expected}`);
+        }
+
+        for (let mIdx = 0; mIdx < matches.length; mIdx++) {
+            const m = matches[mIdx];
+            if (!m || !m.id) {
+                errors.push(`Round "${name}" match ${mIdx + 1} missing id`);
+            }
+            // All rounds except the last must have winnerTo/winnerToSlot for propagation
+            if (rIdx < roundCount - 1 && (m?.winnerTo == null || m?.winnerToSlot == null)) {
+                errors.push(`Round "${name}" match ${mIdx + 1} (${m?.id}) missing winnerTo/winnerToSlot`);
+            }
+        }
+    }
+
+    return {
+        valid: errors.length === 0,
+        errors
+    };
+}
+
+/**
  * Middleware to validate mode locking
  * Ensures category can only be in MEDIA or BRACKET mode, not both
  */

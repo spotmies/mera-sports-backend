@@ -1,0 +1,59 @@
+[2026-03-21T07:18:54.450Z] 🚀 Starting Volleyball league seeding...
+
+[2026-03-21T07:18:54.927Z] ✅ Using Super Admin: superadmin_1773743268240@merasports.com
+[2026-03-21T07:18:54.936Z] 
+👥 Ensuring 64 players for prefix "vbsolo"...
+[2026-03-21T07:19:09.005Z] ✅ 64 players ready for vbsolo
+[2026-03-21T07:19:09.007Z] 
+👥 Ensuring 96 players for prefix "vbteam"...
+[2026-03-21T07:19:32.345Z] 🚀 Starting Volleyball league seeding...
+
+[2026-03-21T07:19:32.628Z] No Super Admin found. Creating one...
+[2026-03-21T07:19:32.855Z] ✅ Using Super Admin: superadmin_1774077572630@merasports.com
+[2026-03-21T07:19:32.856Z] 
+👥 Ensuring 64 players for prefix "vbsolo"...
+[2026-03-21T07:19:32.962Z] ✅ 64 players ready for vbsolo
+[2026-03-21T07:19:32.963Z] 
+👥 Ensuring 96 players for prefix "vbteam"...
+[2026-03-21T07:19:48.083Z] ✅ 96 players ready for vbteam
+[2026-03-21T07:19:48.085Z] 
+🏐 Creating 16 volleyball teams (6 players each)...
+[2026-03-21T07:19:48.164Z]   ✅ Volley Titans created
+[2026-03-21T07:19:48.311Z]   ✅ Net Warriors created
+[2026-03-21T07:19:48.380Z]   ✅ Smash Masters created
+[2026-03-21T07:19:48.449Z]   ✅ Sky Blockers created
+[2026-03-21T07:19:48.513Z]   ✅ Power Servers created
+[2026-03-21T07:19:48.586Z]   ✅ Court Kings created
+[2026-03-21T07:19:48.655Z]   ✅ Ace Spikers created
+[2026-03-21T07:19:48.719Z]   ✅ Rally Force created
+[2026-03-21T07:19:48.789Z]   ✅ Jump Giants created
+[2026-03-21T07:19:48.854Z]   ✅ Thunder Sets created
+[2026-03-21T07:19:48.920Z]   ✅ Spike Legends created
+[2026-03-21T07:19:48.987Z]   ✅ Block Storm created
+[2026-03-21T07:19:49.057Z]   ✅ Elite Aces created
+[2026-03-21T07:19:49.127Z]   ✅ Quick Digs created
+[2026-03-21T07:19:49.196Z]   ✅ Topspin Crew created
+[2026-03-21T07:19:49.284Z]   ✅ Final Set created
+[2026-03-21T07:19:49.285Z] ✅ Created 16/16 teams
+[2026-03-21T07:19:49.286Z] 
+📋 Creating Volleyball event with 2 LEAGUE categories...
+[2026-03-21T07:19:49.364Z] ✅ Volleyball event created: Volleyball League Validation Event 2026 (25)
+[2026-03-21T07:19:49.365Z] 
+📝 Registering 64 individual players in Singles Open...
+[2026-03-21T07:19:53.634Z] ✅ Singles registrations completed: 64/64
+[2026-03-21T07:19:53.635Z] 
+📝 Registering 16 teams in Team Open...
+[2026-03-21T07:19:54.649Z] ✅ Team registrations completed: 16/16
+[2026-03-21T07:19:54.650Z] 
+══════════════════════════════════════════════════════════════════════
+[2026-03-21T07:19:54.650Z] 🎉 VOLLEYBALL LEAGUE SEED COMPLETE
+[2026-03-21T07:19:54.651Z] ══════════════════════════════════════════════════════════════════════
+[2026-03-21T07:19:54.652Z] Event ID            : 25
+[2026-03-21T07:19:54.652Z] Event Name          : Volleyball League Validation Event 2026
+[2026-03-21T07:19:54.653Z] Sport               : Volleyball
+[2026-03-21T07:19:54.654Z] Category 1          : Singles Open (Singles, LEAGUE)
+[2026-03-21T07:19:54.654Z] Registered players  : 64
+[2026-03-21T07:19:54.655Z] Category 2          : Team Open (Team, LEAGUE)
+[2026-03-21T07:19:54.656Z] Registered teams    : 16
+[2026-03-21T07:19:54.657Z] Players per team    : 6
+[2026-03-21T07:19:54.658Z] ══════════════════════════════════════════════════════════════════════

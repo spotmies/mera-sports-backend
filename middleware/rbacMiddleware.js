@@ -72,3 +72,35 @@ export const verifyPlayer = (req, res, next) => {
         return res.status(403).json({ error: "Invalid authentication token." });
     }
 };
+
+// --------------------------------------------------------------------------
+// 3. Verify Institute Head
+//    - Expects 'Authorization: Bearer <jwt_token>'
+//    - Verifies using process.env.JWT_SECRET
+//    - Checks if payload role == 'institutehead'
+// --------------------------------------------------------------------------
+export const verifyInstitute = (req, res, next) => {
+    try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).json({ error: "Missing institute token" });
+        }
+
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        // Enforce Strict Role Check
+        if (!decoded.role || decoded.role !== 'institutehead') {
+            return res.status(403).json({ error: "Access denied: Restricted to Institute Heads only." });
+        }
+
+        req.user = decoded; // Attach decoded payload
+        next();
+    } catch (err) {
+        if (err.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: "Session expired. Please login again." });
+        }
+        console.error("INSTITUTE AUTH ERROR:", err.message);
+        return res.status(403).json({ error: "Invalid authentication token." });
+    }
+};

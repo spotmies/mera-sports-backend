@@ -34,21 +34,61 @@ export const getAllCategories = async (req, res) => {
 /* ================= REGISTRATIONS & TRANSACTIONS ================= */
 export const getRegistrations = async (req, res) => {
     try {
-        const { eventId } = req.query;
+        const { eventId, admin_id, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
                 users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
-            `)
+            `, { count: 'exact' })
             .order('created_at', { ascending: false });
 
         if (eventId) query = query.eq('event_id', eventId);
 
-        const { data: registrations, error } = await query;
+        const requestingAdminId = req.user?.role === 'superadmin'
+            ? null
+            : (admin_id || req.user?.id);
+
+        if (requestingAdminId) {
+            // Run both queries concurrently to avoid sequential round-trips
+            const [directResult, assignmentResult] = await Promise.all([
+                supabaseAdmin.from('events').select('id').or(`created_by.eq.${requestingAdminId},assigned_to.eq.${requestingAdminId}`),
+                supabaseAdmin.from('event_admin_assignments').select('event_id').eq('admin_id', requestingAdminId),
+            ]);
+
+            if (directResult.error) throw directResult.error;
+            if (assignmentResult.error) {
+                if (assignmentResult.error.code === '42P01') {
+                    console.warn('[getRegistrations] event_admin_assignments table does not exist — multi-assignment filter skipped.');
+                } else {
+                    throw assignmentResult.error;
+                }
+            }
+
+            const allowedEventIds = new Set();
+            (directResult.data || []).forEach((eventRow) => allowedEventIds.add(eventRow.id));
+            (assignmentResult.data || []).forEach((row) => allowedEventIds.add(row.event_id));
+
+            const eventIds = Array.from(allowedEventIds).filter((value) => value !== null && value !== undefined);
+            if (eventIds.length === 0) {
+                return res.json({ success: true, registrations: [] });
+            }
+
+            query = query.in('event_id', eventIds);
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: registrations, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, registrations });
+        res.json({ success: true, registrations, total_count: count });
     } catch (err) {
         console.error("ADMIN REGISTRATIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch registrations" });
@@ -57,21 +97,56 @@ export const getRegistrations = async (req, res) => {
 
 export const getTransactions = async (req, res) => {
     try {
-        const { eventId, admin_id } = req.query;
+        const { eventId, admin_id, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
-                events!inner ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment )
-            `)
+                events ( id, name, created_by, assigned_to ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
+                transactions:transaction_id ( id, payment_mode, payment_id, order_id )
+            `, { count: 'exact' })
             .order('created_at', { ascending: false });
 
         if (eventId) query = query.eq('event_id', eventId);
-        if (admin_id) query = query.or(`created_by.eq.${admin_id},assigned_to.eq.${admin_id}`, { foreignTable: 'events' });
+        if (admin_id) {
+            // Run both queries concurrently to avoid sequential round-trips
+            const [directResult, assignmentResult] = await Promise.all([
+                supabaseAdmin.from('events').select('id').or(`created_by.eq.${admin_id},assigned_to.eq.${admin_id}`),
+                supabaseAdmin.from('event_admin_assignments').select('event_id').eq('admin_id', admin_id),
+            ]);
 
-        const { data: transactions, error } = await query;
+            if (directResult.error) throw directResult.error;
+            if (assignmentResult.error) {
+                if (assignmentResult.error.code === '42P01') {
+                    console.warn('[getTransactions] event_admin_assignments table does not exist — multi-assignment filter skipped.');
+                } else {
+                    throw assignmentResult.error;
+                }
+            }
+
+            const allowedEventIds = new Set();
+            (directResult.data || []).forEach((eventRow) => allowedEventIds.add(eventRow.id));
+            (assignmentResult.data || []).forEach((row) => allowedEventIds.add(row.event_id));
+
+            const eventIds = Array.from(allowedEventIds).filter((value) => value !== null && value !== undefined);
+            if (eventIds.length === 0) {
+                return res.json({ success: true, transactions: [] });
+            }
+
+            query = query.in('event_id', eventIds);
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data: transactions, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, transactions });
+        res.json({ success: true, transactions, total_count: count });
     } catch (err) {
         console.error("ADMIN TRANSACTIONS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch transactions" });
@@ -86,7 +161,7 @@ export const verifyTransaction = async (req, res) => {
             .update({ status: "verified" })
             .eq("id", id)
             .select("player_id, registration_no, events(name)")
-            .single();
+            .maybeSingle();
 
         if (error) throw error;
         if (updatedReg) {
@@ -112,7 +187,7 @@ export const rejectTransaction = async (req, res) => {
             .update({ status: "rejected" })
             .eq("id", id)
             .select("player_id, registration_no, events(name)")
-            .single();
+            .maybeSingle();
 
         if (error) throw error;
         if (updatedReg) {
@@ -177,7 +252,7 @@ export const createEventNews = async (req, res) => {
         const { eventId, title, content, imageUrl, isHighlight } = req.body;
         const { data, error } = await supabaseAdmin.from("event_news")
             .insert({ event_id: eventId, title, content, image_url: imageUrl, is_highlight: isHighlight })
-            .select().single();
+            .select().maybeSingle();
         if (error) throw error;
         res.json({ success: true, news: data });
     } catch (err) { res.status(500).json({ message: "Failed to create news" }); }
@@ -188,7 +263,7 @@ export const updateEventNews = async (req, res) => {
         const { id } = req.params;
         const { title, content, imageUrl, isHighlight } = req.body;
         const { data, error } = await supabaseAdmin.from("event_news")
-            .update({ title, content, image_url: imageUrl, is_highlight: isHighlight }).eq("id", id).select().single();
+            .update({ title, content, image_url: imageUrl, is_highlight: isHighlight }).eq("id", id).select().maybeSingle();
         if (error) throw error;
         res.json({ success: true, news: data });
     } catch (err) { res.status(500).json({ message: "Failed to update news" }); }
@@ -218,12 +293,12 @@ export const saveBracket = async (req, res) => {
         const { eventId, category, roundName, drawType, drawData, pdfUrl } = req.body;
         let finalDrawData = drawData;
         let finalPdfUrl = null;
-        
+
         if (drawType === 'image') {
             // Handle multiple images format (new)
             if (drawData?.images && Array.isArray(drawData.images)) {
                 const uploadedImages = [];
-                
+
                 for (const img of drawData.images) {
                     // If image URL is base64, upload it
                     if (img.url?.startsWith('data:')) {
@@ -244,14 +319,14 @@ export const saveBracket = async (req, res) => {
                         });
                     }
                 }
-                
+
                 finalDrawData = { images: uploadedImages };
             }
             // Handle old single image format (backward compatibility)
             else if (drawData?.url?.startsWith('data:')) {
                 const url = await uploadBase64(drawData.url, 'event-assets', 'draws');
                 if (url) {
-                    finalDrawData = { 
+                    finalDrawData = {
                         images: [{
                             id: `img-${Date.now()}-${Math.random()}`,
                             url: url,
@@ -289,19 +364,19 @@ export const saveBracket = async (req, res) => {
         const { data: existing } = await supabaseAdmin.from("event_brackets").select("id, draw_type, draw_data").eq("event_id", eventId).eq("category", category).eq("round_name", roundName).maybeSingle();
 
         let result;
-        
+
         if (existing) {
             // Update existing bracket - preserve existing draw_data when only updating pdf_url
             const updateData = {};
-            
+
             // Always preserve existing draw_data first
             updateData.draw_data = existing.draw_data || {};
-            
+
             // Only update draw_type if provided
             if (drawType) {
                 updateData.draw_type = drawType;
             }
-            
+
             // Only update draw_data if new data is provided and different from existing
             if (finalDrawData && Object.keys(finalDrawData).length > 0) {
                 // Check if we're actually updating draw_data (not just pdf_url)
@@ -309,7 +384,7 @@ export const saveBracket = async (req, res) => {
                 const hasNewMatches = finalDrawData.matches && Array.isArray(finalDrawData.matches) && finalDrawData.matches.length > 0;
                 const hasExistingImages = existing.draw_data?.images && Array.isArray(existing.draw_data.images) && existing.draw_data.images.length > 0;
                 const hasExistingMatches = existing.draw_data?.matches && Array.isArray(existing.draw_data.matches) && existing.draw_data.matches.length > 0;
-                
+
                 // If we have new images or matches, update draw_data
                 if (hasNewImages) {
                     const existingImages = existing.draw_data?.images || [];
@@ -331,28 +406,28 @@ export const saveBracket = async (req, res) => {
                 }
                 // If no new images/matches, keep existing draw_data (already set above)
             }
-            
+
             // Only update pdf_url if it's explicitly provided
             if (pdfUrl !== undefined) {
                 updateData.pdf_url = finalPdfUrl;
             }
-            
-            const { data, error } = await supabaseAdmin.from("event_brackets").update(updateData).eq("id", existing.id).select().single();
+
+            const { data, error } = await supabaseAdmin.from("event_brackets").update(updateData).eq("id", existing.id).select().maybeSingle();
             if (error) throw error;
             result = data;
         } else {
             // Insert new bracket
-            const insertData = { 
-                event_id: eventId, 
-                category, 
-                round_name: roundName, 
-                draw_type: drawType || 'image', 
+            const insertData = {
+                event_id: eventId,
+                category,
+                round_name: roundName,
+                draw_type: drawType || 'image',
                 draw_data: finalDrawData || { images: [] }
             };
             if (pdfUrl !== undefined) {
                 insertData.pdf_url = finalPdfUrl;
             }
-            const { data, error } = await supabaseAdmin.from("event_brackets").insert(insertData).select().single();
+            const { data, error } = await supabaseAdmin.from("event_brackets").insert(insertData).select().maybeSingle();
             if (error) throw error;
             result = data;
         }
@@ -365,8 +440,56 @@ export const saveBracket = async (req, res) => {
 
 export const deleteBracket = async (req, res) => {
     try {
-        const { error } = await supabaseAdmin.from("event_brackets").delete().eq("id", req.params.id);
-        if (error) throw error;
-        res.json({ success: true, message: "Bracket deleted" });
-    } catch (err) { res.status(500).json({ message: "Failed to delete bracket" }); }
+        const bracketId = req.params.id;
+        if (!bracketId) {
+            return res.status(400).json({ success: false, message: "Bracket id is required" });
+        }
+
+        // Fetch bracket to know event/category for match cleanup
+        const { data: bracket, error: fetchError } = await supabaseAdmin
+            .from("event_brackets")
+            .select("id,event_id,category_id,category")
+            .eq("id", bracketId)
+            .maybeSingle();
+
+        if (fetchError) throw fetchError;
+        if (!bracket) {
+            return res.status(404).json({ success: false, message: "Bracket not found" });
+        }
+
+        const { event_id: eventId, category_id: categoryId, category } = bracket;
+
+        // Best-effort: delete all matches for this event+category from scoreboard
+        try {
+            let matchQuery = supabaseAdmin
+                .from("matches")
+                .delete()
+                .eq("event_id", eventId)
+                .select("id");
+
+            if (categoryId) {
+                matchQuery = matchQuery.eq("category_id", categoryId);
+            } else if (category) {
+                matchQuery = matchQuery.eq("category_id", category);
+            }
+
+            const { error: deleteMatchesError } = await matchQuery;
+            if (deleteMatchesError) {
+                console.error("Failed to delete matches when deleting bracket:", deleteMatchesError);
+            }
+        } catch (matchErr) {
+            console.error("Error while deleting matches for bracket:", matchErr);
+        }
+
+        const { error: deleteBracketError } = await supabaseAdmin
+            .from("event_brackets")
+            .delete()
+            .eq("id", bracketId);
+
+        if (deleteBracketError) throw deleteBracketError;
+        res.json({ success: true, message: "Bracket and related matches deleted" });
+    } catch (err) {
+        console.error("DELETE BRACKET ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to delete bracket" });
+    }
 };

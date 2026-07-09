@@ -1,3 +1,5 @@
+import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
 import jwt from "jsonwebtoken";
@@ -69,6 +71,9 @@ router.post('/sync', async (req, res) => {
                 });
             }
 
+            const previous_login = existingUser.last_login || null;
+            const last_login = new Date().toISOString();
+
             // UPDATE ONLY GOOGLE FIELDS (Preserve Mobile/DOB and ROLE)
             // DO NOT OVERWRITE ROLE TO 'admin'
             const { data: updatedUser, error: updateError } = await supabaseAdmin
@@ -79,7 +84,9 @@ router.post('/sync', async (req, res) => {
                     name: fullName,
                     photos: photoUrl,
                     avatar: photoUrl,
-                    google_id: googleId
+                    google_id: googleId,
+                    previous_login,
+                    last_login
                     // role: 'admin'  <-- REMOVED: Never overwrite role
                 })
                 .eq('id', existingUser.id) // Use the FOUND ID, not user.id
@@ -95,6 +102,10 @@ router.post('/sync', async (req, res) => {
             }
         } else {
             // 3. IF NEW USER, CREATE WITH DUMMY DATA
+            // Generate a unique random sentinel per account instead of hashing a static
+            // string. This way the password is never guessable even with source-code access.
+            const oauthSentinel = crypto.randomBytes(32).toString("hex");
+            const hashedOAuthSentinel = await bcrypt.hash(oauthSentinel, 12);
             const userData = {
                 id: user.id,
                 email: user.email,
@@ -106,6 +117,7 @@ router.post('/sync', async (req, res) => {
                 google_id: googleId,
                 role: 'admin', // ONLY set for NEW users
                 verification: 'pending', // Pending SuperAdmin approval
+                last_login: new Date().toISOString(),
 
                 // ROBUST DUMMY DATA STRATEGY
                 mobile: `9${Date.now().toString().slice(-9)}`,
@@ -118,7 +130,7 @@ router.post('/sync', async (req, res) => {
                 state: 'Web',
                 pincode: '000000',
                 country: 'India',
-                password: 'GOOGLE_AUTH_ADMIN',
+                password: hashedOAuthSentinel,
                 player_id: `ADM-${Date.now().toString().slice(-6)}`
             };
 
@@ -136,17 +148,13 @@ router.post('/sync', async (req, res) => {
             finalUser = savedUser;
         }
 
-        // 4. VERIFICATION CHECK (Block Access if not verified)
-        if (finalUser.role === 'admin' && finalUser.verification !== 'verified') {
-            if (finalUser.verification === 'rejected') {
-                return res.status(403).json({
-                    error: "Your admin application has been rejected.",
-                    code: "ADMIN_REJECTED"
-                });
-            }
+        // 4. VERIFICATION CHECK — Block only rejected admins.
+        // Pending admins get a token so they can see the PendingApproval page
+        // and auto-redirect once approved (frontend handles the pending UI).
+        if (finalUser.role === 'admin' && finalUser.verification === 'rejected') {
             return res.status(403).json({
-                error: "Account pending approval from Super Admin.",
-                code: "ADMIN_PENDING"
+                error: "Your admin application has been rejected.",
+                code: "ADMIN_REJECTED"
             });
         }
 
@@ -159,7 +167,18 @@ router.post('/sync', async (req, res) => {
         );
 
         // 6. Return the user data AND token to frontend
-        res.json({ success: true, user: finalUser, token: backendToken });
+        // Include verification status so frontend can show PendingApproval when needed
+        const userPayload = {
+            id: finalUser.id,
+            name: finalUser.name,
+            email: finalUser.email,
+            role: finalUser.role,
+            avatar: finalUser.photos || finalUser.avatar,
+            verification: finalUser.verification,
+            last_login: finalUser.last_login,
+            previous_login: finalUser.previous_login
+        };
+        res.json({ success: true, user: userPayload, token: backendToken });
 
     } catch (error) {
         console.error('Server error:', error);

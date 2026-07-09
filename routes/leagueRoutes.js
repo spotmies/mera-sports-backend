@@ -1,5 +1,5 @@
 import express from "express";
-import { getLeagueConfig, saveLeagueConfig, deleteLeague } from "../controllers/leagueController.js";
+import { deleteLeague, getLeagueConfig, notifyLeaguePromotions, saveLeagueConfig } from "../controllers/leagueController.js";
 import { verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
@@ -10,6 +10,9 @@ router.get("/events/:id/categories/:categoryId/league", verifyAdmin, getLeagueCo
 
 // POST /api/admin/events/:id/categories/:categoryId/league
 router.post("/events/:id/categories/:categoryId/league", verifyAdmin, saveLeagueConfig);
+
+// POST /api/admin/events/:id/categories/:categoryId/league/notify-promotions
+router.post("/events/:id/categories/:categoryId/league/notify-promotions", verifyAdmin, notifyLeaguePromotions);
 
 // DELETE /api/admin/events/:id/categories/:categoryId/league
 router.delete("/events/:id/categories/:categoryId/league", verifyAdmin, deleteLeague);

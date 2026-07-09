@@ -1,0 +1,29 @@
+[2026-03-21T07:19:55.149Z] 🚀 Starting Chess league seeding...
+
+[2026-03-21T07:19:55.491Z] No Super Admin found. Creating one...
+[2026-03-21T07:19:55.716Z] ✅ Using Super Admin: superadmin_1774077595492@merasports.com
+[2026-03-21T07:19:55.717Z] 
+👥 Ensuring 64 players for ch64...
+[2026-03-21T07:20:09.796Z] ✅ 64 players ready for ch64
+[2026-03-21T07:20:09.797Z] 
+👥 Ensuring 32 players for ch32...
+[2026-03-21T07:20:16.600Z] ✅ 32 players ready for ch32
+[2026-03-21T07:20:16.602Z] 
+📋 Creating Chess event with 2 LEAGUE categories...
+[2026-03-21T07:20:16.668Z] ✅ Chess event created: Chess League Validation Event 2026 (26)
+[2026-03-21T07:20:16.677Z] 
+📝 Registering 64 players in Open A...
+[2026-03-21T07:20:20.851Z] ✅ Open A registrations: 64/64
+[2026-03-21T07:20:20.852Z] 
+📝 Registering 32 players in Open B...
+[2026-03-21T07:20:22.846Z] ✅ Open B registrations: 32/32
+[2026-03-21T07:20:22.847Z] 
+══════════════════════════════════════════════════════════════════════
+[2026-03-21T07:20:22.847Z] 🎉 CHESS LEAGUE SEED COMPLETE
+[2026-03-21T07:20:22.848Z] ══════════════════════════════════════════════════════════════════════
+[2026-03-21T07:20:22.849Z] Event ID         : 26
+[2026-03-21T07:20:22.850Z] Event Name       : Chess League Validation Event 2026
+[2026-03-21T07:20:22.851Z] Sport            : Chess
+[2026-03-21T07:20:22.851Z] Category 1       : Open A (64 players, LEAGUE)
+[2026-03-21T07:20:22.852Z] Category 2       : Open B (32 players, LEAGUE)
+[2026-03-21T07:20:22.854Z] ══════════════════════════════════════════════════════════════════════

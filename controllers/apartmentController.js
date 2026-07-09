@@ -4,6 +4,9 @@ import { fileURLToPath } from "url";
 import XLSX from "xlsx";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
+const sanitizeSearch = (s) =>
+    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Adjust path since we are in controllers/ now, not routes/
@@ -54,9 +57,27 @@ export const migrateApartments = async (req, res) => {
 
 export const getApartments = async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin.from("apartments").select("*").order('created_at', { ascending: false });
+        const { page, limit, search } = req.query;
+        let query = supabaseAdmin.from("apartments").select("*", { count: 'exact' }).order('created_at', { ascending: false });
+
+        if (search) {
+            const safe = sanitizeSearch(search);
+            if (safe) {
+                query = query.or(`name.ilike.%${safe}%,locality.ilike.%${safe}%,zone.ilike.%${safe}%`);
+            }
+        }
+
+        if (page && limit) {
+            const pageNum = parseInt(page, 10);
+            const limitNum = parseInt(limit, 10);
+            const from = (pageNum - 1) * limitNum;
+            const to = from + limitNum - 1;
+            query = query.range(from, to);
+        }
+
+        const { data, count, error } = await query;
         if (error) throw error;
-        res.json({ success: true, apartments: data || [] });
+        res.json({ success: true, apartments: data || [], total_count: count });
     } catch (error) { res.status(500).json({ success: false, message: "Failed to fetch apartments" }); }
 };
 
@@ -67,9 +88,9 @@ export const addApartment = async (req, res) => {
 
         const trimmedName = name.trim();
         const { data: existing } = await supabaseAdmin.from("apartments").select("id").ilike("name", trimmedName).maybeSingle();
-        if (existing) return res.json({ success: true, message: "Apartment already exists" });
+        if (existing) return res.json({ success: false, message: "Apartment already exists" });
 
-        const { data, error } = await supabaseAdmin.from("apartments").insert({ name: trimmedName, pincode: pincode || "", locality: locality || "", zone: zone || "" }).select().single();
+        const { data, error } = await supabaseAdmin.from("apartments").insert({ name: trimmedName, pincode: pincode || "", locality: locality || "", zone: zone || "" }).select().maybeSingle();
         if (error) throw error;
         res.json({ success: true, message: "Apartment added", apartment: data });
     } catch (error) { res.status(500).json({ success: false, message: "Failed to add apartment" }); }
@@ -85,7 +106,7 @@ export const updateApartment = async (req, res) => {
         if (locality !== undefined) updateData.locality = locality;
         if (zone !== undefined) updateData.zone = zone;
 
-        const { data, error } = await supabaseAdmin.from("apartments").update(updateData).eq("id", id).select().single();
+        const { data, error } = await supabaseAdmin.from("apartments").update(updateData).eq("id", id).select().maybeSingle();
         if (error) throw error;
         res.json({ success: true, message: "Apartment updated", apartment: data });
     } catch (error) { res.status(500).json({ success: false, message: "Failed to update" }); }

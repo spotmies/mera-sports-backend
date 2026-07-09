@@ -1,0 +1,159 @@
+[2026-03-17T10:13:21.910Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:13:22.511Z] ✅ Using Super Admin: superadmin_1771237813367@merasports.com
+[2026-03-17T10:13:22.514Z] 🧹 Cleaning old Heat test events...
+[2026-03-17T10:13:22.630Z] ✅ No old Heat test events found
+[2026-03-17T10:13:22.631Z] 👥 Ensuring at least 88 test players...
+[2026-03-17T10:13:22.831Z] ✅ Ready with 88 test players
+[2026-03-17T10:13:22.924Z] ✅ Event created: Heat Test Event - Racing 2026 (ID: 20)
+[2026-03-17T10:13:24.727Z]    ↳ Sprint 100m: 24/24 registrations
+[2026-03-17T10:13:26.153Z]    ↳ Sprint 200m: 20/20 registrations
+[2026-03-17T10:13:26.329Z] ✅ Event created: Heat Test Event - Swimming 2026 (ID: 21)
+[2026-03-17T10:13:28.077Z]    ↳ Freestyle 50m: 24/24 registrations
+[2026-03-17T10:13:29.499Z]    ↳ Freestyle 100m: 20/20 registrations
+[2026-03-17T10:13:29.500Z] 
+🎯 Heat test events ready:
+
+[2026-03-17T10:13:29.500Z] Event: Heat Test Event - Racing 2026
+[2026-03-17T10:13:29.501Z]   - ID: 20
+[2026-03-17T10:13:29.501Z]   - Sport: racing
+[2026-03-17T10:13:29.502Z]   - Categories: 2
+[2026-03-17T10:13:29.502Z]   - Registrations: 44
+[2026-03-17T10:13:29.502Z]     • Sprint 100m [d22831cf-83e5-424d-922c-19d492e1dd4c]
+[2026-03-17T10:13:29.503Z]     • Sprint 200m [ed484e80-f0db-4a9d-b485-0cbfeb0306e6]
+[2026-03-17T10:13:29.503Z] Event: Heat Test Event - Swimming 2026
+[2026-03-17T10:13:29.503Z]   - ID: 21
+[2026-03-17T10:13:29.504Z]   - Sport: swimming
+[2026-03-17T10:13:29.504Z]   - Categories: 2
+[2026-03-17T10:13:29.504Z]   - Registrations: 44
+[2026-03-17T10:13:29.505Z]     • Freestyle 50m [4c5e0d2c-c1a2-4968-a9cb-984c39d056b6]
+[2026-03-17T10:13:29.505Z]     • Freestyle 100m [1c2d146f-daf1-41ad-82e5-919ff5ffce4e]
+[2026-03-17T10:13:29.506Z] 
+✅ Done. You can now open these events in admin hub and test Heat tab.
+[2026-03-17T10:18:07.690Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:18:08.152Z] ✅ Using Super Admin: superadmin_1771237813367@merasports.com
+[2026-03-17T10:18:08.153Z] 🧹 Cleaning old Heat test events...
+[2026-03-17T10:18:08.705Z] ✅ Cleaned 2 old Heat event(s)
+[2026-03-17T10:18:08.706Z] 👥 Ensuring at least 124 test players...
+[2026-03-17T10:18:08.783Z] ✅ Ready with 124 test players
+[2026-03-17T10:18:08.865Z] ✅ Event created: Heat Test Event - Racing 2026 (ID: 22)
+[2026-03-17T10:18:10.946Z]    ↳ Sprint 100m: 30/30 registrations
+[2026-03-17T10:18:12.908Z]    ↳ Sprint 200m: 30/30 registrations
+[2026-03-17T10:18:12.990Z] ✅ Event created: Heat Test Event - Swimming 2026 (ID: 23)
+[2026-03-17T10:18:15.156Z]    ↳ Freestyle 50m: 32/32 registrations
+[2026-03-17T10:18:17.256Z]    ↳ Freestyle 100m: 32/32 registrations
+[2026-03-17T10:18:17.257Z] 
+🎯 Heat test events ready:
+
+[2026-03-17T10:18:17.258Z] Event: Heat Test Event - Racing 2026
+[2026-03-17T10:18:17.258Z]   - ID: 22
+[2026-03-17T10:18:17.259Z]   - Sport: racing
+[2026-03-17T10:18:17.262Z]   - Categories: 2
+[2026-03-17T10:18:17.263Z]   - Registrations: 60
+[2026-03-17T10:18:17.264Z]     • Sprint 100m [4570088d-2561-4b60-83d8-7729c8c6f160]
+[2026-03-17T10:18:17.265Z]     • Sprint 200m [4c92351a-ba9d-472a-833c-36125bca9406]
+[2026-03-17T10:18:17.265Z] Event: Heat Test Event - Swimming 2026
+[2026-03-17T10:18:17.266Z]   - ID: 23
+[2026-03-17T10:18:17.266Z]   - Sport: swimming
+[2026-03-17T10:18:17.266Z]   - Categories: 2
+[2026-03-17T10:18:17.267Z]   - Registrations: 64
+[2026-03-17T10:18:17.267Z]     • Freestyle 50m [f0314ae9-e4ab-48a8-91e1-19081ad4f96e]
+[2026-03-17T10:18:17.267Z]     • Freestyle 100m [abcfb117-0543-4dfd-a91c-a13137a94e3b]
+[2026-03-17T10:18:17.267Z] 
+✅ Done. You can now open these events in admin hub and test Heat tab.
+[2026-03-17T10:21:56.172Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:21:56.780Z] ✅ Using Super Admin: superadmin_1771237813367@merasports.com
+[2026-03-17T10:21:56.879Z] 👥 Ensuring at least 124 test players...
+[2026-03-17T10:21:57.000Z] ✅ Ready with 124 test players
+[2026-03-17T10:21:57.112Z] ♻️ Reused existing event: Heat Test Event - Racing 2026 (ID: 22)
+[2026-03-17T10:21:59.619Z]    ↳ Sprint 100m: 30/30 registrations
+[2026-03-17T10:22:01.898Z]    ↳ Sprint 200m: 30/30 registrations
+[2026-03-17T10:22:01.976Z] ♻️ Reused existing event: Heat Test Event - Swimming 2026 (ID: 23)
+[2026-03-17T10:22:04.482Z]    ↳ Freestyle 50m: 32/32 registrations
+[2026-03-17T10:22:06.805Z]    ↳ Freestyle 100m: 32/32 registrations
+[2026-03-17T10:22:06.807Z] 
+🎯 Heat test events ready:
+
+[2026-03-17T10:22:06.814Z] Event: Heat Test Event - Racing 2026
+[2026-03-17T10:22:06.815Z]   - ID: 22
+[2026-03-17T10:22:06.820Z]   - Sport: racing
+[2026-03-17T10:22:06.822Z]   - Categories: 2
+[2026-03-17T10:22:06.829Z]   - Registrations: 60
+[2026-03-17T10:22:06.831Z]     • Sprint 100m [08746413-26cc-409c-b585-525a390c6f70]
+[2026-03-17T10:22:06.832Z]     • Sprint 200m [9ebd95ca-ba9c-4837-9542-729ac8c6e591]
+[2026-03-17T10:22:06.833Z] Event: Heat Test Event - Swimming 2026
+[2026-03-17T10:22:06.833Z]   - ID: 23
+[2026-03-17T10:22:06.834Z]   - Sport: swimming
+[2026-03-17T10:22:06.834Z]   - Categories: 2
+[2026-03-17T10:22:06.835Z]   - Registrations: 64
+[2026-03-17T10:22:06.835Z]     • Freestyle 50m [77b463a9-7bd1-43bf-aecf-816242d613ef]
+[2026-03-17T10:22:06.835Z]     • Freestyle 100m [3c4c5fd8-04d0-47ff-906f-d0237fffedbc]
+[2026-03-17T10:22:06.835Z] 
+✅ Done. You can now open these events in admin hub and test Heat tab.
+[2026-03-17T10:23:10.164Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:23:10.461Z] ✅ Using Super Admin: superadmin_1771237813367@merasports.com
+[2026-03-17T10:23:10.556Z] 👥 Ensuring at least 124 test players...
+[2026-03-17T10:23:10.656Z] ✅ Ready with 124 test players
+[2026-03-17T10:23:10.767Z] ♻️ Reused existing event: Heat Test Event - Racing 2026 (ID: 22)
+[2026-03-17T10:23:13.737Z]    ↳ Sprint 100m: 30/30 registrations
+[2026-03-17T10:23:15.928Z]    ↳ Sprint 200m: 30/30 registrations
+[2026-03-17T10:23:16.161Z] ♻️ Reused existing event: Heat Test Event - Swimming 2026 (ID: 23)
+[2026-03-17T10:23:18.721Z]    ↳ Freestyle 50m: 32/32 registrations
+[2026-03-17T10:23:21.068Z]    ↳ Freestyle 100m: 32/32 registrations
+[2026-03-17T10:23:21.070Z] 
+🎯 Heat test events ready:
+
+[2026-03-17T10:23:21.072Z] Event: Heat Test Event - Racing 2026
+[2026-03-17T10:23:21.074Z]   - ID: 22
+[2026-03-17T10:23:21.075Z]   - Sport: racing
+[2026-03-17T10:23:21.076Z]   - Categories: 2
+[2026-03-17T10:23:21.077Z]   - Registrations: 60
+[2026-03-17T10:23:21.078Z]     • Sprint 100m [e9aa0fb4-0a02-41ef-b1e8-fb334cc1c536]
+[2026-03-17T10:23:21.078Z]     • Sprint 200m [14c261e5-f73c-454b-bc32-2e77091bb161]
+[2026-03-17T10:23:21.078Z] Event: Heat Test Event - Swimming 2026
+[2026-03-17T10:23:21.079Z]   - ID: 23
+[2026-03-17T10:23:21.079Z]   - Sport: swimming
+[2026-03-17T10:23:21.080Z]   - Categories: 2
+[2026-03-17T10:23:21.080Z]   - Registrations: 64
+[2026-03-17T10:23:21.080Z]     • Freestyle 50m [76e4a525-7c58-4025-a4dd-5a347dd837e6]
+[2026-03-17T10:23:21.081Z]     • Freestyle 100m [71b7d672-043f-4398-8c4b-245227a80035]
+[2026-03-17T10:23:21.081Z] 
+✅ Done. You can now open these events in admin hub and test Heat tab.
+[2026-03-17T10:26:32.354Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:26:32.883Z] ✅ Using Super Admin: superadmin_1771237813367@merasports.com
+[2026-03-17T10:26:32.982Z] 👥 Ensuring at least 248 test players...
+[2026-03-17T10:27:05.996Z] ✅ Ready with 248 test players
+[2026-03-17T10:27:06.067Z] ♻️ Reused existing event: Heat Test Event - Racing 2026 (ID: 22)
+[2026-03-17T10:27:10.322Z]    ↳ Sprint 100m: 60/60 registrations
+[2026-03-17T10:27:14.580Z]    ↳ Sprint 200m: 64/64 registrations
+[2026-03-17T10:27:14.659Z] ♻️ Reused existing event: Heat Test Event - Swimming 2026 (ID: 23)
+[2026-03-17T10:27:19.024Z]    ↳ Freestyle 50m: 60/60 registrations
+[2026-03-17T10:27:47.980Z] 🚀 Starting Heat Events Seeder...
+[2026-03-17T10:27:48.238Z] No Super Admin found. Creating one...
+[2026-03-17T10:27:48.471Z] ✅ Using Super Admin: superadmin_1773743268240@merasports.com
+[2026-03-17T10:27:48.598Z] 👥 Ensuring at least 248 test players...
+[2026-03-17T10:27:48.671Z] ✅ Ready with 248 test players
+[2026-03-17T10:27:48.791Z] ♻️ Reused existing event: Heat Test Event - Racing 2026 (ID: 22)
+[2026-03-17T10:27:53.319Z]    ↳ Sprint 100m: 60/60 registrations
+[2026-03-17T10:27:57.764Z]    ↳ Sprint 200m: 64/64 registrations
+[2026-03-17T10:27:57.847Z] ♻️ Reused existing event: Heat Test Event - Swimming 2026 (ID: 23)
+[2026-03-17T10:28:02.374Z]    ↳ Freestyle 50m: 60/60 registrations
+[2026-03-17T10:28:06.848Z]    ↳ Freestyle 100m: 64/64 registrations
+[2026-03-17T10:28:06.851Z] 
+🎯 Heat test events ready:
+
+[2026-03-17T10:28:06.852Z] Event: Heat Test Event - Racing 2026
+[2026-03-17T10:28:06.853Z]   - ID: 22
+[2026-03-17T10:28:06.854Z]   - Sport: racing
+[2026-03-17T10:28:06.855Z]   - Categories: 2
+[2026-03-17T10:28:06.858Z]   - Registrations: 124
+[2026-03-17T10:28:06.871Z]     • Sprint 100m [7aacbf04-b894-4f4e-9a7e-26381b5512bd]
+[2026-03-17T10:28:06.872Z]     • Sprint 200m [9dd0050c-70cc-4c67-80cf-0f191d639b2b]
+[2026-03-17T10:28:06.881Z] Event: Heat Test Event - Swimming 2026
+[2026-03-17T10:28:06.884Z]   - ID: 23
+[2026-03-17T10:28:06.886Z]   - Sport: swimming
+[2026-03-17T10:28:06.888Z]   - Categories: 2
+[2026-03-17T10:28:06.889Z]   - Registrations: 124
+[2026-03-17T10:28:06.890Z]     • Freestyle 50m [3402c559-32a1-4ad9-ac5f-6695a839f4a7]
+[2026-03-17T10:28:06.895Z]     • Freestyle 100m [4d84896c-062f-43b9-b005-949f764bb8b6]
+[2026-03-17T10:28:06.899Z] 
+✅ Done. You can now open these events in admin hub and test Heat tab.

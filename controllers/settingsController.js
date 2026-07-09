@@ -6,6 +6,9 @@ export const getSettings = async (req, res) => {
         if (error) throw error;
         res.json({ success: true, settings });
     } catch (err) {
+        if (err.code === 'PGRST116') {
+            return res.json({ success: true, settings: { id: 1, platform_name: 'Default', logo_url: '' } });
+        }
         console.error("GET SETTINGS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch settings" });
     }
@@ -16,7 +19,8 @@ export const updateSettings = async (req, res) => {
         const { platformName, supportEmail, supportPhone, logoUrl, logoSize } = req.body;
         const { data: settings, error } = await supabaseAdmin
             .from("platform_settings")
-            .update({
+            .upsert({
+                id: 1,
                 platform_name: platformName,
                 support_email: supportEmail,
                 support_phone: supportPhone,
@@ -25,7 +29,6 @@ export const updateSettings = async (req, res) => {
                 registration_config: req.body.registrationConfig,
                 updated_at: new Date()
             })
-            .eq("id", 1)
             .select()
             .single();
 
