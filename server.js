@@ -14,6 +14,7 @@ import authRoutes from "./routes/authRoutes.js";
 import bracketRoutes from "./routes/bracketRoutes.js";
 import contactRoutes from "./routes/contactRoutes.js";
 import eventRoutes from "./routes/eventRoutes.js";
+import fileRoutes from "./routes/fileRoutes.js";
 import googleSyncRoutes from "./routes/googleSyncRoutes.js";
 import leagueRoutes from "./routes/leagueRoutes.js";
 import matchRoutes from "./routes/matchRoutes.js";
@@ -53,6 +54,7 @@ app.use("/api/teams", teamRoutes);
 app.use("/api/notifications", notificationRoutes); // Mounted Notification Routes
 app.use("/api/institute", instituteRoutes); // Institute endpoints
 app.use("/api/public", publicRoutes);
+app.use("/api/files", fileRoutes); // Signed-URL delivery for Railway bucket files
 
 
 const PORT = process.env.PORT || 5001;
