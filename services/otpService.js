@@ -2,22 +2,43 @@ import axios from "axios";
 import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { sendOtpEmail } from "../utils/mailer.js";
+import { sendOtpWhatsApp } from "../utils/whatsapp.js";
 
-// In-memory store for custom email OTPs 
+// In-memory store for custom email OTPs
 const emailOtpStore = new Map();
+
+// In-memory store for WhatsApp mobile OTPs (sessionId -> { otp, expiresAt })
+const mobileOtpStore = new Map();
 
 const TWO_FACTOR_API_KEY = process.env.TWO_FACTOR_API_KEY || "e6b3f27c-da5e-11f0-a6b2-0200cd936042";
 
 /**
- * Sends a Mobile OTP using 2Factor.in
+ * Sends a Mobile OTP — WhatsApp first, 2Factor.in SMS as fallback
  * @param {string} mobile - Mobile number
  * @returns {Promise<{success: boolean, sessionId?: string, message?: string}>}
  */
 export async function sendMobileOtp(mobile) {
     if (!mobile) throw new Error("Mobile number is required");
 
+    const otp = Math.floor(100000 + Math.random() * 900000);
+
+    // Primary channel: WhatsApp (self-generated OTP, verified locally)
     try {
-        const otp = Math.floor(100000 + Math.random() * 900000);
+        const sent = await sendOtpWhatsApp(mobile, otp);
+        if (sent) {
+            const sessionId = `wa_${crypto.randomUUID()}`;
+            mobileOtpStore.set(sessionId, {
+                otp: String(otp),
+                expiresAt: Date.now() + 10 * 60 * 1000 // 10 mins expiry
+            });
+            return { success: true, sessionId };
+        }
+    } catch (waErr) {
+        console.error("Service: sendMobileOtp WhatsApp Error:", waErr.message);
+    }
+
+    // Fallback channel: 2Factor.in SMS
+    try {
         const url = `https://2factor.in/API/V1/${TWO_FACTOR_API_KEY}/SMS/${mobile}/${otp}`;
 
         const response = await axios.get(url);
@@ -35,7 +56,7 @@ export async function sendMobileOtp(mobile) {
 }
 
 /**
- * Verifies a Mobile OTP using 2Factor.in
+ * Verifies a Mobile OTP — local store for WhatsApp sessions, 2Factor.in for SMS sessions
  * @param {string} sessionId - Session ID from send step
  * @param {string} otp - OTP entered by user
  * @returns {Promise<boolean>}
@@ -43,6 +64,24 @@ export async function sendMobileOtp(mobile) {
 export async function verifyMobileOtp(sessionId, otp) {
     if (!sessionId || !otp) throw new Error("Session ID and OTP are required");
 
+    // WhatsApp OTP session — verify against local store
+    if (sessionId.startsWith("wa_")) {
+        const record = mobileOtpStore.get(sessionId);
+        if (!record) return false;
+
+        if (Date.now() > record.expiresAt) {
+            mobileOtpStore.delete(sessionId); // expired
+            return false;
+        }
+
+        if (record.otp === String(otp)) {
+            mobileOtpStore.delete(sessionId); // used successfully
+            return true;
+        }
+        return false;
+    }
+
+    // 2Factor.in SMS session
     try {
         const url = `https://2factor.in/API/V1/${TWO_FACTOR_API_KEY}/SMS/VERIFY/${sessionId}/${otp}`;
         const response = await axios.get(url);

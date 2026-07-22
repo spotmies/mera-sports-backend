@@ -10,6 +10,7 @@ import {
     verifyMobileOtp
 } from "../services/otpService.js";
 import { sendRegistrationSuccessEmail } from "../utils/mailer.js";
+import { sendWelcomeWhatsApp } from "../utils/whatsapp.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -468,6 +469,15 @@ export const registerPlayer = async (req, res) => {
                 password: plainPassword
             });
         } catch (emailErr) { console.error("Welcome Email Error:", emailErr.message); }
+
+        // 10b. Send Welcome WhatsApp (alongside email, non-blocking)
+        try {
+            await sendWelcomeWhatsApp(user.mobile, {
+                name: user.name,
+                playerId: user.player_id,
+                password: plainPassword
+            });
+        } catch (waErr) { console.error("Welcome WhatsApp Error:", waErr.message); }
 
         res.json({
             success: true,
