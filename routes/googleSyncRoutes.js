@@ -3,63 +3,66 @@ import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
 import jwt from "jsonwebtoken";
+import { OAuth2Client } from "google-auth-library";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
 dotenv.config({ quiet: true });
 
 const router = express.Router();
 
-router.get('/google-url', (req, res) => {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    // The redirect_to should point to your ADMIN Frontend Login page
-    const frontendUrl = process.env.ADMIN_FRONTEND_URL;
-    if (!frontendUrl) {
-        console.error("CRITICAL: ADMIN_FRONTEND_URL is not defined in .env");
-        return res.status(500).json({ error: "Server misconfiguration" });
-    }
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-    const redirectUrl = `${supabaseUrl}/auth/v1/authorize?provider=google&redirect_to=${frontendUrl}`;
-
-    res.json({ url: redirectUrl });
-});
+/**
+ * Verify a Google ID token (from Google Identity Services on the frontend)
+ * and return its payload. Throws on any verification failure.
+ * Replaces the old Supabase-hosted OAuth + supabaseAdmin.auth.getUser flow.
+ */
+export async function verifyGoogleIdToken(idToken) {
+    const ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    return ticket.getPayload(); // { sub, email, email_verified, name, given_name, family_name, picture }
+}
 
 router.post('/sync', async (req, res) => {
     try {
-        // 1. Verify the token sent from Frontend
+        // 1. Verify the Google ID token sent from Frontend
         const authHeader = req.headers.authorization;
         if (!authHeader) return res.status(401).json({ error: 'No token provided' });
 
         const token = authHeader.split(' ')[1];
 
-        // Get the user details from Supabase Auth (using the token)
-        const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
-
-        if (authError || !user) {
+        let payload;
+        try {
+            payload = await verifyGoogleIdToken(token);
+        } catch (e) {
+            console.error("Google token verification failed:", e.message);
+            return res.status(401).json({ error: 'Invalid token' });
+        }
+        if (!payload?.email || payload.email_verified === false) {
             return res.status(401).json({ error: 'Invalid token' });
         }
 
-        // 2. CHECK IF USER ALREADY EXISTS (By ID or Email)
+        // 2. CHECK IF USER ALREADY EXISTS (by email — IDs are our own UUIDs now)
         const { data: existingUser } = await supabaseAdmin
             .from('users')
             .select('*')
-            .or(`id.eq.${user.id},email.eq.${user.email}`)
+            .eq('email', payload.email)
             .maybeSingle();
 
         // Robust Name Parsing
-        const meta = user.user_metadata || {};
-        const fullName = meta.full_name || meta.name || 'Admin User';
-
-        let firstName = meta.given_name || meta.first_name || meta.name;
-        let lastName = meta.family_name || meta.last_name || '';
-
+        const fullName = payload.name || 'Admin User';
+        let firstName = payload.given_name || fullName;
+        let lastName = payload.family_name || '';
         if (!lastName && fullName.includes(' ')) {
             const parts = fullName.trim().split(' ');
             firstName = parts[0];
             lastName = parts.slice(1).join(' ');
         }
 
-        const googleId = user.identities?.find(id => id.provider === 'google')?.id || null;
-        const photoUrl = meta.avatar_url || meta.picture || '';
+        const googleId = payload.sub || null;
+        const photoUrl = payload.picture || '';
 
         let finalUser;
 
@@ -75,7 +78,6 @@ router.post('/sync', async (req, res) => {
             const last_login = new Date().toISOString();
 
             // UPDATE ONLY GOOGLE FIELDS (Preserve Mobile/DOB and ROLE)
-            // DO NOT OVERWRITE ROLE TO 'admin'
             const { data: updatedUser, error: updateError } = await supabaseAdmin
                 .from('users')
                 .update({
@@ -87,28 +89,26 @@ router.post('/sync', async (req, res) => {
                     google_id: googleId,
                     previous_login,
                     last_login
-                    // role: 'admin'  <-- REMOVED: Never overwrite role
+                    // role never overwritten
                 })
-                .eq('id', existingUser.id) // Use the FOUND ID, not user.id
+                .eq('id', existingUser.id)
                 .select()
                 .single();
 
             if (updateError) {
                 console.error("Error updating existing admin:", updateError);
-                // If update fails, fallback to existing data but STILL generate token
                 finalUser = existingUser;
             } else {
                 finalUser = updatedUser;
             }
         } else {
             // 3. IF NEW USER, CREATE WITH DUMMY DATA
-            // Generate a unique random sentinel per account instead of hashing a static
-            // string. This way the password is never guessable even with source-code access.
+            // Random per-account sentinel so the password is never guessable.
             const oauthSentinel = crypto.randomBytes(32).toString("hex");
             const hashedOAuthSentinel = await bcrypt.hash(oauthSentinel, 12);
             const userData = {
-                id: user.id,
-                email: user.email,
+                id: crypto.randomUUID(), // our own UUID (no Supabase Auth uid anymore)
+                email: payload.email,
                 first_name: firstName,
                 last_name: lastName,
                 name: fullName,
@@ -134,11 +134,10 @@ router.post('/sync', async (req, res) => {
                 player_id: `ADM-${Date.now().toString().slice(-6)}`
             };
 
-            // 3. Upsert into public.users
             const { data: savedUser, error: dbError } = await supabaseAdmin
                 .from('users')
                 .upsert(userData, { onConflict: 'id' })
-                .select() // Important to return the row
+                .select()
                 .single();
 
             if (dbError) {
@@ -149,8 +148,6 @@ router.post('/sync', async (req, res) => {
         }
 
         // 4. VERIFICATION CHECK — Block only rejected admins.
-        // Pending admins get a token so they can see the PendingApproval page
-        // and auto-redirect once approved (frontend handles the pending UI).
         if (finalUser.role === 'admin' && finalUser.verification === 'rejected') {
             return res.status(403).json({
                 error: "Your admin application has been rejected.",
@@ -159,7 +156,6 @@ router.post('/sync', async (req, res) => {
         }
 
         // 5. Generate Backend Token (consistent with login-admin)
-        // Admin tokens last 30 days for convenience (user can still logout manually)
         const backendToken = jwt.sign(
             { id: finalUser.id, role: finalUser.role },
             process.env.JWT_SECRET,
@@ -167,7 +163,6 @@ router.post('/sync', async (req, res) => {
         );
 
         // 6. Return the user data AND token to frontend
-        // Include verification status so frontend can show PendingApproval when needed
         const userPayload = {
             id: finalUser.id,
             name: finalUser.name,

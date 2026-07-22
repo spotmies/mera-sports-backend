@@ -907,10 +907,17 @@ export const reapplyGoogleAdmin = async (req, res) => {
     if (!token) return res.status(400).json({ message: "No token provided" });
 
     try {
-        const { data: { user: authUser }, error: authError } = await supabaseAdmin.auth.getUser(token);
-        if (authError || !authUser) return res.status(401).json({ message: "Invalid Google Session" });
+        // Verify the Google ID token directly (Supabase Auth removed)
+        let payload;
+        try {
+            const { verifyGoogleIdToken } = await import("../routes/googleSyncRoutes.js");
+            payload = await verifyGoogleIdToken(token);
+        } catch {
+            return res.status(401).json({ message: "Invalid Google Session" });
+        }
+        if (!payload?.email) return res.status(401).json({ message: "Invalid Google Session" });
 
-        const { data: user } = await supabaseAdmin.from("users").select("*").eq("email", authUser.email).maybeSingle();
+        const { data: user } = await supabaseAdmin.from("users").select("*").eq("email", payload.email).maybeSingle();
         if (!user) return res.status(404).json({ message: "User not found" });
 
         if (user.verification !== 'rejected') return res.status(400).json({ message: "Account is not in rejected state." });
