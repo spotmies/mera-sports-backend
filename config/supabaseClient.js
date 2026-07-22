@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import { PostgrestClient } from "@supabase/postgrest-js";
 import dotenv from "dotenv";
 import jwt from "jsonwebtoken"; // Import to inspect key role
+import { railwayStorage } from "../utils/railwayStorage.js";
 
 dotenv.config({ quiet: true });
 
@@ -77,11 +78,18 @@ if (USE_RAILWAY_DB) {
     // our own PostgREST → every controller's .from()/.rpc() works unchanged.
     const postgrest = new PostgrestClient(postgrestUrl, { schema: "public" });
 
+    // USE_RAILWAY_STORAGE=true → uploads/deletes/URLs go to the Railway
+    // bucket (private, served via /api/files signed-URL redirects).
+    const USE_RAILWAY_STORAGE = process.env.USE_RAILWAY_STORAGE === "true";
+    if (USE_RAILWAY_STORAGE) {
+        console.log(`🪣 Storage layer: Railway bucket (${process.env.BUCKET_NAME})`);
+    }
+
     supabaseAdminInstance = {
         from: (table) => postgrest.from(table),
         rpc: (fn, args, options) => postgrest.rpc(fn, args, options),
-        // Storage + Auth remain on Supabase until their own migration phases.
-        storage: supabaseLegacy.storage,
+        storage: USE_RAILWAY_STORAGE ? railwayStorage : supabaseLegacy.storage,
+        // Auth remains on Supabase until the Google-OAuth migration phase.
         auth: supabaseLegacy.auth,
     };
 } else {
