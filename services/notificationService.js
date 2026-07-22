@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { emitNotification } from "./realtimeService.js";
 
 /**
  * Helper: Create Notification within Backend
@@ -28,19 +29,13 @@ export const createNotification = async (userId, title, message, type = 'info', 
             return false;
         }
 
-        // Use httpSend() instead of send() for server-side broadcast.
-        //
-        // WHY: send() requires an active WebSocket connection. Browser clients maintain one,
-        // but a Node.js backend server does not — so send() was silently falling back to REST
-        // every time and printing a deprecation warning in the console.
-        //
-        // httpSend(event, payload) explicitly uses the REST API with no WebSocket needed.
-        // Signature: httpSend(event: string, payload: any, opts?: { timeout?: number })
-        // Available in @supabase/supabase-js >= 2.43 (using v2.87.3 here).
-        await supabaseAdmin
-            .channel(`system-notifications`)
-            .httpSend('new_notification', { user_id: userId })
-            .catch(err => console.warn("Broadcast failed, but notification saved:", err));
+        // Socket.IO broadcast (replaces Supabase Realtime httpSend).
+        // Fire-and-forget: a broadcast failure must never fail the notification.
+        try {
+            emitNotification(userId, { title, type });
+        } catch (err) {
+            console.warn("Broadcast failed, but notification saved:", err);
+        }
 
         return true;
 

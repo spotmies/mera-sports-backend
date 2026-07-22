@@ -58,6 +58,12 @@ app.use("/api/files", fileRoutes); // Signed-URL delivery for Railway bucket fil
 
 
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, () => {
+import { createServer } from "http";
+import { initRealtime } from "./services/realtimeService.js";
+
+// Socket.IO needs the raw http server (Express 5's app.listen would hide it)
+const httpServer = createServer(app);
+initRealtime(httpServer);
+httpServer.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });

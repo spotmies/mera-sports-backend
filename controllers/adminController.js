@@ -248,8 +248,7 @@ export const deleteAdmin = async (req, res) => {
         const { error: transferError } = await supabaseAdmin.from('events').update({ created_by: superAdminId }).eq('created_by', targetAdminId);
         if (transferError) throw transferError;
 
-        // 3. Delete user
-        await supabaseAdmin.auth.admin.deleteUser(targetAdminId).catch(console.warn);
+        // 3. Delete user (public.users is the only user store now — Supabase Auth removed)
         const { error: deletePublicError } = await supabaseAdmin.from('users').delete().eq('id', targetAdminId);
         if (deletePublicError) throw deletePublicError;
 
