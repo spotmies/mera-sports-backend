@@ -27,6 +27,13 @@ import teamRoutes from "./routes/teamRoutes.js";
 
 dotenv.config({ quiet: true });
 
+// Fail fast if the signing secret is missing — without it every jwt.sign/verify
+// across auth, OTP reset tokens and payments would be silently insecure.
+if (!process.env.JWT_SECRET) {
+    console.error("❌ FATAL: JWT_SECRET is not set. Refusing to start.");
+    process.exit(1);
+}
+
 const app = express();
 
 app.use(cors());
