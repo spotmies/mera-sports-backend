@@ -16,16 +16,67 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 
 /* ================= FORGOT PASSWORD ================= */
 
-export const resetPassword = async (req, res) => {
+// Verifies a forgot-password OTP and issues a short-lived reset token.
+// This is what binds the reset to a proven OTP — resetPassword below refuses
+// to run without a valid token, so the reset can never be called directly.
+export const verifyForgotPasswordOtp = async (req, res) => {
     try {
-        const { method, value, newPassword } = req.body;
-        if (!method || !value || !newPassword) {
-            return res.status(400).json({ message: "Missing reset data" });
+        const { method, value, otp, sessionId } = req.body;
+        if (!method || !value || !otp) {
+            return res.status(400).json({ message: "Missing verification data" });
         }
 
-        // We assume the frontend verified the OTP right before this call. 
-        // In a strictly secure environment, `verifyOtp` would issue a token. 
-        // Since we are reusing registration OTPs which do not issue tokens, we will do a direct update.
+        let verified = false;
+        if (method === 'mobile') {
+            if (!sessionId) return res.status(400).json({ message: "Missing session. Please resend the OTP." });
+            verified = await verifyMobileOtp(sessionId, otp);
+        } else if (method === 'email') {
+            verified = await verifyEmailOtp(value, otp);
+        } else {
+            return res.status(400).json({ message: "Invalid method" });
+        }
+
+        if (!verified) {
+            return res.status(400).json({ success: false, message: "Invalid OTP or session expired" });
+        }
+
+        // Reset token is bound to this exact method+value and expires in 10 minutes
+        const resetToken = jwt.sign(
+            { type: 'password_reset', method, value },
+            process.env.JWT_SECRET,
+            { expiresIn: "10m" }
+        );
+
+        res.json({ success: true, resetToken });
+    } catch (err) {
+        console.error("FORGOT PASSWORD VERIFY OTP ERROR:", err.message);
+        res.status(500).json({ success: false, message: "Verification failed" });
+    }
+};
+
+export const resetPassword = async (req, res) => {
+    try {
+        const { method, value, newPassword, resetToken } = req.body;
+        if (!method || !value || !newPassword || !resetToken) {
+            return res.status(400).json({ message: "Missing reset data" });
+        }
+        if (String(newPassword).length < 6) {
+            return res.status(400).json({ message: "Password must be at least 6 characters" });
+        }
+
+        // Require a valid, unexpired reset token issued by verifyForgotPasswordOtp,
+        // bound to the same method+value. Without this the endpoint would let anyone
+        // reset any account's password just by knowing its email/mobile.
+        let decoded;
+        try {
+            decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+        } catch {
+            return res.status(401).json({ message: "Reset session expired. Please verify OTP again." });
+        }
+        if (decoded.type !== 'password_reset' || decoded.method !== method || decoded.value !== value) {
+            return res.status(401).json({ message: "Invalid reset session. Please verify OTP again." });
+        }
+
         let user = null;
 
         if (method === 'mobile') {
