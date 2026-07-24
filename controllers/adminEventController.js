@@ -1,6 +1,28 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
+
+// Fire-and-forget WhatsApp status update to the registration's player
+const notifyRegistrationStatusWhatsApp = (playerId, eventName, registrationNo, status) => {
+    (async () => {
+        try {
+            const { data: user } = await supabaseAdmin
+                .from("users")
+                .select("first_name, mobile")
+                .eq("id", playerId)
+                .maybeSingle();
+            if (user?.mobile) {
+                await sendRegistrationStatusWhatsApp(user.mobile, {
+                    playerName: user.first_name,
+                    eventName,
+                    registrationNo,
+                    status,
+                });
+            }
+        } catch (e) { console.error("Registration status WhatsApp error:", e.message); }
+    })();
+};
 
 /* ================= CATEGORIES ================= */
 export const getAllCategories = async (req, res) => {
@@ -171,6 +193,7 @@ export const verifyTransaction = async (req, res) => {
                 `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) has been verified.`,
                 "success"
             );
+            notifyRegistrationStatusWhatsApp(updatedReg.player_id, updatedReg.events?.name, updatedReg.registration_no, "Verified");
         }
         res.json({ success: true, message: "Transaction verified" });
     } catch (err) {
@@ -197,6 +220,7 @@ export const rejectTransaction = async (req, res) => {
                 `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) was rejected.`,
                 "error"
             );
+            notifyRegistrationStatusWhatsApp(updatedReg.player_id, updatedReg.events?.name, updatedReg.registration_no, "Rejected");
         }
         res.json({ success: true, message: "Transaction rejected" });
     } catch (err) {
@@ -220,11 +244,13 @@ export const bulkUpdateTransactions = async (req, res) => {
         if (error) throw error;
 
         if (updatedRegs) {
+            const statusLabel = status === 'verified' ? "Verified" : "Rejected";
             updatedRegs.forEach(reg => {
                 const title = status === 'verified' ? "Registration Verified" : "Registration Rejected";
                 const type = status === 'verified' ? "success" : "error";
                 const msg = `Your registration for ${reg.events?.name} (Reg No: ${reg.registration_no}) was ${status}.`;
                 createNotification(reg.player_id, title, msg, type);
+                notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
             });
         }
         res.json({ success: true, message: `Transactions ${status}`, count });
