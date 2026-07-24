@@ -1,4 +1,3 @@
-import axios from "axios";
 import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { sendOtpEmail } from "../utils/mailer.js";
@@ -7,11 +6,9 @@ import { sendOtpWhatsApp } from "../utils/whatsapp.js";
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 // In-memory fallback — used only when the `otp_sessions` table is unavailable
-// (e.g. before the migration is run). A single Supabase-backed store keeps OTPs
-// valid across backend restarts and multiple instances.
+// (e.g. before the migration is run). The DB-backed store keeps OTPs valid
+// across backend restarts and multiple instances.
 const memStore = new Map();
-
-const TWO_FACTOR_API_KEY = process.env.TWO_FACTOR_API_KEY || "e6b3f27c-da5e-11f0-a6b2-0200cd936042";
 
 /**
  * Persist an OTP for a given channel + key (sessionId for mobile, email for email).
@@ -81,72 +78,36 @@ async function consumeOtp(channel, key, otp) {
 }
 
 /**
- * Sends a Mobile OTP — WhatsApp first, 2Factor.in SMS as fallback
+ * Sends a Mobile OTP via WhatsApp (self-generated OTP, verified against our store).
  * @param {string} mobile - Mobile number
- * @returns {Promise<{success: boolean, sessionId?: string, message?: string}>}
+ * @returns {Promise<{success: boolean, sessionId: string}>}
+ * @throws if the WhatsApp send is not accepted
  */
 export async function sendMobileOtp(mobile) {
     if (!mobile) throw new Error("Mobile number is required");
 
-    const otp = Math.floor(100000 + Math.random() * 900000);
+    // crypto.randomInt is cryptographically secure (unlike Math.random) → unpredictable OTPs
+    const otp = crypto.randomInt(100000, 1000000);
 
-    // Primary channel: WhatsApp (self-generated OTP, verified against our store)
-    try {
-        const sent = await sendOtpWhatsApp(mobile, otp);
-        if (sent) {
-            const sessionId = `wa_${crypto.randomUUID()}`;
-            await storeOtp("mobile", sessionId, otp);
-            return { success: true, sessionId };
-        }
-    } catch (waErr) {
-        console.error("Service: sendMobileOtp WhatsApp Error:", waErr.message);
+    const sent = await sendOtpWhatsApp(mobile, otp);
+    if (!sent) {
+        throw new Error("Failed to send WhatsApp OTP. Make sure the number is registered on WhatsApp.");
     }
 
-    // Fallback channel: 2Factor.in SMS
-    try {
-        const url = `https://2factor.in/API/V1/${TWO_FACTOR_API_KEY}/SMS/${mobile}/${otp}`;
-
-        const response = await axios.get(url);
-
-        if (response.data && response.data.Status === "Success") {
-            return { success: true, sessionId: response.data.Details };
-        } else {
-            console.error("2Factor Error:", response.data);
-            throw new Error("Failed to send SMS OTP via Provider");
-        }
-    } catch (err) {
-        console.error("Service: sendMobileOtp Error:", err.message);
-        throw err;
-    }
+    const sessionId = `wa_${crypto.randomUUID()}`;
+    await storeOtp("mobile", sessionId, otp);
+    return { success: true, sessionId };
 }
 
 /**
- * Verifies a Mobile OTP — shared store for WhatsApp sessions, 2Factor.in for SMS sessions
+ * Verifies a Mobile OTP against the shared store.
  * @param {string} sessionId - Session ID from send step
  * @param {string} otp - OTP entered by user
  * @returns {Promise<boolean>}
  */
 export async function verifyMobileOtp(sessionId, otp) {
     if (!sessionId || !otp) throw new Error("Session ID and OTP are required");
-
-    // WhatsApp OTP session — verify against our shared store
-    if (sessionId.startsWith("wa_")) {
-        return consumeOtp("mobile", sessionId, otp);
-    }
-
-    // 2Factor.in SMS session
-    try {
-        const url = `https://2factor.in/API/V1/${TWO_FACTOR_API_KEY}/SMS/VERIFY/${sessionId}/${otp}`;
-        const response = await axios.get(url);
-
-        if (response.data && response.data.Status === "Success") {
-            return true;
-        }
-        return false;
-    } catch (err) {
-        console.error("Service: verifyMobileOtp Error:", err.message);
-        return false;
-    }
+    return consumeOtp("mobile", sessionId, otp);
 }
 
 /**
@@ -157,7 +118,7 @@ export async function sendEmailOtp(email) {
     if (!email) throw new Error("Email is required");
 
     try {
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otp = String(crypto.randomInt(100000, 1000000));
 
         await storeOtp("email", email, otp);
 
