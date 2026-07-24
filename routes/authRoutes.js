@@ -15,7 +15,8 @@ import {
     verifyVerificationOtp,
     registerInstitute,
     loginInstitute,
-    resetPassword
+    resetPassword,
+    verifyForgotPasswordOtp
 } from "../controllers/authController.js";
 
 const router = express.Router();
@@ -34,6 +35,7 @@ router.post("/verify-mobile-otp", verifyMobileRegistrationOtp);
 router.post("/check-conflict", checkUserConflict);
 
 /* ================= FORGOT PASSWORD ================= */
+router.post("/forgot-password/verify-otp", verifyForgotPasswordOtp);
 router.post("/forgot-password/reset", resetPassword);
 
 /* ================= PLAYER AUTH ================= */

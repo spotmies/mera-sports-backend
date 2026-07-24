@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import * as xlsx from "xlsx";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { sendWelcomeWhatsApp } from "../utils/whatsapp.js";
 
 // 1. POST /api/institute/request-bulk-approval
 export const updateInstituteProfile = async (req, res) => {
@@ -264,7 +265,7 @@ export const finalizeBulkImport = async (req, res) => {
         // the DB sequence (P1001, P1002 …) is assigned without gaps or races.
         // A 30ms yield between inserts prevents Supabase connection pool saturation
         // and ensures concurrent individual registrations always find a free slot.
-        for (const { row, fName, lName, parsedDob, hashedPassword } of hashedStudents) {
+        for (const { row, fName, lName, parsedDob, plainPassword, hashedPassword } of hashedStudents) {
             const { data: newPlayerId, error: pidError } = await supabaseAdmin.rpc("get_next_player_id");
             if (pidError || !newPlayerId) {
                 console.error("Failed to generate player_id:", pidError);
@@ -317,6 +318,15 @@ export const finalizeBulkImport = async (req, res) => {
                 failed.push({ row, errorField, reason });
             } else {
                 successful.push({ first_name: student.first_name, email: student.email });
+
+                // Send login credentials to the student's WhatsApp (fire-and-forget)
+                if (student.mobile) {
+                    sendWelcomeWhatsApp(student.mobile, {
+                        name: student.name,
+                        playerId: student.player_id,
+                        password: plainPassword
+                    }).catch(e => console.error("Bulk import welcome WhatsApp error:", e.message));
+                }
             }
         }
 

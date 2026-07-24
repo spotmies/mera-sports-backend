@@ -4,6 +4,7 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
+import { sendRegistrationWhatsApp } from "../utils/whatsapp.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
 // ── Server-side fee computation ──────────────────────────────────────────────
@@ -306,17 +307,21 @@ export const verifyRazorpayPayment = async (req, res) => {
             throw regError;
         }
 
-        // Email (async, non-blocking)
+        // Email + WhatsApp (async, non-blocking)
         (async () => {
             try {
-                const { data: user } = await supabaseAdmin.from("users").select("email, first_name").eq("id", userId).single();
+                const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
                 const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
+                const details = {
+                    playerName: user?.first_name, eventName: event?.name, registrationNo, amount: paidAmount, category: categories, date: new Date(), status: "Confirmed"
+                };
                 if (user?.email) {
-                    await sendRegistrationEmail(user.email, {
-                        playerName: user.first_name, eventName: event?.name, registrationNo, amount: paidAmount, category: categories, date: new Date(), status: "Confirmed"
-                    });
+                    await sendRegistrationEmail(user.email, details);
                 }
-            } catch (e) { console.error("Email Error:", e); }
+                if (user?.mobile) {
+                    await sendRegistrationWhatsApp(user.mobile, details);
+                }
+            } catch (e) { console.error("Email/WhatsApp Error:", e); }
         })();
 
         if (teamId) {
@@ -527,17 +532,21 @@ export const submitManualPayment = async (req, res) => {
             throw regError;
         }
 
-        // 3. Email (Async)
+        // 3. Email + WhatsApp (Async)
         (async () => {
             try {
-                const { data: user } = await supabaseAdmin.from("users").select("email, first_name").eq("id", userId).single();
+                const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
                 const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
+                const details = {
+                    playerName: user?.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: 'Pending Verification'
+                };
                 if (user?.email) {
-                    await sendRegistrationEmail(user.email, {
-                        playerName: user.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: 'Pending Verification'
-                    });
+                    await sendRegistrationEmail(user.email, details);
                 }
-            } catch (e) { console.error("Email Error:", e); }
+                if (user?.mobile) {
+                    await sendRegistrationWhatsApp(user.mobile, details);
+                }
+            } catch (e) { console.error("Email/WhatsApp Error:", e); }
         })();
 
         // 4. Notify team members about event registration (Async, non-blocking)
