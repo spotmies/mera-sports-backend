@@ -14,37 +14,39 @@ export const getPlayerDashboard = async (req, res) => {
         if (error) throw error;
         if (!player) return res.status(404).json({ message: "Player not found" });
 
-        const { data: schoolDetails } = await supabaseAdmin.from("player_school_details").select("*").eq("player_id", userId).maybeSingle();
+        // These lookups don't depend on each other — run them in one parallel batch
+        // instead of ~5 sequential round-trips.
+        const [
+            { data: schoolDetails },
+            { data: captainTeams },
+            { data: memberTeams },
+            { data: allTeams },
+            { data: transactions },
+        ] = await Promise.all([
+            supabaseAdmin.from("player_school_details").select("*").eq("player_id", userId).maybeSingle(),
+            supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId),
+            player.mobile
+                ? supabaseAdmin.from("player_teams").select("id").contains("members", [{ mobile: player.mobile }])
+                : Promise.resolve({ data: [] }),
+            supabaseAdmin.from("player_teams").select("id, members"),
+            supabaseAdmin.from("transactions").select("*").eq("user_id", userId),
+        ]);
+
         if (schoolDetails) player.schoolDetails = schoolDetails;
 
-        // Fetch Teams
+        // Collect every team this player belongs to: captain, member-by-mobile,
+        // or member-by-id/player_id inside the members array.
         let relevantTeamIds = [];
-        let captainTeamIdSet = new Set();
-        const { data: captainTeams } = await supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId);
-        if (captainTeams) {
-            captainTeams.forEach(t => { relevantTeamIds.push(t.id); captainTeamIdSet.add(t.id); });
-        }
-
-        // Check membership by mobile
-        if (player.mobile) {
-            const { data: memberTeams } = await supabaseAdmin.from("player_teams").select("id").contains("members", [{ mobile: player.mobile }]);
-            if (memberTeams) relevantTeamIds.push(...memberTeams.map(t => t.id));
-        }
-
-        // Check membership by player_id string or user UUID in members array
-        {
-            const { data: allTeams } = await supabaseAdmin.from("player_teams").select("id, members");
-            if (allTeams) {
-                allTeams.forEach(team => {
-                    if (Array.isArray(team.members) && team.members.some(m =>
-                        m.id === userId ||
-                        (player.player_id && m.player_id === player.player_id)
-                    )) {
-                        relevantTeamIds.push(team.id);
-                    }
-                });
+        (captainTeams || []).forEach(t => relevantTeamIds.push(t.id));
+        (memberTeams || []).forEach(t => relevantTeamIds.push(t.id));
+        (allTeams || []).forEach(team => {
+            if (Array.isArray(team.members) && team.members.some(m =>
+                m.id === userId ||
+                (player.player_id && m.player_id === player.player_id)
+            )) {
+                relevantTeamIds.push(team.id);
             }
-        }
+        });
         relevantTeamIds = [...new Set(relevantTeamIds)];
 
         // Fetch Registrations
@@ -56,17 +58,23 @@ export const getPlayerDashboard = async (req, res) => {
         }
         const { data: registrations } = await query;
 
-        // Fetch Transactions
-        const { data: transactions } = await supabaseAdmin.from("transactions").select("*").eq("user_id", userId);
+        // Batch-fetch team details for ALL registrations in one query (was an N+1:
+        // one player_teams query per registration → dozens of round-trips).
+        const regTeamIds = [...new Set((registrations || []).filter(r => r.team_id).map(r => r.team_id))];
+        const teamsById = {};
+        if (regTeamIds.length > 0) {
+            const { data: regTeams } = await supabaseAdmin.from("player_teams").select("*").in("id", regTeamIds);
+            (regTeams || []).forEach(t => { teamsById[t.id] = t; });
+        }
 
-        // Merge Details
-        const detailedRegistrations = await Promise.all((registrations || []).map(async (reg) => {
+        // Merge Details (pure in-memory now — no awaits inside the loop)
+        const detailedRegistrations = (registrations || []).map((reg) => {
             const txn = (transactions || []).find(t => (reg.transaction_id && t.id === reg.transaction_id) || (t.event_id === reg.event_id));
             let teamDetails = null;
             let isTeamMember = false;
             let isCaptain = false;
             if (reg.team_id) {
-                const { data: team } = await supabaseAdmin.from("player_teams").select("*").eq("id", reg.team_id).maybeSingle();
+                const team = teamsById[reg.team_id] || null;
                 teamDetails = team;
                 if (team) {
                     isCaptain = team.captain_id === userId;
@@ -88,7 +96,7 @@ export const getPlayerDashboard = async (req, res) => {
                 is_captain: isCaptain,
                 registered_by: reg.player_id === userId ? 'self' : 'team'
             };
-        }));
+        });
 
         res.json({
             success: true,

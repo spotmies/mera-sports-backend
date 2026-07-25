@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 
 // Simple UUID v4 validator
@@ -93,6 +94,10 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
 // GET /api/public/events/list
 export const listPublicEvents = async (_req, res) => {
     try {
+        // Cache-aside: serve the public events list from Redis when warm.
+        const cached = await cacheGet("public:events:list");
+        if (cached) return res.json({ success: true, events: cached });
+
         const { data, error } = await supabaseAdmin
             .from("events")
             .select("*, event_registrations(count)")
@@ -110,6 +115,7 @@ export const listPublicEvents = async (_req, res) => {
             };
         });
 
+        await cacheSet("public:events:list", events, 60); // 60s TTL
         return res.json({ success: true, events });
     } catch (err) {
         console.error("PUBLIC EVENTS LIST ERROR:", err);
@@ -120,6 +126,10 @@ export const listPublicEvents = async (_req, res) => {
 // GET /api/public/settings
 export const getPublicSettings = async (req, res) => {
     try {
+        // Cache-aside: settings change rarely — cache for 2 min.
+        const cached = await cacheGet("public:settings");
+        if (cached) return res.json({ success: true, settings: cached });
+
         const { data: settings, error } = await supabaseAdmin
             .from("platform_settings")
             .select("platform_name, logo_url, support_email, support_phone, logo_size, registration_config")
@@ -128,10 +138,9 @@ export const getPublicSettings = async (req, res) => {
 
         if (error) throw error;
 
-        res.json({
-            success: true,
-            settings: settings || { platform_name: 'Sports Paramount', logo_url: '' }
-        });
+        const payload = settings || { platform_name: 'Sports Paramount', logo_url: '' };
+        await cacheSet("public:settings", payload, 120);
+        res.json({ success: true, settings: payload });
     } catch (err) {
         console.error("PUBLIC SETTINGS ERROR:", err);
         res.json({
