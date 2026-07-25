@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheDel } from "../config/redisClient.js";
 
 export const getSettings = async (req, res) => {
     try {
@@ -33,6 +34,7 @@ export const updateSettings = async (req, res) => {
             .single();
 
         if (error) throw error;
+        await cacheDel("public:settings"); // refresh public footer/logo cache
         res.json({ success: true, settings });
     } catch (err) {
         console.error("UPDATE SETTINGS ERROR:", err);
