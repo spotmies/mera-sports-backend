@@ -1,7 +1,19 @@
 import QRCode from 'qrcode';
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheGet, cacheSet, cacheDel } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+
+/**
+ * Invalidate all event-related caches. Call after any event write so public
+ * reads (list + detail) don't serve stale data.
+ */
+export const invalidateEventCaches = async () => {
+    await Promise.all([
+        cacheDel("public:events:list"),
+        cacheDel("event:detail:*"),
+    ]);
+};
 
 const sanitizeSearch = (s) =>
     typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
@@ -151,13 +163,27 @@ export const listEvents = async (req, res) => {
 export const getEventDetails = async (req, res) => {
     try {
         const { id } = req.params;
+
+        // Cache-aside: full event detail (incl. counts) cached 60s. Writes call
+        // invalidateEventCaches(); registrations also invalidate (see below).
+        const cacheKey = `event:detail:${id}`;
+        const cachedEvent = await cacheGet(cacheKey);
+        if (cachedEvent) return res.json({ success: true, event: cachedEvent });
+
         const eventData = await resolveEventByIdentifier(id, '*');
         if (!eventData) return res.status(404).json({ success: false, message: "Event not found" });
         eventData.public_id = getPublicEventId(eventData);
         const internalEventId = eventData.id;
 
-        const assignedAdmins = await loadAssignedAdminsForEvent(internalEventId);
-        if (assignedAdmins.length > 0) {
+        // assigned admins, news and registration stats are independent of each
+        // other — fetch them in one parallel batch instead of 3 sequential calls.
+        const [assignedAdmins, { data: newsData }, { data: regStats }] = await Promise.all([
+            loadAssignedAdminsForEvent(internalEventId),
+            supabaseAdmin.from('event_news').select('*').eq('event_id', internalEventId).order('created_at', { ascending: false }),
+            supabaseAdmin.from("event_registrations").select("categories, status, team_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]),
+        ]);
+
+        if (assignedAdmins.length > 0) { 
             eventData.assigned_admins = assignedAdmins;
             eventData.assigned_admin_ids = assignedAdmins.map((admin) => admin.id);
             eventData.assigned_user = {
@@ -177,14 +203,11 @@ export const getEventDetails = async (req, res) => {
             eventData.assigned_admin_ids = [];
         }
 
-        const { data: newsData } = await supabaseAdmin.from('event_news').select('*').eq('event_id', internalEventId).order('created_at', { ascending: false });
         eventData.news = newsData || [];
 
-        // Stats
-        // Also fetch team_id so team/doubles categories count distinct teams, not individual players.
-        // (For Singles: team_id is null → count rows. For Team/Doubles: team_id is shared → count distinct team_ids.)
-        const { data: regStats } = await supabaseAdmin.from("event_registrations").select("categories, status, team_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]);
-
+        // Stats — team_id lets team/doubles categories count distinct teams, not
+        // individual players. (Singles: team_id null → count rows. Team/Doubles:
+        // team_id shared → count distinct team_ids.) regStats fetched in the batch above.
         const registrationCounts = {};
         // Tracks distinct team_ids per category key (for Team/Doubles events)
         const teamIdsPerCategory = {};
@@ -215,6 +238,7 @@ export const getEventDetails = async (req, res) => {
         eventData.registration_counts = registrationCounts;
         eventData.total_registrations_count = regStats ? regStats.length : 0;
 
+        await cacheSet(cacheKey, eventData, 60); // 60s TTL
         res.json({ success: true, event: eventData });
     } catch (err) {
         console.error("Fetch Event Error:", err);
@@ -339,6 +363,7 @@ export const createEvent = async (req, res) => {
             };
         }
 
+        await invalidateEventCaches();
         res.json({ success: true, event: data });
     } catch (err) {
         console.error("Create Event Logic Error:", err);
@@ -423,6 +448,7 @@ export const updateEvent = async (req, res) => {
             };
         }
 
+        await invalidateEventCaches();
         res.json({ success: true, event: data });
     } catch (err) {
         console.error("Update Event Error:", err);
@@ -439,6 +465,7 @@ export const deleteEvent = async (req, res) => {
         await supabaseAdmin.from('event_brackets').delete().eq('event_id', id);
         const { error } = await supabaseAdmin.from('events').delete().eq('id', id);
         if (error) throw error;
+        await invalidateEventCaches();
         res.json({ success: true, message: "Event deleted" });
     } catch (err) {
         console.error("Delete Event Error:", err);

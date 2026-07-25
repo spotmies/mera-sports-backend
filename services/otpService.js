@@ -1,21 +1,37 @@
 import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { redis, isRedisReady } from "../config/redisClient.js";
 import { sendOtpEmail } from "../utils/mailer.js";
 import { sendOtpWhatsApp } from "../utils/whatsapp.js";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_TTL_S = Math.ceil(OTP_TTL_MS / 1000);
 
-// In-memory fallback — used only when the `otp_sessions` table is unavailable
-// (e.g. before the migration is run). The DB-backed store keeps OTPs valid
-// across backend restarts and multiple instances.
+// In-memory fallback — used only when neither Redis nor the `otp_sessions` table
+// is available. The Redis/DB stores keep OTPs valid across backend restarts and
+// multiple instances.
 const memStore = new Map();
+
+const redisOtpKey = (channel, key) => `otp:${channel}:${key}`;
 
 /**
  * Persist an OTP for a given channel + key (sessionId for mobile, email for email).
- * Writes to Supabase; falls back to an in-memory Map if the DB is unreachable.
+ * Storage precedence: Redis (native TTL) → Supabase → in-memory.
  */
 async function storeOtp(channel, key, otp) {
     const now = Date.now();
+
+    // 1. Redis — auto-expires via TTL (no cleanup job), shared across instances.
+    if (isRedisReady()) {
+        try {
+            await redis.set(redisOtpKey(channel, key), String(otp), "EX", OTP_TTL_S);
+            return;
+        } catch (err) {
+            console.warn(`OTP store: Redis failed, falling back to DB (${err.message})`);
+        }
+    }
+
+    // 2. Supabase/Postgres fallback.
     try {
         const { error } = await supabaseAdmin
             .from("otp_sessions")
@@ -36,11 +52,27 @@ async function storeOtp(channel, key, otp) {
 }
 
 /**
- * Verify an OTP for a channel + key. Consumes (deletes) the record on success or
- * expiry so it can't be reused; leaves it in place on a wrong guess for retries.
+ * Verify an OTP for a channel + key. Consumes (deletes) the record on success so
+ * it can't be reused; leaves it in place on a wrong guess for retries. Expiry is
+ * handled by Redis TTL (a missing key = expired). Checks Redis → DB → in-memory.
  * @returns {Promise<boolean>}
  */
 async function consumeOtp(channel, key, otp) {
+    // 1. Redis first.
+    if (isRedisReady()) {
+        try {
+            const stored = await redis.get(redisOtpKey(channel, key));
+            if (stored !== null) {
+                const match = stored === String(otp);
+                if (match) await redis.del(redisOtpKey(channel, key)); // consume on success only
+                return match;
+            }
+            // Not in Redis (expired, or stored before Redis was enabled) → fall through.
+        } catch (err) {
+            console.warn(`OTP verify: Redis error, checking DB (${err.message})`);
+        }
+    }
+
     try {
         const { data, error } = await supabaseAdmin
             .from("otp_sessions")
