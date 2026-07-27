@@ -5,6 +5,7 @@ import { createNotification } from "../services/notificationService.js";
 import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { publishReceiptPdf } from "../utils/receiptDelivery.js";
+import { generateReceiptPdf, receiptFilename } from "../utils/receiptPdf.js";
 import { sendRegistrationReceiptWhatsApp } from "../utils/whatsapp.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -823,5 +824,87 @@ export const submitManualPayment = async (req, res) => {
     } catch (err) {
         console.error("Manual Payment Error:", err);
         res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
+// Raw registration status → the wording players see on the receipt.
+const RECEIPT_STATUS_LABELS = {
+    verified: "Confirmed",
+    confirmed: "Confirmed",
+    approved: "Confirmed",
+    paid: "Confirmed",
+    pending_verification: "Pending Verification",
+    payment_pending: "Payment Pending",
+    registered: "Submitted",
+    rejected: "Rejected",
+    cancelled: "Cancelled",
+};
+
+/**
+ * GET /api/payment/receipt/:registrationNo
+ *
+ * Serves the same PDF the confirmation email attaches and WhatsApp delivers, so
+ * the copy downloaded from the dashboard is byte-identical to the ones the
+ * player was already sent. The player app previously rebuilt the receipt in the
+ * browser as raw HTML, which both drifted from these and mis-rendered ₹ on
+ * mobile (no charset declared on the downloaded file).
+ */
+export const downloadRegistrationReceipt = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        const { registrationNo } = req.params;
+
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (!registrationNo) return res.status(400).json({ message: "Missing registration number" });
+
+        const { data: registration, error: regErr } = await supabaseAdmin
+            .from("event_registrations")
+            .select("registration_no, player_id, event_id, categories, amount_paid, status, created_at, transaction_id, manual_transaction_id")
+            .eq("registration_no", registrationNo)
+            .maybeSingle();
+        if (regErr) throw regErr;
+
+        // 404 rather than 403 for someone else's registration: registration
+        // numbers are `REG-<timestamp>`, so a distinguishable response would
+        // make them enumerable.
+        if (!registration || registration.player_id !== userId) {
+            return res.status(404).json({ message: "Receipt not found" });
+        }
+
+        const [{ data: user }, { data: event }, { data: transaction }] = await Promise.all([
+            supabaseAdmin.from("users").select("first_name").eq("id", userId).maybeSingle(),
+            supabaseAdmin.from("events").select("name").eq("id", registration.event_id).maybeSingle(),
+            registration.transaction_id
+                ? supabaseAdmin
+                    .from("transactions")
+                    .select("payment_id, payment_mode, manual_transaction_id")
+                    .eq("id", registration.transaction_id)
+                    .maybeSingle()
+                : Promise.resolve({ data: null }),
+        ]);
+
+        const pdf = await generateReceiptPdf({
+            playerName: user?.first_name,
+            eventName: event?.name,
+            registrationNo: registration.registration_no,
+            amount: registration.amount_paid,
+            category: registration.categories,
+            date: registration.created_at,
+            status: RECEIPT_STATUS_LABELS[registration.status] || registration.status || "Confirmed",
+            paymentId: transaction?.payment_id
+                || transaction?.manual_transaction_id
+                || registration.manual_transaction_id
+                || null,
+            paymentMode: transaction?.payment_mode
+                || (registration.manual_transaction_id ? "manual" : "razorpay"),
+        });
+
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="${receiptFilename(registration.registration_no)}"`);
+        res.setHeader("Content-Length", pdf.length);
+        res.send(pdf);
+    } catch (err) {
+        console.error("Receipt download error:", err);
+        res.status(500).json({ message: "Could not generate receipt" });
     }
 };

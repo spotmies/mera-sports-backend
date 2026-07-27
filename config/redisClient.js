@@ -30,11 +30,11 @@ if (redisUrl) {
         retryStrategy: (times) => Math.min(times * 200, 3000),
     });
 
-    redis.on("connect", () => console.log("🧠 Redis: connecting…"));
-    redis.on("ready", () => console.log("🧠 Redis: ready"));
-    // Swallow errors to a single line — a down cache must not spam or crash.
-    redis.on("error", (err) => console.warn("🧠 Redis error:", err.code || err.message));
-    redis.on("end", () => console.warn("🧠 Redis: connection closed"));
+    // redis.on("connect", () => console.log("🧠 Redis: connecting…"));
+    // redis.on("ready", () => console.log("🧠 Redis: ready"));
+    // // Swallow errors to a single line — a down cache must not spam or crash.
+    // redis.on("error", (err) => console.warn("🧠 Redis error:", err.code || err.message));
+    // redis.on("end", () => console.warn("🧠 Redis: connection closed"));
 } else {
     console.log("🧠 Redis: disabled (no REDIS_URL / REDIS_PUBLIC_URL set)");
 }

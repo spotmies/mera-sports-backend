@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
@@ -100,7 +101,8 @@ export const getPlayerDashboard = async (req, res) => {
 
         res.json({
             success: true,
-            player,
+            // age recomputed from dob so the client never sees a stale value
+            player: withResolvedAge(player),
             registrations: detailedRegistrations
         });
 
@@ -115,8 +117,11 @@ export const checkConflict = async (req, res) => {
     try {
         const userId = req.user.id;
         const { email, mobile } = req.body;
-        const { data: currentUser } = await supabaseAdmin.from("users").select("age").eq("id", userId).maybeSingle();
-        const allowSharedMobile = Number(currentUser?.age) <= 15;
+        const { data: currentUser } = await supabaseAdmin.from("users").select("age, dob").eq("id", userId).maybeSingle();
+        // Derived from dob — the stored age column is stale for anyone who has
+        // had a birthday since signup.
+        const resolvedAge = resolveAge(currentUser);
+        const allowSharedMobile = resolvedAge !== null && resolvedAge <= 15;
 
         if (email) {
             const { data } = await supabaseAdmin.from("users").select("id").eq("email", email).neq("id", userId).maybeSingle();
@@ -172,7 +177,8 @@ export const updateProfile = async (req, res) => {
         }
         if (mobile && mobile !== currentUser.mobile) {
             const { data } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).maybeSingle();
-            const allowSharedMobile = Number(currentUser.age) <= 15;
+            const resolvedAge = resolveAge(currentUser);
+            const allowSharedMobile = resolvedAge !== null && resolvedAge <= 15;
             if (data && !allowSharedMobile) return res.status(409).json({ message: "Mobile taken" });
         }
 
@@ -197,7 +203,7 @@ export const updateProfile = async (req, res) => {
         const { data: updatedPlayer, error } = await supabaseAdmin.from("users").update(updates).eq("id", userId).select();
         if (error) throw error;
 
-        res.json({ success: true, player: updatedPlayer?.[0] || updates, message: "Profile updated" });
+        res.json({ success: true, player: withResolvedAge(updatedPlayer?.[0] || updates), message: "Profile updated" });
 
     } catch (err) {
         console.error("UPDATE ERROR:", err);
