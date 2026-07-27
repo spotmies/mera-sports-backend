@@ -14,6 +14,10 @@ const TEMPLATES = {
     welcome: process.env.WHATSAPP_TEMPLATE_WELCOME || 'welcome_credentials',
     registration: process.env.WHATSAPP_TEMPLATE_REGISTRATION || 'registration_confirmation',
     status: process.env.WHATSAPP_TEMPLATE_STATUS || 'registration_status',
+    // Same body as `registration`, but with a DOCUMENT header carrying the
+    // receipt PDF. Separate template because changing an approved template's
+    // header type requires resubmission to Meta.
+    receipt: process.env.WHATSAPP_TEMPLATE_RECEIPT || 'registration_receipt',
 };
 
 export const isWhatsAppEnabled = () => Boolean(PHONE_ID && TOKEN);
@@ -144,17 +148,48 @@ export const sendRegistrationStatusWhatsApp = (mobile, { playerName, eventName, 
         },
     ]);
 
-export const sendRegistrationWhatsApp = (mobile, { playerName, eventName, registrationNo, amount, category, status }) =>
+const registrationBodyParams = ({ playerName, eventName, registrationNo, amount, category, status }) => [
+    textParam(playerName),
+    textParam(eventName),
+    textParam(registrationNo),
+    textParam(formatCategories(category)),
+    textParam(amount),
+    textParam(status || 'Verified'),
+];
+
+export const sendRegistrationWhatsApp = (mobile, details) =>
     sendWhatsAppTemplate(mobile, TEMPLATES.registration, [
-        {
-            type: 'body',
-            parameters: [
-                textParam(playerName),
-                textParam(eventName),
-                textParam(registrationNo),
-                textParam(formatCategories(category)),
-                textParam(amount),
-                textParam(status || 'Verified'),
-            ],
-        },
+        { type: 'body', parameters: registrationBodyParams(details) },
     ]);
+
+/**
+ * Send the registration confirmation with the receipt PDF attached as a
+ * document. Meta fetches `documentUrl` server-side at send time, so it must be
+ * publicly reachable without auth for the lifetime of the request (a signed
+ * bucket URL is fine -- WhatsApp caches the media once delivered).
+ *
+ * @param {string} mobile
+ * @param {object} details - same shape as sendRegistrationWhatsApp
+ * @param {object} receipt - { documentUrl, filename }
+ */
+export const sendRegistrationReceiptWhatsApp = async (mobile, details, { documentUrl, filename } = {}) => {
+    if (documentUrl) {
+        const sent = await sendWhatsAppTemplate(mobile, TEMPLATES.receipt, [
+            {
+                type: 'header',
+                parameters: [{
+                    type: 'document',
+                    document: { link: documentUrl, filename: filename || 'Receipt.pdf' },
+                }],
+            },
+            { type: 'body', parameters: registrationBodyParams(details) },
+        ]);
+        if (sent) return true;
+        // Covers the window where `registration_receipt` is still under review
+        // (Meta answers 132001 "template does not exist") as well as a rejected
+        // template or an unreachable document link. The player still gets their
+        // confirmation, just without the PDF attached.
+        console.warn(`Receipt template "${TEMPLATES.receipt}" send failed — falling back to text confirmation`);
+    }
+    return sendRegistrationWhatsApp(mobile, details);
+};
