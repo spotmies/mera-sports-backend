@@ -72,6 +72,77 @@ const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) =>
     return { fee: feeSum * multiplier, categoryObjects };
 };
 
+// ── Category eligibility (server-side mirror of the player app's check) ──────
+// The player app disables ineligible categories, but that is browser-side only.
+// Without this the gate is cosmetic: a crafted request could enter any category.
+//
+// Age rules are encoded in the category NAME, exactly as the player app parses
+// them: "U-15" => max age 15, "Above 40" => min age 40, "All" => unrestricted.
+const parseCategoryAgeRules = (name) => {
+    const label = String(name || "");
+    const maxMatch = label.match(/(?:U|Under)[-\s]?(\d+)/i);
+    const minMatch = label.match(/(?:Above|Over)\s*(\d+)|\b(\d+)\s*\+/i);
+    return {
+        ageLimit: maxMatch ? Number.parseInt(maxMatch[1], 10) : undefined,
+        minAge: minMatch ? Number.parseInt(minMatch[1] ?? minMatch[2], 10) : undefined,
+    };
+};
+
+// Returns the player's birth year, or null when nothing usable is on file.
+const resolveBirthYear = (user, currentYear) => {
+    if (user?.dob) {
+        const parsed = new Date(user.dob);
+        if (!Number.isNaN(parsed.getTime())) return parsed.getFullYear();
+    }
+    const age = Number(user?.age);
+    if (Number.isFinite(age) && age > 0) return currentYear - age;
+    return null;
+};
+
+/**
+ * Throws a 400 if the player may not enter one of the requested categories.
+ *
+ * Mirrors the player app's policy deliberately, including the lenient part: a
+ * player with no date of birth or age on file is allowed through, because most
+ * accounts have neither and blocking them would stop registration entirely.
+ * Tighten this only once DOB collection is in place.
+ */
+const assertPlayerEligible = (user, categoryObjects) => {
+    const playerGender = String(user?.gender || "").toLowerCase();
+    const currentYear = new Date().getFullYear();
+    const birthYear = resolveBirthYear(user, currentYear);
+
+    for (const cat of categoryObjects) {
+        const categoryGender = String(cat.gender || "Mixed").toLowerCase();
+        if (playerGender && categoryGender !== "mixed" && categoryGender !== "open") {
+            if (categoryGender !== playerGender) {
+                const err = new Error(`You are not eligible for "${cat.name}" (gender restricted)`);
+                err.statusCode = 400;
+                throw err;
+            }
+        }
+
+        if (birthYear === null) continue; // no age on file — see note above
+
+        const { ageLimit, minAge } = parseCategoryAgeRules(cat.name);
+        // "Under 9" is strictly under 9 — the player must not turn 9 this year,
+        // so the earliest allowed birth year is (currentYear - ageLimit + 1).
+        // In 2026: U-9 => 2018, U-12 => 2015, U-15 => 2012.
+        if (ageLimit !== undefined && birthYear < currentYear - ageLimit + 1) {
+            const err = new Error(
+                `You are not eligible for "${cat.name}" — born ${currentYear - ageLimit + 1} or later required`
+            );
+            err.statusCode = 400;
+            throw err;
+        }
+        if (minAge !== undefined && birthYear > currentYear - minAge) {
+            const err = new Error(`You are not eligible for "${cat.name}" (minimum age ${minAge})`);
+            err.statusCode = 400;
+            throw err;
+        }
+    }
+};
+
 const getRazorpayInstance = () => {
     const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
     if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
@@ -291,7 +362,14 @@ export const createRazorpayOrder = async (req, res) => {
 
         // The server-computed fee is authoritative. The client-sent amount is only
         // compared so a stale or tampered UI fails loudly instead of mischarging.
-        const { fee } = computeRegistrationFee(event, categories, teamMemberCount);
+        const { fee, categoryObjects } = computeRegistrationFee(event, categories, teamMemberCount);
+
+        // Eligibility is enforced here as well as in the UI — the UI check alone
+        // is bypassable. Runs before the order is created so an ineligible player
+        // is never charged.
+        const { data: payingUser } = await supabaseAdmin
+            .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+        assertPlayerEligible(payingUser, categoryObjects);
         if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
             return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
         }
@@ -382,7 +460,11 @@ export const verifyRazorpayPayment = async (req, res) => {
                 success: true,
                 message: "Payment already verified",
                 registrationNo: existingRecord.registration.registration_no,
-                paymentId: existingRecord.transaction.payment_id,
+                // transactions.payment_id is nullable. Fall back to the id from
+                // this request — the signature check above already proved it
+                // belongs to this order, so it is safe and strictly better than
+                // handing the client an empty receipt field.
+                paymentId: existingRecord.transaction.payment_id || razorpay_payment_id,
                 alreadyProcessed: true,
             });
         }
@@ -668,8 +750,21 @@ export const submitManualPayment = async (req, res) => {
         if (!eventId || !amount || !categories || !screenshot) return res.status(400).json({ message: "Missing fields" });
         if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
 
-        const resolvedEventId = await resolveEventIdByIdentifier(eventId);
-        if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
+        const eventForEligibility = await resolveEventByIdentifier(eventId, "id, categories");
+        if (!eventForEligibility) return res.status(404).json({ message: "Event not found" });
+        const resolvedEventId = eventForEligibility.id;
+
+        // Same eligibility gate as the Razorpay path — manual payments must not
+        // be a way around it.
+        try {
+            const { categoryObjects } = computeRegistrationFee(eventForEligibility, categories, 0);
+            const { data: payingUser } = await supabaseAdmin
+                .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+            assertPlayerEligible(payingUser, categoryObjects);
+        } catch (eligErr) {
+            if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message });
+            throw eligErr;
+        }
 
         const screenshotUrl = await uploadBase64(screenshot, "event-assets", "payment-proofs");
         if (!screenshotUrl) return res.status(500).json({ message: "Failed to upload screenshot" });
