@@ -382,6 +382,7 @@ export const verifyRazorpayPayment = async (req, res) => {
                 success: true,
                 message: "Payment already verified",
                 registrationNo: existingRecord.registration.registration_no,
+                paymentId: existingRecord.transaction.payment_id,
                 alreadyProcessed: true,
             });
         }
@@ -421,7 +422,7 @@ export const verifyRazorpayPayment = async (req, res) => {
             paymentId: razorpay_payment_id,
         });
 
-        res.json({ success: true, message: "Payment verified", registrationNo });
+        res.json({ success: true, message: "Payment verified", registrationNo, paymentId: razorpay_payment_id });
     } catch (err) {
         console.error("Razorpay Verify Error:", err);
         res.status(500).json({ message: "Internal Server Error" });
