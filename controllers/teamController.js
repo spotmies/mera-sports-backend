@@ -126,6 +126,30 @@ export const getMyTeams = async (req, res) => {
     }
 };
 
+/** Last 4 digits only, e.g. 9492085123 -> XXXXXX5123. */
+const maskTail = (value, visible = 4, groupWith = "") => {
+    const digits = String(value ?? "").replace(/\D/g, "");
+    if (!digits) return "";
+    if (digits.length <= visible) return digits;
+    const masked = "X".repeat(digits.length - visible) + digits.slice(-visible);
+    if (!groupWith) return masked;
+    return masked.replace(/(.{4})(?=.)/g, `$1${groupWith}`);
+};
+
+/**
+ * Look up a player by their public player id, so a captain can add them to a
+ * team.
+ *
+ * Mobile and Aadhaar are masked. This endpoint is reachable by any logged-in
+ * user for any player id, and player ids are sequential (P1770, P1771, …), so
+ * returning them in full let one account walk the range and harvest every
+ * player's phone number and Aadhaar. The captain only needs enough to confirm
+ * they picked the right person — the name and age do that.
+ *
+ * Masking here rather than in the UI is deliberate: the values must not reach
+ * the browser at all. Callers that need to act on the member (notifications,
+ * registration) resolve them by `id` / `player_id`, both still returned.
+ */
 export const lookupPlayer = async (req, res) => {
     try {
         const { playerId } = req.params;
@@ -144,7 +168,9 @@ export const lookupPlayer = async (req, res) => {
                 id: player.id,
                 player_id: player.player_id,
                 name: `${player.first_name} ${player.last_name}`,
-                age, mobile: player.mobile, aadhaar: player.aadhaar
+                age,
+                mobile: maskTail(player.mobile),
+                aadhaar: maskTail(player.aadhaar, 4, "-"),
             }
         });
     } catch (err) {
