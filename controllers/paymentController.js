@@ -4,7 +4,8 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
-import { sendRegistrationWhatsApp } from "../utils/whatsapp.js";
+import { publishReceiptPdf } from "../utils/receiptDelivery.js";
+import { sendRegistrationReceiptWhatsApp } from "../utils/whatsapp.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
 // ── Server-side fee computation ──────────────────────────────────────────────
@@ -77,6 +78,120 @@ const getRazorpayInstance = () => {
         throw new Error("Razorpay credentials (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET) are not configured");
     }
     return new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+};
+
+// ── Shared order → registration plumbing ─────────────────────────────────────
+// Three writers can complete a Razorpay payment: the browser `handler` callback,
+// the `payment.captured` webhook, and the reconcile endpoint the player app hits
+// when the browser callback never fires (UPI app-switch, 3DS redirect, tab
+// reload). They race, so every path goes through these helpers and treats an
+// already-recorded order as success rather than an error.
+
+// Rebuild category objects from the ids stored in the order notes, using the
+// event's own category definitions so fees are authoritative.
+const rebuildCategoriesFromNotes = async (notes) => {
+    try {
+        if (notes?.catIds) {
+            const { data: event } = await supabaseAdmin
+                .from("events")
+                .select("id, categories")
+                .eq("id", notes.eventId)
+                .maybeSingle();
+            if (event) {
+                return computeRegistrationFee(event, String(notes.catIds).split(","), notes.teamMemberCount).categoryObjects;
+            }
+        } else if (notes?.categories) {
+            return JSON.parse(notes.categories);
+        }
+    } catch (catErr) {
+        console.warn("Could not reconstruct categories from order notes:", catErr.message);
+    }
+    return [];
+};
+
+// Look up whatever has already been recorded for a Razorpay order.
+const findExistingOrderRecord = async (orderId) => {
+    const { data: transaction, error: txErr } = await supabaseAdmin
+        .from("transactions")
+        .select("id, user_id, payment_id, amount")
+        .eq("order_id", orderId)
+        .maybeSingle();
+    if (txErr) throw txErr;
+    if (!transaction) return null;
+
+    const { data: registration, error: regErr } = await supabaseAdmin
+        .from("event_registrations")
+        .select("registration_no, player_id, event_id, amount_paid")
+        .eq("transaction_id", transaction.id)
+        .maybeSingle();
+    if (regErr) throw regErr;
+
+    return { transaction, registration: registration || null };
+};
+
+// Insert transaction + verified registration as one unit (rolls the transaction
+// back if the registration insert fails, so a retry can re-attempt both).
+const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId, amount, categories, teamId }) => {
+    const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
+        order_id: orderId,
+        payment_id: paymentId,
+        payment_mode: "razorpay",
+        amount,
+        currency: "INR",
+        user_id: userId,
+    }).select().maybeSingle();
+
+    if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
+
+    const registrationNo = `REG-${Date.now()}`;
+    const { error: regError } = await supabaseAdmin.from("event_registrations").insert({
+        event_id: eventId,
+        player_id: userId,
+        registration_no: registrationNo,
+        categories,
+        amount_paid: amount,
+        transaction_id: transaction.id,
+        team_id: teamId || null,
+        status: "verified",
+    });
+
+    if (regError) {
+        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+        throw regError;
+    }
+
+    return { transaction, registrationNo };
+};
+
+// Email + WhatsApp + team notifications — fire-and-forget, never blocks the response.
+const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amount, categories, teamId, paymentId, paymentMode = "razorpay", status = "Confirmed" }) => {
+    (async () => {
+        try {
+            const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
+            const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", eventId).single();
+            const details = {
+                playerName: user?.first_name, eventName: event?.name, registrationNo,
+                amount, category: categories, date: new Date(), status,
+                paymentId, paymentMode,
+            };
+
+            // The email builds its own PDF; WhatsApp needs one Meta can fetch.
+            const receipt = user?.mobile ? await publishReceiptPdf(details) : null;
+
+            await Promise.allSettled([
+                user?.email ? sendRegistrationEmail(user.email, details) : Promise.resolve(),
+                user?.mobile
+                    ? sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {})
+                    : Promise.resolve(),
+            ]);
+        } catch (e) { console.error("Email/WhatsApp Error:", e); }
+    })();
+
+    if (teamId) {
+        notifyTeamMembersOfRegistration(teamId, eventId).catch(e =>
+            console.error("Team registration notification error:", e)
+        );
+    }
 };
 
 /**
@@ -247,14 +362,28 @@ export const verifyRazorpayPayment = async (req, res) => {
         // Replay protection — one Razorpay order can produce exactly one registration.
         // Without this, a single genuine payment could be re-submitted with different
         // eventIds/categories to mint unlimited verified registrations.
-        const { data: existingTx, error: existingTxErr } = await supabaseAdmin
-            .from("transactions")
-            .select("id")
-            .eq("order_id", razorpay_order_id)
-            .maybeSingle();
-        if (existingTxErr) throw existingTxErr;
-        if (existingTx) {
-            return res.status(409).json({ success: false, message: "This payment has already been processed" });
+        //
+        // An order already recorded for THIS user is not an attack: the webhook
+        // usually wins this race (payment.captured fires within a second or two for
+        // UPI, while the browser is still round-tripping). Returning the existing
+        // registration lets the player reach the receipt instead of being told to
+        // pay again for a payment that already succeeded.
+        const existingRecord = await findExistingOrderRecord(razorpay_order_id);
+        if (existingRecord) {
+            if (existingRecord.transaction.user_id !== userId) {
+                return res.status(409).json({ success: false, message: "This payment has already been processed" });
+            }
+            if (!existingRecord.registration) {
+                // Transaction row exists but the registration is still being written
+                // by the other writer — tell the client to poll rather than fail.
+                return res.status(202).json({ success: false, pending: true, message: "Payment is still being confirmed" });
+            }
+            return res.json({
+                success: true,
+                message: "Payment already verified",
+                registrationNo: existingRecord.registration.registration_no,
+                alreadyProcessed: true,
+            });
         }
 
         // Fetch the order from Razorpay — ties the payment to the user, event and
@@ -277,62 +406,123 @@ export const verifyRazorpayPayment = async (req, res) => {
 
         const paidAmount = order.amount / 100; // authoritative — set server-side at order creation
 
-        // Create verified transaction
-        const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
-            order_id: razorpay_order_id,
-            payment_id: razorpay_payment_id,
-            payment_mode: "razorpay",
+        const { registrationNo } = await recordVerifiedRegistration({
+            orderId: razorpay_order_id,
+            paymentId: razorpay_payment_id,
+            userId,
+            eventId: resolvedEventId,
             amount: paidAmount,
-            currency: "INR",
-            user_id: userId,
-        }).select().maybeSingle();
-
-        if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
-
-        // Create registration — immediately verified since payment is confirmed
-        const registrationNo = `REG-${Date.now()}`;
-        const { error: regError } = await supabaseAdmin.from("event_registrations").insert({
-            event_id: resolvedEventId,
-            player_id: userId,
-            registration_no: registrationNo,
             categories,
-            amount_paid: paidAmount,
-            transaction_id: transaction.id,
-            team_id: teamId || null,
-            status: "verified",
+            teamId,
         });
 
-        if (regError) {
-            await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
-            throw regError;
-        }
-
-        // Email + WhatsApp (async, non-blocking)
-        (async () => {
-            try {
-                const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
-                const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
-                const details = {
-                    playerName: user?.first_name, eventName: event?.name, registrationNo, amount: paidAmount, category: categories, date: new Date(), status: "Confirmed"
-                };
-                if (user?.email) {
-                    await sendRegistrationEmail(user.email, details);
-                }
-                if (user?.mobile) {
-                    await sendRegistrationWhatsApp(user.mobile, details);
-                }
-            } catch (e) { console.error("Email/WhatsApp Error:", e); }
-        })();
-
-        if (teamId) {
-            notifyTeamMembersOfRegistration(teamId, resolvedEventId).catch(e =>
-                console.error("Team registration notification error:", e)
-            );
-        }
+        dispatchRegistrationSideEffects({
+            userId, eventId: resolvedEventId, registrationNo, amount: paidAmount, categories, teamId,
+            paymentId: razorpay_payment_id,
+        });
 
         res.json({ success: true, message: "Payment verified", registrationNo });
     } catch (err) {
         console.error("Razorpay Verify Error:", err);
+        res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
+// GET /api/payment/order-status/:orderId
+// Reconciliation endpoint for the case the browser callback never runs — UPI
+// intent app-switch, 3DS full-page redirect, or the tab being reloaded while the
+// payment completes. The player app calls this on load for any order it opened
+// but never saw confirmed. If Razorpay says the order is paid and no webhook has
+// recorded it yet, the registration is created here so the money is never taken
+// without a registration to show for it.
+export const getRazorpayOrderStatus = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+        const { orderId } = req.params;
+        if (!orderId) return res.status(400).json({ message: "orderId is required" });
+
+        const existing = await findExistingOrderRecord(orderId);
+        if (existing) {
+            // Never leak another user's order — report it as unknown.
+            if (existing.transaction.user_id !== userId) {
+                return res.json({ success: true, status: "not_found" });
+            }
+            if (!existing.registration) {
+                return res.json({ success: true, status: "pending" });
+            }
+            return res.json({
+                success: true,
+                status: "registered",
+                registrationNo: existing.registration.registration_no,
+                paymentId: existing.transaction.payment_id,
+                amount: existing.registration.amount_paid ?? existing.transaction.amount,
+                eventId: existing.registration.event_id,
+            });
+        }
+
+        // Nothing recorded yet — ask Razorpay directly.
+        const razorpay = getRazorpayInstance();
+        let order;
+        try {
+            order = await razorpay.orders.fetch(orderId);
+        } catch (fetchErr) {
+            console.error("Razorpay order fetch failed (status check):", fetchErr);
+            return res.json({ success: true, status: "not_found" });
+        }
+
+        const notes = order?.notes || {};
+        if (notes.userId !== userId) return res.json({ success: true, status: "not_found" });
+        if (order.status !== "paid") {
+            return res.json({ success: true, status: order.status === "attempted" ? "pending" : "unpaid" });
+        }
+
+        // Order is paid but unrecorded — recover it.
+        const resolvedEventId = await resolveEventIdByIdentifier(notes.eventId);
+        if (!resolvedEventId) return res.status(404).json({ message: "Event not found" });
+
+        let paymentId = null;
+        try {
+            const payments = await razorpay.orders.fetchPayments(orderId);
+            paymentId = (payments?.items || []).find((p) => p.status === "captured" || p.status === "authorized")?.id || null;
+        } catch (payErr) {
+            console.warn("Could not fetch payments for order:", payErr.message);
+        }
+
+        const amount = order.amount_paid / 100;
+        const categories = await rebuildCategoriesFromNotes(notes);
+        const teamId = notes.teamId || null;
+
+        let registrationNo;
+        try {
+            ({ registrationNo } = await recordVerifiedRegistration({
+                orderId, paymentId, userId, eventId: resolvedEventId, amount, categories, teamId,
+            }));
+        } catch (writeErr) {
+            // The webhook may have won the race between our lookup and this insert.
+            const raced = await findExistingOrderRecord(orderId);
+            if (raced?.registration && raced.transaction.user_id === userId) {
+                return res.json({
+                    success: true,
+                    status: "registered",
+                    registrationNo: raced.registration.registration_no,
+                    paymentId: raced.transaction.payment_id,
+                    amount: raced.registration.amount_paid ?? raced.transaction.amount,
+                    eventId: raced.registration.event_id,
+                });
+            }
+            throw writeErr;
+        }
+
+        console.log("Reconcile: recovered unrecorded paid order", orderId, "→", registrationNo);
+        dispatchRegistrationSideEffects({
+            userId, eventId: resolvedEventId, registrationNo, amount, categories, teamId, paymentId,
+        });
+
+        res.json({ success: true, status: "registered", registrationNo, paymentId, amount, eventId: resolvedEventId, recovered: true });
+    } catch (err) {
+        console.error("Razorpay Order Status Error:", err);
         res.status(500).json({ message: "Internal Server Error" });
     }
 };
@@ -411,59 +601,46 @@ export const razorpayWebhook = async (req, res) => {
             if (existingErr) throw existingErr;
 
             if (!existing && notes.userId && notes.eventId) {
+                // QA and PROD share one Razorpay account, so this account's webhook
+                // fires into whichever backend URL is registered — which may not be
+                // the environment the order was created in. Confirm the order's user
+                // and event actually exist in THIS database before writing, otherwise
+                // a QA payment could mint a phantom registration in prod (UUIDs
+                // overlap: both databases were seeded from the same source).
+                const [{ data: notesUser }, { data: notesEvent }] = await Promise.all([
+                    supabaseAdmin.from("users").select("id").eq("id", notes.userId).maybeSingle(),
+                    supabaseAdmin.from("events").select("id").eq("id", notes.eventId).maybeSingle(),
+                ]);
+                if (!notesUser || !notesEvent) {
+                    // Not this environment's payment. 200 so Razorpay stops retrying.
+                    console.warn("Webhook ignored — order belongs to another environment:", orderId);
+                    return res.json({ received: true, ignored: "unknown user or event" });
+                }
+
                 // Frontend callback never fired — create registration as fallback
                 const amount = amountPaise / 100;
+                const categories = await rebuildCategoriesFromNotes(notes);
 
-                // Rebuild category objects from the ids stored in order notes,
-                // using the event's own category definitions (fees included).
-                let categories = [];
-                try {
-                    if (notes.catIds) {
-                        const { data: event } = await supabaseAdmin
-                            .from("events")
-                            .select("id, categories")
-                            .eq("id", notes.eventId)
-                            .maybeSingle();
-                        if (event) {
-                            categories = computeRegistrationFee(event, notes.catIds.split(","), 0).categoryObjects;
-                        }
-                    } else if (notes.categories) {
-                        categories = JSON.parse(notes.categories);
-                    }
-                } catch (catErr) {
-                    console.warn("Webhook: could not reconstruct categories:", catErr.message);
-                }
-
-                const { data: transaction, error: txErr } = await supabaseAdmin.from("transactions").insert({
-                    order_id: orderId,
-                    payment_id: paymentId,
-                    payment_mode: "razorpay",
+                const { registrationNo } = await recordVerifiedRegistration({
+                    orderId,
+                    paymentId,
+                    userId: notes.userId,
+                    eventId: notes.eventId,
                     amount,
-                    currency: "INR",
-                    user_id: notes.userId,
-                }).select().maybeSingle();
+                    categories,
+                    teamId: notes.teamId,
+                });
+                console.log("Webhook fallback: registration created", registrationNo);
 
-                if (txErr) throw txErr;
-
-                if (transaction) {
-                    const registrationNo = `REG-${Date.now()}`;
-                    const { error: regErr } = await supabaseAdmin.from("event_registrations").insert({
-                        event_id: notes.eventId,
-                        player_id: notes.userId,
-                        registration_no: registrationNo,
-                        categories,
-                        amount_paid: amount,
-                        transaction_id: transaction.id,
-                        team_id: notes.teamId || null,
-                        status: "verified",
-                    });
-                    if (regErr) {
-                        // Roll back the transaction row so the next retry re-attempts both inserts
-                        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
-                        throw regErr;
-                    }
-                    console.log("Webhook fallback: registration created", registrationNo);
-                }
+                dispatchRegistrationSideEffects({
+                    userId: notes.userId,
+                    eventId: notes.eventId,
+                    registrationNo,
+                    amount,
+                    categories,
+                    teamId: notes.teamId,
+                    paymentId,
+                });
             }
         }
 
@@ -532,29 +709,18 @@ export const submitManualPayment = async (req, res) => {
             throw regError;
         }
 
-        // 3. Email + WhatsApp (Async)
-        (async () => {
-            try {
-                const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
-                const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
-                const details = {
-                    playerName: user?.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: 'Pending Verification'
-                };
-                if (user?.email) {
-                    await sendRegistrationEmail(user.email, details);
-                }
-                if (user?.mobile) {
-                    await sendRegistrationWhatsApp(user.mobile, details);
-                }
-            } catch (e) { console.error("Email/WhatsApp Error:", e); }
-        })();
-
-        // 4. Notify team members about event registration (Async, non-blocking)
-        if (teamId) {
-            notifyTeamMembersOfRegistration(teamId, resolvedEventId).catch(e =>
-                console.error('Team registration notification error:', e)
-            );
-        }
+        // 3. Email + WhatsApp + team notifications (Async)
+        dispatchRegistrationSideEffects({
+            userId,
+            eventId: resolvedEventId,
+            registrationNo,
+            amount,
+            categories,
+            teamId,
+            paymentId: transactionId || null,
+            paymentMode: "manual",
+            status: "Pending Verification",
+        });
 
         res.json({ success: true, message: "Payment submitted", transactionId: transaction.id, registrationNo });
 
