@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { resolveAge } from "../utils/age.js";
 import { createNotification } from "../services/notificationService.js";
 import {
     sendEmailOtp,
@@ -540,7 +541,14 @@ export const registerPlayer = async (req, res) => {
                 lastName: user.last_name,
                 role: 'player',
                 photos: user.photos,
-                age: user.age
+                // dob + gender are needed for category eligibility. Without them
+                // the client fell back to the stale `age` column and computed a
+                // different birth year than the pages that read the dashboard,
+                // so the same player showed Eligible on one screen and Not
+                // Eligible on another. Age is derived from dob here.
+                dob: user.dob,
+                gender: user.gender,
+                age: resolveAge(user)
             },
         });
     } catch (err) {
@@ -674,7 +682,14 @@ export const loginPlayer = async (req, res) => {
                 lastName: user.last_name,
                 role: 'player',
                 photos: user.photos,
-                age: user.age
+                // dob + gender are needed for category eligibility. Without them
+                // the client fell back to the stale `age` column and computed a
+                // different birth year than the pages that read the dashboard,
+                // so the same player showed Eligible on one screen and Not
+                // Eligible on another. Age is derived from dob here.
+                dob: user.dob,
+                gender: user.gender,
+                age: resolveAge(user)
             },
         });
     } catch (err) {
