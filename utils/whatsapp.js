@@ -49,7 +49,33 @@ const textParam = (value) => ({ type: 'text', text: sanitizeParam(value) });
  * @param {Array} components - Template components (body/button parameters)
  * @returns {Promise<boolean>} true if the API accepted the message
  */
-export const sendWhatsAppTemplate = async (mobile, templateName, components = []) => {
+// Meta stores "English" and "English (US)" as separate translations (`en` and
+// `en_US`) and error 132001 does not say which one it looked for. Whichever was
+// picked in WhatsApp Manager is invisible from the API without the management
+// scope, so a send that fails on the primary code is retried on the other.
+const PRIMARY_LANG = process.env.WHATSAPP_TEMPLATE_LANG || 'en';
+// `registration_receipt` was registered in WhatsApp Manager as English (US)
+// while the others are plain English, so it needs its own default. Confirmed by
+// a live send on 2026-07-27; the retry above still covers it if that changes.
+const RECEIPT_LANG = process.env.WHATSAPP_TEMPLATE_RECEIPT_LANG || 'en_US';
+
+const postTemplate = (to, templateName, components, langCode) =>
+    axios.post(
+        `https://graph.facebook.com/${API_VERSION}/${PHONE_ID}/messages`,
+        {
+            messaging_product: 'whatsapp',
+            to,
+            type: 'template',
+            template: {
+                name: templateName,
+                language: { code: langCode },
+                components,
+            },
+        },
+        { headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 15000 }
+    );
+
+export const sendWhatsAppTemplate = async (mobile, templateName, components = [], langOverride = null) => {
     if (!isWhatsAppEnabled()) {
         console.warn('WhatsApp disabled: WHATSAPP_PHONE_ID / WHATSAPP_TOKEN not set');
         return false;
@@ -61,24 +87,32 @@ export const sendWhatsAppTemplate = async (mobile, templateName, components = []
         return false;
     }
 
+    const primaryLang = langOverride || PRIMARY_LANG;
+    const altLang = primaryLang === 'en' ? 'en_US' : 'en';
+
     try {
-        await axios.post(
-            `https://graph.facebook.com/${API_VERSION}/${PHONE_ID}/messages`,
-            {
-                messaging_product: 'whatsapp',
-                to,
-                type: 'template',
-                template: {
-                    name: templateName,
-                    language: { code: 'en' },
-                    components,
-                },
-            },
-            { headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 15000 }
-        );
+        await postTemplate(to, templateName, components, primaryLang);
         return true;
     } catch (error) {
         const apiError = error.response?.data?.error;
+
+        // 132001 = name/translation not found. Retry once on the other English
+        // variant before giving up, so a template registered as en_US still sends.
+        if (apiError?.code === 132001) {
+            try {
+                await postTemplate(to, templateName, components, altLang);
+                console.warn(`WhatsApp: template "${templateName}" sent as ${altLang} — set its language override to skip this retry`);
+                return true;
+            } catch (retryError) {
+                const retryApiError = retryError.response?.data?.error;
+                console.error(
+                    `WhatsApp send error (template=${templateName}, tried ${primaryLang} and ${altLang}):`,
+                    retryApiError ? `${retryApiError.code} ${retryApiError.message}` : retryError.message
+                );
+                return false;
+            }
+        }
+
         console.error(
             `WhatsApp send error (template=${templateName}):`,
             apiError ? `${apiError.code} ${apiError.message}` : error.message
@@ -183,7 +217,7 @@ export const sendRegistrationReceiptWhatsApp = async (mobile, details, { documen
                 }],
             },
             { type: 'body', parameters: registrationBodyParams(details) },
-        ]);
+        ], RECEIPT_LANG);
         if (sent) return true;
         // Covers the window where `registration_receipt` is still under review
         // (Meta answers 132001 "template does not exist") as well as a rejected
