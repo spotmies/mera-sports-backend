@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
+import { generateReceiptPdf, receiptFilename } from './receiptPdf.js';
 
 dotenv.config({ quiet: true });
 
@@ -49,7 +50,7 @@ export const sendRegistrationEmail = async (toEmail, details) => {
                         <p style="margin: 5px 0;"><strong>Status:</strong> <span style="text-transform: uppercase;">${details.status || 'Verified'}</span></p>
                     </div>
 
-                    <p>Please carry a digital or physical copy of this email to the venue for verification.</p>
+                    <p>Your receipt is attached to this email as a PDF. Please carry a digital or physical copy to the venue for verification.</p>
                     <p>Good luck!</p>
                 </div>
                 <div style="background-color: #f3f4f6; padding: 15px; text-align: center; color: #6b7280; font-size: 12px;">
@@ -58,6 +59,21 @@ export const sendRegistrationEmail = async (toEmail, details) => {
             </div>
         `
     };
+
+    // Attach the receipt PDF. Generated here rather than by the caller so every
+    // path that sends this mail (verify, webhook, reconcile, manual payment, the
+    // resend script) gets the attachment without changes. A PDF failure must not
+    // cost the player their confirmation email, so it degrades to body-only.
+    try {
+        const pdf = await generateReceiptPdf(details);
+        mailOptions.attachments = [{
+            filename: receiptFilename(registrationNo),
+            content: pdf,
+            contentType: 'application/pdf',
+        }];
+    } catch (pdfErr) {
+        console.error("Receipt PDF generation failed, sending email without attachment:", pdfErr.message);
+    }
 
     try {
         const info = await transporter.sendMail(mailOptions);

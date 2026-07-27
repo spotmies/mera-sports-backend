@@ -4,7 +4,8 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
-import { sendRegistrationWhatsApp } from "../utils/whatsapp.js";
+import { publishReceiptPdf } from "../utils/receiptDelivery.js";
+import { sendRegistrationReceiptWhatsApp } from "../utils/whatsapp.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
 // ── Server-side fee computation ──────────────────────────────────────────────
@@ -163,17 +164,26 @@ const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId,
 };
 
 // Email + WhatsApp + team notifications — fire-and-forget, never blocks the response.
-const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amount, categories, teamId }) => {
+const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amount, categories, teamId, paymentId, paymentMode = "razorpay", status = "Confirmed" }) => {
     (async () => {
         try {
             const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
             const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", eventId).single();
             const details = {
                 playerName: user?.first_name, eventName: event?.name, registrationNo,
-                amount, category: categories, date: new Date(), status: "Confirmed"
+                amount, category: categories, date: new Date(), status,
+                paymentId, paymentMode,
             };
-            if (user?.email) await sendRegistrationEmail(user.email, details);
-            if (user?.mobile) await sendRegistrationWhatsApp(user.mobile, details);
+
+            // The email builds its own PDF; WhatsApp needs one Meta can fetch.
+            const receipt = user?.mobile ? await publishReceiptPdf(details) : null;
+
+            await Promise.allSettled([
+                user?.email ? sendRegistrationEmail(user.email, details) : Promise.resolve(),
+                user?.mobile
+                    ? sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {})
+                    : Promise.resolve(),
+            ]);
         } catch (e) { console.error("Email/WhatsApp Error:", e); }
     })();
 
@@ -408,6 +418,7 @@ export const verifyRazorpayPayment = async (req, res) => {
 
         dispatchRegistrationSideEffects({
             userId, eventId: resolvedEventId, registrationNo, amount: paidAmount, categories, teamId,
+            paymentId: razorpay_payment_id,
         });
 
         res.json({ success: true, message: "Payment verified", registrationNo });
@@ -506,7 +517,7 @@ export const getRazorpayOrderStatus = async (req, res) => {
 
         console.log("Reconcile: recovered unrecorded paid order", orderId, "→", registrationNo);
         dispatchRegistrationSideEffects({
-            userId, eventId: resolvedEventId, registrationNo, amount, categories, teamId,
+            userId, eventId: resolvedEventId, registrationNo, amount, categories, teamId, paymentId,
         });
 
         res.json({ success: true, status: "registered", registrationNo, paymentId, amount, eventId: resolvedEventId, recovered: true });
@@ -628,6 +639,7 @@ export const razorpayWebhook = async (req, res) => {
                     amount,
                     categories,
                     teamId: notes.teamId,
+                    paymentId,
                 });
             }
         }
@@ -697,29 +709,18 @@ export const submitManualPayment = async (req, res) => {
             throw regError;
         }
 
-        // 3. Email + WhatsApp (Async)
-        (async () => {
-            try {
-                const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
-                const { data: event } = await supabaseAdmin.from("events").select("name").eq("id", resolvedEventId).single();
-                const details = {
-                    playerName: user?.first_name, eventName: event?.name, registrationNo, amount, category: categories, date: new Date(), status: 'Pending Verification'
-                };
-                if (user?.email) {
-                    await sendRegistrationEmail(user.email, details);
-                }
-                if (user?.mobile) {
-                    await sendRegistrationWhatsApp(user.mobile, details);
-                }
-            } catch (e) { console.error("Email/WhatsApp Error:", e); }
-        })();
-
-        // 4. Notify team members about event registration (Async, non-blocking)
-        if (teamId) {
-            notifyTeamMembersOfRegistration(teamId, resolvedEventId).catch(e =>
-                console.error('Team registration notification error:', e)
-            );
-        }
+        // 3. Email + WhatsApp + team notifications (Async)
+        dispatchRegistrationSideEffects({
+            userId,
+            eventId: resolvedEventId,
+            registrationNo,
+            amount,
+            categories,
+            teamId,
+            paymentId: transactionId || null,
+            paymentMode: "manual",
+            status: "Pending Verification",
+        });
 
         res.json({ success: true, message: "Payment submitted", transactionId: transaction.id, registrationNo });
 
