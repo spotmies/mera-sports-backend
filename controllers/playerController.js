@@ -26,8 +26,11 @@ export const getPlayerDashboard = async (req, res) => {
         ] = await Promise.all([
             supabaseAdmin.from("player_school_details").select("*").eq("player_id", userId).maybeSingle(),
             supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId),
+            // The payload has to be pre-stringified JSON: handed a JS array,
+            // supabase-js emits a Postgres *array* literal (`cs.{[object Object]}`)
+            // rather than jsonb containment, so this filter never matched anything.
             player.mobile
-                ? supabaseAdmin.from("player_teams").select("id").contains("members", [{ mobile: player.mobile }])
+                ? supabaseAdmin.from("player_teams").select("id").contains("members", JSON.stringify([{ mobile: player.mobile }]))
                 : Promise.resolve({ data: [] }),
             supabaseAdmin.from("player_teams").select("id, members"),
             supabaseAdmin.from("transactions").select("*").eq("user_id", userId),

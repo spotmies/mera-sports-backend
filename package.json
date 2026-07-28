@@ -16,7 +16,8 @@
     "seed:volleyball-league": "node scripts/seed_volleyball_league_event.js",
     "seed:chess-league": "node scripts/seed_chess_league_event.js",
     "seed:heat-events": "node scripts/seed_heat_events.js",
-    "migrate:passwords": "node scripts/migrate_passwords_bcrypt.js"
+    "migrate:passwords": "node scripts/migrate_passwords_bcrypt.js",
+    "db:local": "node scripts/start-local-postgrest.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1092.0",

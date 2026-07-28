@@ -20,50 +20,65 @@ dotenv.config({ quiet: true });
  *   Local dev:                    http://localhost:3333
  */
 const USE_RAILWAY_DB = process.env.USE_RAILWAY_DB === "true";
+const USE_RAILWAY_STORAGE = process.env.USE_RAILWAY_STORAGE === "true";
 const postgrestUrl = process.env.POSTGREST_URL;
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseUrl || !serviceRoleKey) {
-    console.error("❌ CRITICAL: Missing Supabase Env Variables.");
-    console.error("URL:", supabaseUrl ? "Set" : "Missing");
-    console.error("Service Role Key:", serviceRoleKey ? "Set" : "Missing");
-} else {
-    // DEBUG: Check Role
+/**
+ * 🔐 Legacy Supabase admin client — built on demand, never at import time.
+ *
+ * This used to be constructed unconditionally, which meant a machine with the
+ * Supabase vars commented out (the normal state now that both flags are `true`
+ * and Railway is the system of record) could not even *boot* the backend:
+ * `createClient(undefined, undefined)` throws "supabaseUrl is required." before
+ * a single route is mounted. With both flags on, Supabase is not in the data
+ * path at all, so requiring its credentials to start was pure legacy drag.
+ */
+let legacyClient = null;
+const getSupabaseLegacy = () => {
+    if (legacyClient) return legacyClient;
+
+    if (!supabaseUrl || !serviceRoleKey) {
+        throw new Error(
+            "Supabase fallback requested but SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set. " +
+            "Set them, or keep USE_RAILWAY_DB and USE_RAILWAY_STORAGE at 'true' so Railway is used."
+        );
+    }
+
     try {
         const decoded = jwt.decode(serviceRoleKey);
-        if (decoded && decoded.role) {
-            if (decoded.role !== 'service_role') {
-                console.error("❌ CRITICAL: You are using the ANON KEY as Service Role Key!");
-                console.error("❌ RLS Bypassing will NOT work. Update SUPABASE_SERVICE_ROLE_KEY in .env");
-            }
+        if (decoded?.role && decoded.role !== 'service_role') {
+            console.error("❌ CRITICAL: You are using the ANON KEY as Service Role Key!");
+            console.error("❌ RLS Bypassing will NOT work. Update SUPABASE_SERVICE_ROLE_KEY in .env");
         }
-    } catch (e) {
+    } catch {
         console.warn("⚠️ Could not decode Service Key JWT");
     }
-}
+
+    legacyClient = createClient(supabaseUrl, serviceRoleKey, {
+        auth: { autoRefreshToken: false, persistSession: false },
+        global: { headers: { Authorization: `Bearer ${serviceRoleKey}` } },
+    });
+    return legacyClient;
+};
 
 /**
- * 🔐 Legacy Supabase admin client.
- * Still used directly for Storage + Auth while DB traffic moves to
- * PostgREST/Railway. Becomes fully unused after Phases 2-3.
+ * Stand-in for `supabaseAdmin.auth`, which now has no implementation behind it —
+ * Google login verifies ID tokens directly (`googleSyncRoutes`) and `public.users`
+ * is the only user store. The sole remaining caller is `seedController.js`, whose
+ * route is not mounted. Throwing names the problem instead of failing as
+ * "cannot read property 'admin' of undefined".
  */
-const supabaseLegacy = createClient(
-    supabaseUrl,
-    serviceRoleKey,
-    {
-        auth: {
-            autoRefreshToken: false,
-            persistSession: false,
-        },
-        global: {
-            headers: {
-                Authorization: `Bearer ${serviceRoleKey}`,
-            },
-        },
-    }
-);
+const unavailableAuth = new Proxy({}, {
+    get(_target, prop) {
+        throw new Error(
+            `supabaseAdmin.auth.${String(prop)} is no longer available — Supabase Auth was removed in the Railway migration. ` +
+            "Users live in public.users; Google sign-in is verified in routes/googleSyncRoutes.js."
+        );
+    },
+});
 
 let supabaseAdminInstance;
 
@@ -80,7 +95,6 @@ if (USE_RAILWAY_DB) {
 
     // USE_RAILWAY_STORAGE=true → uploads/deletes/URLs go to the Railway
     // bucket (private, served via /api/files signed-URL redirects).
-    const USE_RAILWAY_STORAGE = process.env.USE_RAILWAY_STORAGE === "true";
     if (USE_RAILWAY_STORAGE) {
         console.log(`🪣 Storage layer: Railway bucket (${process.env.BUCKET_NAME})`);
     }
@@ -88,12 +102,16 @@ if (USE_RAILWAY_DB) {
     supabaseAdminInstance = {
         from: (table) => postgrest.from(table),
         rpc: (fn, args, options) => postgrest.rpc(fn, args, options),
-        storage: USE_RAILWAY_STORAGE ? railwayStorage : supabaseLegacy.storage,
-        // Auth remains on Supabase until the Google-OAuth migration phase.
-        auth: supabaseLegacy.auth,
+        get storage() {
+            return USE_RAILWAY_STORAGE ? railwayStorage : getSupabaseLegacy().storage;
+        },
+        get auth() {
+            return unavailableAuth;
+        },
     };
 } else {
-    supabaseAdminInstance = supabaseLegacy;
+    console.log("🟠 DB layer: legacy Supabase (USE_RAILWAY_DB is not 'true')");
+    supabaseAdminInstance = getSupabaseLegacy();
 }
 
 /**

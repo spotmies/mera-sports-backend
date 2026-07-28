@@ -1,60 +1,87 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (value) => typeof value === "string" && UUID_RE.test(value.trim());
+
+/**
+ * A usable mobile number, i.e. one we could actually match a user row on.
+ *
+ * `lookupPlayer` masks what it returns ("XXXXXX5123"), and the client stores
+ * "N/A" when a player has no number on file. Both come straight back to us in
+ * the create/update payload, so filtering here keeps junk out of the lookup.
+ */
+const isRealMobile = (value) => typeof value === "string" && /^\d{10,15}$/.test(value.trim());
+
 /**
  * Batch-resolve member user UUIDs and send "added to team" notifications.
- * Uses a single prefetch query instead of sequential per-member lookups.
+ *
+ * One indexed `IN` query per identifier type, run in parallel. This used to be
+ * a single `.or()` combining all three — but that made the whole lookup
+ * all-or-nothing: one member carrying a non-UUID `id` (legacy rows stored the
+ * player code there) made Postgres reject the entire filter, `resolveMemberUserIds`
+ * returned an empty map, and *nobody* on the team got notified. Splitting the
+ * query means a bad value can only cost us the column it appears in.
  */
 async function resolveMemberUserIds(members) {
     if (!Array.isArray(members) || members.length === 0) return new Map();
 
-    // Collect all known UUIDs, player_ids, and mobiles
-    const knownIds = [];
-    const playerIds = [];
-    const mobiles = [];
+    const knownIds = new Set();
+    const playerIds = new Set();
+    const mobiles = new Set();
+
     for (const m of members) {
-        if (m.id) knownIds.push(m.id);
-        if (m.player_id) playerIds.push(m.player_id.toUpperCase());
-        if (m.mobile) mobiles.push(m.mobile);
+        if (isUuid(m?.id)) knownIds.add(m.id.trim());
+        const playerId = String(m?.player_id ?? "").trim();
+        if (playerId) {
+            // player_id casing is inconsistent across older rows, and `.in()`
+            // cannot case-fold server-side, so ask for both forms.
+            playerIds.add(playerId);
+            playerIds.add(playerId.toUpperCase());
+        }
+        if (isRealMobile(m?.mobile)) mobiles.add(m.mobile.trim());
     }
 
-    // Batch fetch all matching users in a single query
-    const orFilters = [];
-    if (knownIds.length > 0) orFilters.push(`id.in.(${knownIds.join(',')})`);
-    if (playerIds.length > 0) orFilters.push(`player_id.in.(${playerIds.join(',')})`);
-    if (mobiles.length > 0) orFilters.push(`mobile.in.(${mobiles.join(',')})`);
+    const lookupBy = async (column, values) => {
+        if (values.size === 0) return [];
+        const { data, error } = await supabaseAdmin
+            .from('users')
+            .select('id, player_id, mobile')
+            .in(column, Array.from(values));
+        if (error) {
+            console.error(`[resolveMemberUserIds] lookup by ${column} failed:`, error);
+            return [];
+        }
+        return data || [];
+    };
 
-    if (orFilters.length === 0) return new Map();
-
-    const { data: users, error } = await supabaseAdmin
-        .from('users')
-        .select('id, player_id, mobile')
-        .or(orFilters.join(','));
-
-    if (error) {
-        console.error('Batch user lookup error:', error);
-        return new Map();
-    }
+    const [byIdRows, byPlayerIdRows, byMobileRows] = await Promise.all([
+        lookupBy('id', knownIds),
+        lookupBy('player_id', playerIds),
+        lookupBy('mobile', mobiles),
+    ]);
 
     // Build lookup maps for fast resolution
     const byId = new Map();
     const byPlayerId = new Map();
     const byMobile = new Map();
-    for (const u of (users || [])) {
-        if (u.id) byId.set(u.id, u.id);
-        if (u.player_id) byPlayerId.set(u.player_id.toUpperCase(), u.id);
-        if (u.mobile) byMobile.set(u.mobile, u.id);
+    for (const u of [...byIdRows, ...byPlayerIdRows, ...byMobileRows]) {
+        if (u.id) byId.set(String(u.id), u.id);
+        if (u.player_id) byPlayerId.set(String(u.player_id).toUpperCase(), u.id);
+        if (u.mobile) byMobile.set(String(u.mobile), u.id);
     }
 
     // Resolve each member to a user UUID
     const resolved = new Map();
     for (const m of members) {
-        const key = m.id || m.player_id || m.mobile;
-        const userId = (m.id && byId.get(m.id))
-            || (m.player_id && byPlayerId.get(m.player_id.toUpperCase()))
-            || (m.mobile && byMobile.get(m.mobile))
+        const key = m?.id || m?.player_id || m?.mobile;
+        if (!key) continue;
+        const playerId = String(m?.player_id ?? "").trim().toUpperCase();
+        const userId = (m?.id && byId.get(String(m.id)))
+            || (playerId && byPlayerId.get(playerId))
+            || (m?.mobile && byMobile.get(String(m.mobile)))
             || null;
-        if (userId && key) resolved.set(key, userId);
+        if (userId) resolved.set(key, userId);
     }
     return resolved;
 }
@@ -66,6 +93,7 @@ async function notifyTeamMembers(members, teamName, captainName) {
         const resolvedIds = await resolveMemberUserIds(members);
 
         const notificationPromises = [];
+        const unresolved = [];
         for (const member of members) {
             const key = member.id || member.player_id || member.mobile;
             const userId = key ? resolvedIds.get(key) : null;
@@ -75,10 +103,22 @@ async function notifyTeamMembers(members, teamName, captainName) {
                         userId,
                         'Added to Team',
                         `${captainName} added you to the team "${teamName}".`,
-                        'info'
+                        'info',
+                        // Deep-links the bell straight to the Teams tab, where the
+                        // team now shows up under "Teams You're In".
+                        '/dashboard?tab=teams'
                     )
                 );
+            } else {
+                unresolved.push(member?.player_id || member?.id || '(unidentified)');
             }
+        }
+
+        // A member who cannot be resolved to a user row gets no notification and
+        // no error — worth a line in the log, since from the captain's side the
+        // add looks like it worked.
+        if (unresolved.length > 0) {
+            console.warn(`[notifyTeamMembers] "${teamName}": no user row for ${unresolved.join(', ')} — not notified`);
         }
 
         const results = await Promise.allSettled(notificationPromises);
@@ -103,17 +143,44 @@ export const getMyTeams = async (req, res) => {
         // 2. Teams where user is a member (lookup by UUID, mobile, or player_id)
         const { data: player } = await supabaseAdmin.from('users').select('mobile, player_id').eq('id', userId).maybeSingle();
 
-        const { data: allTeams } = await supabaseAdmin.from('player_teams').select('*').neq('captain_id', userId).order('created_at', { ascending: false });
+        // JSONB containment pushes the member match into Postgres. The previous
+        // version pulled *every* team row in the table back and filtered them in
+        // memory, which silently truncated at PostgREST's default row cap — past
+        // that point a player simply stopped seeing teams they'd been added to.
+        // `@>` matches on a partial object, so {id} alone matches the full
+        // stored member object.
+        const membershipProbes = [{ id: userId }];
+        if (player?.player_id) membershipProbes.push({ player_id: player.player_id });
+        if (player?.mobile) membershipProbes.push({ mobile: player.mobile });
+
+        const memberTeamResults = await Promise.all(
+            membershipProbes.map(async (probe) => {
+                const { data, error: probeError } = await supabaseAdmin
+                    .from('player_teams')
+                    .select('*')
+                    .neq('captain_id', userId)
+                    // Must be a pre-stringified JSON array: given a JS array,
+                    // supabase-js builds a Postgres *array* literal
+                    // (`cs.{[object Object]}`) instead of a jsonb one.
+                    .contains('members', JSON.stringify([probe]))
+                    .order('created_at', { ascending: false });
+                if (probeError) {
+                    console.error('[getMyTeams] membership probe failed:', probe, probeError);
+                    return [];
+                }
+                return data || [];
+            })
+        );
 
         const captainTeamIds = new Set((captainTeams || []).map(t => t.id));
-        const memberTeams = (allTeams || []).filter(team => {
-            if (captainTeamIds.has(team.id)) return false;
-            return Array.isArray(team.members) && team.members.some(m =>
-                m.id === userId ||
-                (player?.mobile && m.mobile === player.mobile) ||
-                (player?.player_id && m.player_id === player.player_id)
-            );
-        });
+        const seenMemberTeamIds = new Set();
+        const memberTeams = [];
+        for (const team of memberTeamResults.flat()) {
+            if (captainTeamIds.has(team.id) || seenMemberTeamIds.has(team.id)) continue;
+            seenMemberTeamIds.add(team.id);
+            memberTeams.push(team);
+        }
+        memberTeams.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
         // Mark each team with the user's role
         const ownTeams = (captainTeams || []).map(t => ({ ...t, user_role: 'captain' }));
