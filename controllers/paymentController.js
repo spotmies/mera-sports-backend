@@ -17,6 +17,20 @@ const TEAM_MATCH_TYPES = ["doubles", "mixed doubles", "team"];
 const DEFAULT_CATEGORY_FEE = 500; // player-app fallback when a category has no fee
 const MAX_TEAM_MEMBERS = 100;
 
+/**
+ * Parses a configured entry fee. Returns null when no fee is recorded, so a
+ * genuine 0 (free category) stays distinguishable from "not set" — `Number(x)
+ * || null` collapsed both to null and silently made free categories billable.
+ * An empty string is "not set", not zero.
+ */
+const parseEntryFee = (value) => {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim();
+    if (raw === "") return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
 const normalizeEventCategories = (event) => {
     const raw = Array.isArray(event?.categories) ? event.categories : [];
     return raw.map((c, idx) => {
@@ -27,7 +41,7 @@ const normalizeEventCategories = (event) => {
             name,
             gender: (isObj && c.gender) || "Mixed",
             matchType: (isObj && c.matchType) || "Singles",
-            entryFee: isObj ? (Number(c.entryFee ?? c.fee) || null) : null,
+            entryFee: isObj ? parseEntryFee(c.entryFee ?? c.fee) : null,
         };
     });
 };
@@ -41,7 +55,9 @@ const findEventCategory = (normalizedCategories, catId) =>
 // Returns { fee, categoryObjects }. Throws (statusCode 400) on unknown category ids.
 const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) => {
     const normalized = normalizeEventCategories(event);
-    const baseFee = normalized[0]?.entryFee || DEFAULT_CATEGORY_FEE;
+    // `??` not `||` — a first category priced at 0 must not fall through to the
+    // default fee.
+    const baseFee = normalized[0]?.entryFee ?? DEFAULT_CATEGORY_FEE;
 
     let feeSum = 0;
     let hasTeamMatchType = false;
@@ -55,7 +71,7 @@ const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) =>
             err.statusCode = 400;
             throw err;
         }
-        const fee = cat.entryFee || baseFee;
+        const fee = cat.entryFee ?? baseFee;
         feeSum += fee;
         if (TEAM_MATCH_TYPES.some((t) => cat.matchType.toLowerCase().includes(t))) {
             hasTeamMatchType = true;
@@ -373,6 +389,17 @@ export const createRazorpayOrder = async (req, res) => {
         assertPlayerEligible(payingUser, categoryObjects);
         if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
             return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
+        }
+
+        // Razorpay rejects orders below ₹1, so a free (₹0) selection cannot go
+        // through checkout. Fail here with a clear message rather than letting
+        // the SDK throw something opaque. Free registration needs its own
+        // no-payment path — see FREE_ENTRY note in the admin CreateEvent form.
+        if (!(fee > 0)) {
+            return res.status(400).json({
+                message: "This selection totals ₹0. Free registration is not supported yet — contact the organiser.",
+                code: "ZERO_AMOUNT_ORDER",
+            });
         }
 
         const catIds = categories.map((c) => (c && typeof c === "object" ? c.id : c)).join(",");
