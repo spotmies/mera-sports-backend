@@ -2,6 +2,7 @@ import express from "express";
 import {
     updateInstituteProfile,
     requestBulkApproval,
+    cancelBulkApproval,
     getApprovalStatus,
     finalizeBulkImport,
     getApprovedPlayers
@@ -16,7 +17,10 @@ router.put("/profile", verifyInstitute, updateInstituteProfile);
 // 2. POST /api/institute/request-bulk-approval
 router.post("/request-bulk-approval", verifyInstitute, requestBulkApproval);
 
-// 2. GET /api/institute/approval-status
+// 2b. DELETE /api/institute/cancel-approval
+router.delete("/cancel-approval", verifyInstitute, cancelBulkApproval);
+
+// 2c. GET /api/institute/approval-status
 router.get("/approval-status", verifyInstitute, getApprovalStatus);
 
 // 3. POST /api/institute/bulk-import-finalize

@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { resolveAge } from "../utils/age.js";
 import { createNotification } from "../services/notificationService.js";
 import {
     sendEmailOtp,
@@ -51,6 +52,77 @@ export const verifyForgotPasswordOtp = async (req, res) => {
     } catch (err) {
         console.error("FORGOT PASSWORD VERIFY OTP ERROR:", err.message);
         res.status(500).json({ success: false, message: "Verification failed" });
+    }
+};
+
+/**
+ * Institute forgot-password: step 1 of 3.
+ *
+ * Institutes sign in with their email, so this flow is email-only — there is no
+ * mobile branch to mirror the player flow's WhatsApp option.
+ *
+ * Why this exists instead of reusing /auth/send-otp: that endpoint mails an OTP
+ * to ANY address without checking it belongs to an account. An institute who
+ * mistyped their email would get a code, enter it successfully, and only then
+ * hit "User not found" at the reset step — after burning an OTP and two minutes.
+ * Checking here fails fast, at the point where the mistake was made.
+ *
+ * Steps 2 and 3 deliberately reuse the shared /auth/forgot-password/verify-otp
+ * and /reset endpoints: users.email is UNIQUE, so resolving by email hits
+ * exactly one row. Since an OTP is only ever issued here for an institutehead
+ * account, a token from this flow cannot be turned against a player or admin.
+ *
+ * This reports "no institute account" plainly rather than returning a generic
+ * success. loginInstitute already answers the same question to anyone who asks
+ * ("This account is not registered as an institute."), so masking it here would
+ * cost real usability and buy no secrecy that the login form does not already
+ * give away.
+ */
+export const sendInstituteForgotPasswordOtp = async (req, res) => {
+    try {
+        // Trim only — deliberately NOT lowercased. Postgres `.eq` is case-sensitive
+        // and loginInstitute matches the email exactly as typed, so normalising
+        // case here would break password reset for any account registered with a
+        // capital letter while its login kept working. The OTP store, the verify
+        // step and the reset all key off this same string, so they stay in sync.
+        const email = String(req.body?.email || "").trim();
+        if (!email) {
+            return res.status(400).json({ success: false, message: "Email is required" });
+        }
+
+        const { data: user, error } = await supabaseAdmin
+            .from("users")
+            .select("id, role, verification")
+            .eq("email", email)
+            .maybeSingle();
+
+        if (error) throw error;
+
+        if (!user || user.role !== "institutehead") {
+            return res.status(404).json({
+                success: false,
+                message: "No institute account is registered with this email."
+            });
+        }
+
+        // A rejected institute cannot log in even with the correct password, so
+        // letting them set a new one would just hand them a working credential
+        // for a door that stays shut. Pending accounts are allowed through —
+        // they are awaiting approval, not refused.
+        if (user.verification === "rejected") {
+            return res.status(403).json({
+                success: false,
+                code: "INSTITUTE_REJECTED",
+                message: "Your institute application was rejected. Please contact admin."
+            });
+        }
+
+        await sendEmailOtp(email);
+        res.json({ success: true, message: "OTP sent to your registered email" });
+
+    } catch (err) {
+        console.error("INSTITUTE FORGOT PASSWORD OTP ERROR:", err.message);
+        res.status(500).json({ success: false, message: "Failed to send OTP. Please try again." });
     }
 };
 
@@ -540,7 +612,14 @@ export const registerPlayer = async (req, res) => {
                 lastName: user.last_name,
                 role: 'player',
                 photos: user.photos,
-                age: user.age
+                // dob + gender are needed for category eligibility. Without them
+                // the client fell back to the stale `age` column and computed a
+                // different birth year than the pages that read the dashboard,
+                // so the same player showed Eligible on one screen and Not
+                // Eligible on another. Age is derived from dob here.
+                dob: user.dob,
+                gender: user.gender,
+                age: resolveAge(user)
             },
         });
     } catch (err) {
@@ -674,7 +753,14 @@ export const loginPlayer = async (req, res) => {
                 lastName: user.last_name,
                 role: 'player',
                 photos: user.photos,
-                age: user.age
+                // dob + gender are needed for category eligibility. Without them
+                // the client fell back to the stale `age` column and computed a
+                // different birth year than the pages that read the dashboard,
+                // so the same player showed Eligible on one screen and Not
+                // Eligible on another. Age is derived from dob here.
+                dob: user.dob,
+                gender: user.gender,
+                age: resolveAge(user)
             },
         });
     } catch (err) {
@@ -714,13 +800,60 @@ export const registerAdmin = async (req, res) => {
     }
 };
 
+// Field ceilings mirrored from the register form. The users columns are `text`,
+// so without these the API is the only thing between a scripted client and a
+// megabyte-long institute name sitting in the database.
+const INSTITUTE_LIMITS = {
+    instituteName: 100,
+    email: 254,
+    contactNumber: 10,
+    website: 200,
+    address: 250,
+    password: 64,
+};
+const PASSWORD_MIN_LENGTH = 6;
+
 export const registerInstitute = async (req, res) => {
     try {
-        const { instituteName, email, contactNumber, website, address, password } = req.body || {};
+        const raw = req.body || {};
 
-        // Basic validation
-        if (!instituteName || !email || !contactNumber || !password) {
+        // Trim before storing. loginInstitute resolves the account with an exact
+        // `.eq("email", …)`, so an address saved with a stray leading space would
+        // produce an account nobody can ever sign in to.
+        const instituteName = String(raw.instituteName || "").trim();
+        const email = String(raw.email || "").trim();
+        const contactNumber = String(raw.contactNumber || "").replace(/\D/g, "");
+        const website = String(raw.website || "").trim();
+        const address = String(raw.address || "").trim();
+        const password = String(raw.password || "");
+
+        // Presence is checked against what was actually sent, not the stripped
+        // number — otherwise a phone of "abcdefghij" strips to "" and gets
+        // reported as a missing field instead of an invalid one.
+        if (!instituteName || !email || !String(raw.contactNumber || "").trim() || !password) {
             return res.status(400).json({ message: "Missing required fields: Institute Name, Email, Contact Number, or Password" });
+        }
+
+        for (const [field, max] of Object.entries(INSTITUTE_LIMITS)) {
+            const value = { instituteName, email, contactNumber, website, address, password }[field];
+            if (value && value.length > max) {
+                return res.status(400).json({ message: `${field} must be ${max} characters or fewer.` });
+            }
+        }
+
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            return res.status(400).json({ message: "Please provide a valid email address." });
+        }
+
+        if (!/^\d{10}$/.test(contactNumber)) {
+            return res.status(400).json({ message: "Contact number must be exactly 10 digits." });
+        }
+
+        // Was unchecked: registration accepted a 1-character password while
+        // resetPassword demands 6, so an institute could create a credential it
+        // was then forbidden from restoring.
+        if (password.length < PASSWORD_MIN_LENGTH) {
+            return res.status(400).json({ message: `Password must be at least ${PASSWORD_MIN_LENGTH} characters.` });
         }
 
         // Check for existing user with that email
@@ -875,7 +1008,13 @@ export const loginAdmin = async (req, res) => {
 
         const { data: user, error } = await supabaseAdmin.from("users").select("*").eq("email", email).maybeSingle();
 
-        if (error || !user) return res.status(401).json({ message: "Invalid credentials" });
+        // Reporting a DB outage as "Invalid credentials" sent admins chasing
+        // their password while the real problem was an unreachable database.
+        if (error) {
+            console.error("ADMIN LOGIN DB ERROR:", error.message || error);
+            return res.status(503).json({ message: "Database unavailable, please retry" });
+        }
+        if (!user) return res.status(401).json({ message: "Invalid credentials" });
         if (user.role !== 'admin' && user.role !== 'superadmin') return res.status(403).json({ message: "Access Denied." });
 
         // Compare password using bcrypt only.
@@ -942,7 +1081,16 @@ export const getCurrentUser = async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const { data: user, error } = await supabaseAdmin.from("users").select("id, name, email, role, photos, verification, last_login, previous_login").eq("id", decoded.id).maybeSingle();
 
-        if (error || !user) return res.status(404).json({ message: "User not found" });
+        // A database failure is NOT "this user does not exist". Returning 404
+        // here told the admin client the account was gone, so it wiped the
+        // stored token — which is why an unreachable DB logged you out on every
+        // refresh locally while QA and prod, whose DB is up, stayed signed in.
+        // 503 is transient: the client keeps the session and retries.
+        if (error) {
+            console.error("SESSION RESTORE DB ERROR:", error.message || error);
+            return res.status(503).json({ message: "Database unavailable, please retry" });
+        }
+        if (!user) return res.status(404).json({ message: "User not found" });
 
         res.json({
             success: true,

@@ -45,11 +45,23 @@ router.post('/sync', async (req, res) => {
         }
 
         // 2. CHECK IF USER ALREADY EXISTS (by email — IDs are our own UUIDs now)
-        const { data: existingUser } = await supabaseAdmin
+        const { data: existingUser, error: lookupError } = await supabaseAdmin
             .from('users')
             .select('*')
             .eq('email', payload.email)
             .maybeSingle();
+
+        // This error used to be discarded. An unreachable database therefore
+        // looked identical to "no such user", so a returning admin fell straight
+        // into the new-user branch below — which then failed its INSERT and
+        // returned 500. Worse, had the write succeeded where the read did not,
+        // it would have silently created a duplicate account for an existing
+        // admin. Bail out instead: 503 tells the client to retry, not to
+        // re-register.
+        if (lookupError) {
+            console.error('Google sync: user lookup failed:', lookupError);
+            return res.status(503).json({ error: 'Database unavailable, please retry' });
+        }
 
         // Robust Name Parsing
         const fullName = payload.name || 'Admin User';

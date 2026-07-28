@@ -62,8 +62,29 @@ export const getPendingStudentImports = async (req, res) => {
             .order("created_at", { ascending: false });
 
         if (error) throw error;
+        if (!approvals || approvals.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
 
-        res.json({ success: true, data: approvals });
+        // Resolve the CURRENT institute name from users — the snapshotted
+        // institute_name in the ticket goes stale when institutes rename themselves.
+        const uniqueIds = [...new Set(approvals.map(a => a.institute_id))];
+        const { data: users } = await supabaseAdmin
+            .from("users")
+            .select("id, institute_name, name")
+            .in("id", uniqueIds);
+
+        const nameMap = {};
+        for (const u of (users || [])) {
+            nameMap[u.id] = u.institute_name || u.name || null;
+        }
+
+        const resolved = approvals.map(a => ({
+            ...a,
+            institute_name: nameMap[a.institute_id] || a.institute_name
+        }));
+
+        res.json({ success: true, data: resolved });
     } catch (err) {
         console.error("FETCH PENDING STUDENT IMPORTS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch pending student import approvals" });
@@ -80,8 +101,28 @@ export const getApprovedStudentImports = async (req, res) => {
             .order("created_at", { ascending: false });
 
         if (error) throw error;
+        if (!approvals || approvals.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
 
-        res.json({ success: true, data: approvals });
+        // Same live-name resolution as pending
+        const uniqueIds = [...new Set(approvals.map(a => a.institute_id))];
+        const { data: users } = await supabaseAdmin
+            .from("users")
+            .select("id, institute_name, name")
+            .in("id", uniqueIds);
+
+        const nameMap = {};
+        for (const u of (users || [])) {
+            nameMap[u.id] = u.institute_name || u.name || null;
+        }
+
+        const resolved = approvals.map(a => ({
+            ...a,
+            institute_name: nameMap[a.institute_id] || a.institute_name
+        }));
+
+        res.json({ success: true, data: resolved });
     } catch (err) {
         console.error("FETCH APPROVED STUDENT IMPORTS ERROR:", err);
         res.status(500).json({ message: "Failed to fetch approved student import approvals" });
@@ -107,6 +148,25 @@ export const approveStudentImport = async (req, res) => {
     } catch (err) {
         console.error("APPROVE STUDENT IMPORT ERROR:", err);
         res.status(500).json({ message: "Failed to approve bulk student import" });
+    }
+};
+
+// DELETE /api/admin/institutes/imports/:id/reject
+export const rejectStudentImport = async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const { error } = await supabaseAdmin
+            .from("institute_approvals")
+            .delete()
+            .eq("id", id);
+
+        if (error) throw error;
+
+        res.json({ success: true, message: "Import request rejected and removed." });
+    } catch (err) {
+        console.error("REJECT STUDENT IMPORT ERROR:", err);
+        res.status(500).json({ message: "Failed to reject import request" });
     }
 };
 
