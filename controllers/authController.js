@@ -890,7 +890,13 @@ export const loginAdmin = async (req, res) => {
 
         const { data: user, error } = await supabaseAdmin.from("users").select("*").eq("email", email).maybeSingle();
 
-        if (error || !user) return res.status(401).json({ message: "Invalid credentials" });
+        // Reporting a DB outage as "Invalid credentials" sent admins chasing
+        // their password while the real problem was an unreachable database.
+        if (error) {
+            console.error("ADMIN LOGIN DB ERROR:", error.message || error);
+            return res.status(503).json({ message: "Database unavailable, please retry" });
+        }
+        if (!user) return res.status(401).json({ message: "Invalid credentials" });
         if (user.role !== 'admin' && user.role !== 'superadmin') return res.status(403).json({ message: "Access Denied." });
 
         // Compare password using bcrypt only.
@@ -957,7 +963,16 @@ export const getCurrentUser = async (req, res) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const { data: user, error } = await supabaseAdmin.from("users").select("id, name, email, role, photos, verification, last_login, previous_login").eq("id", decoded.id).maybeSingle();
 
-        if (error || !user) return res.status(404).json({ message: "User not found" });
+        // A database failure is NOT "this user does not exist". Returning 404
+        // here told the admin client the account was gone, so it wiped the
+        // stored token — which is why an unreachable DB logged you out on every
+        // refresh locally while QA and prod, whose DB is up, stayed signed in.
+        // 503 is transient: the client keeps the session and retries.
+        if (error) {
+            console.error("SESSION RESTORE DB ERROR:", error.message || error);
+            return res.status(503).json({ message: "Database unavailable, please retry" });
+        }
+        if (!user) return res.status(404).json({ message: "User not found" });
 
         res.json({
             success: true,
