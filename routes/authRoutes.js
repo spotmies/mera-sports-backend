@@ -16,6 +16,7 @@ import {
     registerInstitute,
     loginInstitute,
     resetPassword,
+    sendInstituteForgotPasswordOtp,
     verifyForgotPasswordOtp
 } from "../controllers/authController.js";
 
@@ -37,6 +38,10 @@ router.post("/check-conflict", checkUserConflict);
 /* ================= FORGOT PASSWORD ================= */
 router.post("/forgot-password/verify-otp", verifyForgotPasswordOtp);
 router.post("/forgot-password/reset", resetPassword);
+
+// Institute step 1. Steps 2 and 3 reuse the two shared endpoints above with
+// method: 'email' — see sendInstituteForgotPasswordOtp for why that is safe.
+router.post("/institute/forgot-password/send-otp", sendInstituteForgotPasswordOtp);
 
 /* ================= PLAYER AUTH ================= */
 router.post("/register-player", registerPlayer);
