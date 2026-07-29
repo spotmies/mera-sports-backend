@@ -5,6 +5,18 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 // support request.
 const CONTACT_SOURCES = ["website", "institute"];
 
+// Field ceilings mirroring both contact forms. contact_messages columns are
+// `text`, so this endpoint is the only thing standing between an unauthenticated
+// POST and an unbounded row — the form's maxLength attributes protect nobody
+// scripting against the API directly.
+const CONTACT_LIMITS = {
+    name: 100,
+    email: 254,
+    phone: 10,
+    subject: 50,
+    message: 1000,
+};
+
 // GET /api/contact (Admin)
 export const getMessages = async (req, res) => {
     try {
@@ -29,9 +41,39 @@ export const updateMessageStatus = async (req, res) => {
 
 // POST /api/contact/send
 export const sendMessage = async (req, res) => {
-    const { name, email, phone, subject, message, source } = req.body;
+    const raw = req.body || {};
+    const source = raw.source;
     const resolvedSource = CONTACT_SOURCES.includes(source) ? source : "website";
     const isInstitute = resolvedSource === "institute";
+
+    const name = String(raw.name || "").trim();
+    const email = String(raw.email || "").trim();
+    const phone = String(raw.phone || "").replace(/\D/g, "");
+    const subject = String(raw.subject || "").trim();
+    const message = String(raw.message || "").trim();
+
+    if (!name || !email || !message) {
+        return res.status(400).json({ success: false, message: "Name, email and message are required." });
+    }
+
+    for (const [field, max] of Object.entries(CONTACT_LIMITS)) {
+        const value = { name, email, phone, subject, message }[field];
+        if (value && value.length > max) {
+            return res.status(400).json({ success: false, message: `${field} must be ${max} characters or fewer.` });
+        }
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ success: false, message: "Please provide a valid email address." });
+    }
+
+    // Phone is optional at the API level (older callers may omit it), but when
+    // present it must be a real 10-digit number rather than the 23-digit string
+    // the unvalidated form used to accept.
+    if (phone && !/^\d{10}$/.test(phone)) {
+        return res.status(400).json({ success: false, message: "Phone number must be exactly 10 digits." });
+    }
+
     const baseRow = { name, email, phone, subject, message };
     try {
         let { data: savedMessage, error } = await supabaseAdmin

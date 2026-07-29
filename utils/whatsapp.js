@@ -18,6 +18,11 @@ const TEMPLATES = {
     // receipt PDF. Separate template because changing an approved template's
     // header type requires resubmission to Meta.
     receipt: process.env.WHATSAPP_TEMPLATE_RECEIPT || 'registration_receipt',
+    // Admin broadcasts. Two templates for the same message because a template's
+    // header type is fixed at creation — the image variant cannot be derived
+    // from the text one, exactly like `registration` vs `receipt` above.
+    broadcast: process.env.WHATSAPP_TEMPLATE_BROADCAST || 'event_announcement',
+    broadcastImage: process.env.WHATSAPP_TEMPLATE_BROADCAST_IMAGE || 'event_announcement_image',
 };
 
 export const isWhatsAppEnabled = () => Boolean(PHONE_ID && TOKEN);
@@ -75,24 +80,34 @@ const postTemplate = (to, templateName, components, langCode) =>
         { headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 15000 }
     );
 
-export const sendWhatsAppTemplate = async (mobile, templateName, components = [], langOverride = null) => {
+/**
+ * Same send as `sendWhatsAppTemplate`, but reports *what happened* instead of
+ * just whether it worked: the broadcast pipeline stores Meta's message id per
+ * recipient (the status webhook arrives keyed by that id and nothing else) and
+ * shows the failure reason to the admin, so a bare boolean is not enough.
+ *
+ * @returns {Promise<{ok: boolean, messageId?: string, error?: string, code?: number}>}
+ */
+export const sendWhatsAppTemplateDetailed = async (mobile, templateName, components = [], langOverride = null) => {
     if (!isWhatsAppEnabled()) {
         console.warn('WhatsApp disabled: WHATSAPP_PHONE_ID / WHATSAPP_TOKEN not set');
-        return false;
+        return { ok: false, error: 'WhatsApp is not configured on this server' };
     }
 
     const to = normalizeWhatsAppNumber(mobile);
     if (!to) {
         console.warn(`WhatsApp: invalid mobile number "${mobile}"`);
-        return false;
+        return { ok: false, error: `Invalid mobile number "${mobile}"` };
     }
 
     const primaryLang = langOverride || PRIMARY_LANG;
     const altLang = primaryLang === 'en' ? 'en_US' : 'en';
 
+    const messageIdOf = (response) => response?.data?.messages?.[0]?.id;
+
     try {
-        await postTemplate(to, templateName, components, primaryLang);
-        return true;
+        const response = await postTemplate(to, templateName, components, primaryLang);
+        return { ok: true, messageId: messageIdOf(response) };
     } catch (error) {
         const apiError = error.response?.data?.error;
 
@@ -100,25 +115,31 @@ export const sendWhatsAppTemplate = async (mobile, templateName, components = []
         // variant before giving up, so a template registered as en_US still sends.
         if (apiError?.code === 132001) {
             try {
-                await postTemplate(to, templateName, components, altLang);
+                const response = await postTemplate(to, templateName, components, altLang);
                 console.warn(`WhatsApp: template "${templateName}" sent as ${altLang} — set its language override to skip this retry`);
-                return true;
+                return { ok: true, messageId: messageIdOf(response) };
             } catch (retryError) {
                 const retryApiError = retryError.response?.data?.error;
+                const detail = retryApiError
+                    ? `${retryApiError.code} ${retryApiError.message}`
+                    : retryError.message;
                 console.error(
                     `WhatsApp send error (template=${templateName}, tried ${primaryLang} and ${altLang}):`,
-                    retryApiError ? `${retryApiError.code} ${retryApiError.message}` : retryError.message
+                    detail
                 );
-                return false;
+                return { ok: false, error: detail, code: retryApiError?.code };
             }
         }
 
-        console.error(
-            `WhatsApp send error (template=${templateName}):`,
-            apiError ? `${apiError.code} ${apiError.message}` : error.message
-        );
-        return false;
+        const detail = apiError ? `${apiError.code} ${apiError.message}` : error.message;
+        console.error(`WhatsApp send error (template=${templateName}):`, detail);
+        return { ok: false, error: detail, code: apiError?.code };
     }
+};
+
+export const sendWhatsAppTemplate = async (mobile, templateName, components = [], langOverride = null) => {
+    const { ok } = await sendWhatsAppTemplateDetailed(mobile, templateName, components, langOverride);
+    return ok;
 };
 
 /**
@@ -226,4 +247,69 @@ export const sendRegistrationReceiptWhatsApp = async (mobile, details, { documen
         console.warn(`Receipt template "${TEMPLATES.receipt}" send failed — falling back to text confirmation`);
     }
     return sendRegistrationWhatsApp(mobile, details);
+};
+
+/* ================= ADMIN BROADCASTS ================= */
+
+// A template's body parameters are capped by Meta at 1024 characters. The admin
+// UI enforces the same limit so the count shown while typing is the real one.
+export const BROADCAST_MESSAGE_MAX = 1024;
+export const BROADCAST_TITLE_MAX = 60;
+
+/**
+ * Render a broadcast exactly as WhatsApp will deliver it.
+ *
+ * Template parameters cannot contain newlines, tabs or runs of 4+ spaces —
+ * Meta rejects the send outright (error 132000). `sanitizeParam` collapses them,
+ * which means a message typed as several paragraphs arrives as one. That is a
+ * property of templates, not a bug, so the admin UI previews the *sanitized*
+ * text and this helper is what it previews with.
+ *
+ * @param {object} broadcast - { title, message }
+ * @param {string} recipientName
+ */
+export const renderBroadcastPreview = ({ title, message }, recipientName = 'Player') => ({
+    header: sanitizeParam(title).slice(0, BROADCAST_TITLE_MAX),
+    body: `Hi ${sanitizeParam(recipientName)},\n\n${sanitizeParam(message).slice(0, BROADCAST_MESSAGE_MAX)}\n\nOpen the Sports Paramount app for full details.`,
+    footer: 'Sports Paramount',
+});
+
+/**
+ * Send one admin broadcast message.
+ *
+ * Picks the image-header template when an image is attached and the text-header
+ * one otherwise — a single template cannot do both, since the header type is
+ * fixed when Meta approves it.
+ *
+ * `imageUrl` must be directly fetchable by Meta's media downloader: pass a
+ * signed bucket URL, NOT the `/api/files/...` route, which answers with a 302
+ * that Meta does not reliably follow (same trap as the receipt PDF).
+ *
+ * @param {string} mobile
+ * @param {object} broadcast - { title, message, imageUrl? }
+ * @param {string} recipientName
+ * @returns {Promise<{ok: boolean, messageId?: string, error?: string, code?: number}>}
+ */
+export const sendBroadcastWhatsApp = (mobile, { title, message, imageUrl } = {}, recipientName = 'Player') => {
+    const bodyParams = [
+        textParam(recipientName),
+        textParam(String(message ?? '').slice(0, BROADCAST_MESSAGE_MAX)),
+    ];
+
+    if (imageUrl) {
+        return sendWhatsAppTemplateDetailed(mobile, TEMPLATES.broadcastImage, [
+            { type: 'header', parameters: [{ type: 'image', image: { link: imageUrl } }] },
+            { type: 'body', parameters: bodyParams },
+        ]);
+    }
+
+    return sendWhatsAppTemplateDetailed(mobile, TEMPLATES.broadcast, [
+        { type: 'header', parameters: [textParam(String(title ?? '').slice(0, BROADCAST_TITLE_MAX))] },
+        { type: 'body', parameters: bodyParams },
+    ]);
+};
+
+export const BROADCAST_TEMPLATES = {
+    text: TEMPLATES.broadcast,
+    image: TEMPLATES.broadcastImage,
 };
