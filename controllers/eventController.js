@@ -180,7 +180,7 @@ export const getEventDetails = async (req, res) => {
         const [assignedAdmins, { data: newsData }, { data: regStats }] = await Promise.all([
             loadAssignedAdminsForEvent(internalEventId),
             supabaseAdmin.from('event_news').select('*').eq('event_id', internalEventId).order('created_at', { ascending: false }),
-            supabaseAdmin.from("event_registrations").select("categories, status, team_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]),
+            supabaseAdmin.from("event_registrations").select("categories, status, team_id, player_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]),
         ]);
 
         if (assignedAdmins.length > 0) { 
@@ -236,7 +236,18 @@ export const getEventDetails = async (req, res) => {
             });
         }
         eventData.registration_counts = registrationCounts;
-        eventData.total_registrations_count = regStats ? regStats.length : 0;
+        // A "registration" is a category entry, not a row: one player entering two
+        // categories has registered twice, pays two fees and occupies two slots.
+        // regStats.length counted rows, so the headline total contradicted the
+        // per-category cards right below it (40 vs the cards' 9+18+5+12+9 = 53).
+        // Summing registrationCounts also keeps team/doubles correct — those keys
+        // already hold distinct team counts rather than one per member.
+        eventData.total_registrations_count = Object.values(registrationCounts)
+            .reduce((sum, n) => sum + (Number(n) || 0), 0);
+        // Distinct people, for callers that need headcount rather than entries.
+        eventData.total_players_count = regStats
+            ? new Set(regStats.map(r => r.player_id).filter(Boolean)).size
+            : 0;
 
         await cacheSet(cacheKey, eventData, 60); // 60s TTL
         res.json({ success: true, event: eventData });
