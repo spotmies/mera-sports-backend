@@ -25,6 +25,7 @@ import instituteRoutes from "./routes/instituteRoutes.js"; // Added Institute Ro
 import playerDashboardRoutes from "./routes/playerDashboardroutes.js";
 import publicRoutes from "./routes/publicRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
+import whatsappRoutes from "./routes/whatsappRoutes.js";
 
 dotenv.config({ quiet: true });
 
@@ -62,6 +63,7 @@ app.use("/api/teams", teamRoutes);
 app.use("/api/notifications", notificationRoutes); // Mounted Notification Routes
 app.use("/api/institute", instituteRoutes); // Institute endpoints
 app.use("/api/public", publicRoutes);
+app.use("/api/whatsapp", whatsappRoutes); // Meta delivery-status callbacks for broadcasts
 app.use("/api/files", fileRoutes); // Signed-URL delivery for Railway bucket files
 app.use("/api/health", healthRoutes); // Redis (and future) health checks
 
