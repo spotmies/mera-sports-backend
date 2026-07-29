@@ -38,7 +38,14 @@ import {
     getPlayerDetails,
     listPlayers
 } from "../controllers/adminPlayerController.js";
-import { sendBroadcast } from "../controllers/broadcastController.js";
+import {
+    getBroadcastAudience,
+    getBroadcastDetail,
+    listBroadcasts,
+    refreshBroadcast,
+    retryBroadcast,
+    sendBroadcast,
+} from "../controllers/broadcastController.js";
 import {
     getSettings, updateSettings
 } from "../controllers/settingsController.js";
@@ -65,7 +72,15 @@ router.delete("/delete-admin/:id", verifyAdmin, deleteAdmin);
 /* ================= DASHBOARD ================= */
 router.get("/dashboard-stats", verifyAdmin, getDashboardStats);
 router.post("/upload", verifyAdmin, uploadAsset);
-router.post("/broadcast", verifyAdmin, sendBroadcast); // Added Route
+/* ================= BROADCASTS ================= */
+// /broadcast/audience must be declared before any /broadcast/:something route
+// so "audience" is not swallowed as a parameter.
+router.get("/broadcast/audience", verifyAdmin, getBroadcastAudience);
+router.post("/broadcast", verifyAdmin, sendBroadcast);
+router.get("/broadcasts", verifyAdmin, listBroadcasts);
+router.get("/broadcasts/:id", verifyAdmin, getBroadcastDetail);
+router.post("/broadcasts/:id/retry", verifyAdmin, retryBroadcast);
+router.post("/broadcasts/:id/refresh", verifyAdmin, refreshBroadcast);
 
 /* ================= PLAYER MANAGEMENT ================= */
 router.get("/players", verifyAdmin, listPlayers);
