@@ -471,13 +471,20 @@ export const finalizeBulkImport = async (req, res) => {
             } else {
                 successful.push({ first_name: student.first_name, email: student.email });
 
-                // Send login credentials to the student's WhatsApp (fire-and-forget)
+                // Welcome WhatsApp — sends name, Player ID and plain-text password.
+                // sendWelcomeWhatsApp catches all errors internally and returns {ok}
+                // so .catch() alone is unreachable; use .then(ok) to log outcomes.
                 if (student.mobile) {
                     sendWelcomeWhatsApp(student.mobile, {
                         name: student.name,
                         playerId: student.player_id,
                         password: plainPassword
-                    }).catch(e => console.error("Bulk import welcome WhatsApp error:", e.message));
+                    }).then(ok => {
+                        if (!ok) console.error(`Bulk import WhatsApp FAILED for ${student.first_name} (${student.mobile})`);
+                        else console.log(`Bulk import WhatsApp sent to ${student.mobile} (${student.first_name})`);
+                    }).catch(e => console.error("Bulk import welcome WhatsApp unexpected error:", e.message));
+                } else {
+                    console.warn(`Bulk import: no mobile for ${student.first_name} — WhatsApp skipped`);
                 }
             }
         }
