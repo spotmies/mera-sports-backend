@@ -246,7 +246,18 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const isBye = (hasPlayer1 && !hasPlayer2) || (!hasPlayer1 && hasPlayer2);
                 const isEmpty = !hasPlayer1 && !hasPlayer2;
 
-                const matchCategoryId = bracketCategoryId || categoryId;
+                // Must agree with createFullBracketStructure (bracketController "START
+                // ROUNDS"), which writes `bracket.category_id || (uuid ? categoryId :
+                // categoryLabel || bracket.category)`. This path used to write the raw
+                // `categoryId` param instead, so when the Scoreboard regenerated round 1
+                // it rewrote those rows' category_id to a numeric id while the rounds
+                // created by the bracket builder kept the label — one category, two keys,
+                // and every read that filtered on one key lost the other's rounds.
+                const matchCategoryId =
+                    bracketCategoryId ||
+                    (categoryId && isUuid(categoryId)
+                        ? categoryId
+                        : (categoryLabel || bracketData.category || categoryId));
 
                 // Check if this match already exists and is COMPLETED
                 const existingMatch = existingMatchesMap.get(bracketMatchId);
@@ -3089,21 +3100,29 @@ export const getMatches = async (req, res) => {
             .eq('event_id', eventId)
             .order('created_at', { ascending: true });
 
-        // Try to filter by category_id, but if it fails (UUID type mismatch), we'll filter in memory
+        // matches.category_id is not written consistently: depending on which screen
+        // created a round, the SAME category's rows can be keyed by its id
+        // ("1785388592194") or by its display label ("U-17 (Male) - Male - Doubles").
+        // Real example in QA — event 42, U-17 (Male) Doubles: Round of 16 keyed by id,
+        // Quarterfinal/Semifinal/Final keyed by label. Filtering on one key returned a
+        // SUBSET of the category's matches, so later rounds looked ungenerated and the
+        // "N match(es) still syncing to scoreboard" warning could never clear.
+        //
+        // Accept every key the caller knows for this one category. Both values always
+        // identify the same category (the client derives them from one category
+        // object), so this widens nothing — it only stops rows from going missing.
+        const categoryKeys = [categoryId, categoryName]
+            .map((v) => (v == null ? "" : String(v).trim()))
+            .filter((v) => v.length > 0);
+        const uniqueCategoryKeys = Array.from(new Set(categoryKeys));
+
         let categoryFilterApplied = false;
-        if (categoryId) {
-            try {
-                if (isUuid(categoryId)) {
-                    query = query.eq('category_id', categoryId);
-                    categoryFilterApplied = true;
-                } else {
-                    // Non-UUID - try to filter (might fail if column is UUID type)
-                    query = query.eq('category_id', categoryId);
-                    categoryFilterApplied = true;
-                }
-            } catch (e) {
-                // Filter will be applied in memory if query fails
-            }
+        if (uniqueCategoryKeys.length === 1) {
+            query = query.eq('category_id', uniqueCategoryKeys[0]);
+            categoryFilterApplied = true;
+        } else if (uniqueCategoryKeys.length > 1) {
+            query = query.in('category_id', uniqueCategoryKeys);
+            categoryFilterApplied = true;
         }
 
         // Filter by roundName if provided (do this first as it's most specific)
@@ -3113,16 +3132,6 @@ export const getMatches = async (req, res) => {
 
         if (bracketId) {
             query = query.eq('bracket_id', bracketId);
-        }
-
-        // Also try categoryName if provided (treat as category_id)
-        if (categoryName && !categoryFilterApplied) {
-            try {
-                query = query.eq('category_id', categoryName);
-                categoryFilterApplied = true;
-            } catch (e) {
-                // Filter will be applied in memory if query fails
-            }
         }
 
         const { data, error } = await query;
@@ -3144,21 +3153,14 @@ export const getMatches = async (req, res) => {
             // Filter in memory (handles all cases including UUID/string mismatches)
             let filteredMatches = retryData || [];
 
-            // Filter by categoryId first (exact match), fall back to categoryName ONLY if categoryId not provided
-            if (categoryId) {
+            // Match on ANY supplied key — see the note above the query build.
+            if (uniqueCategoryKeys.length > 0) {
                 filteredMatches = filteredMatches.filter(m => {
                     const matchCategoryId = m.category_id;
                     if (!matchCategoryId) return false;
-                    // Use == for type coercion (handles number vs string)
-                    return matchCategoryId == categoryId || String(matchCategoryId) === String(categoryId);
-                });
-            } else if (categoryName) {
-                // Only use categoryName when categoryId is not provided
-                filteredMatches = filteredMatches.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Exact match with type coercion
-                    return matchCategoryId == categoryName || String(matchCategoryId) === String(categoryName);
+                    return uniqueCategoryKeys.some(
+                        (key) => matchCategoryId == key || String(matchCategoryId) === key
+                    );
                 });
             }
 
@@ -3188,34 +3190,18 @@ export const getMatches = async (req, res) => {
         // This handles cases where categoryId is stored as number vs string, or UUID vs label
         let finalMatches = data || [];
 
-        if (finalMatches.length > 0 && (categoryId || categoryName)) {
-            let filtered = finalMatches;
-            const originalCount = finalMatches.length;
-
-            // Try categoryId first (exact match with type coercion)
-            if (categoryId) {
-                filtered = filtered.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Use == for type coercion (handles number vs string)
-                    return matchCategoryId == categoryId || String(matchCategoryId) === String(categoryId);
-                });
-            }
-
-            // If categoryId filter returned 0 matches, try categoryName as fallback
-            if (categoryName && filtered.length === 0 && originalCount > 0) {
-                // Reset to original matches for categoryName filtering
-                filtered = finalMatches;
-
-                filtered = filtered.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Exact match with type coercion
-                    return matchCategoryId == categoryName || String(matchCategoryId) === String(categoryName);
-                });
-            }
-
-            finalMatches = filtered;
+        if (finalMatches.length > 0 && uniqueCategoryKeys.length > 0) {
+            // Keep a row when its category_id equals ANY key the caller supplied.
+            // The old version filtered by categoryId and only tried categoryName if
+            // that left ZERO rows — so a category with rows under both keys silently
+            // lost the label-keyed ones (its later rounds) instead of returning all.
+            finalMatches = finalMatches.filter(m => {
+                const matchCategoryId = m.category_id;
+                if (!matchCategoryId) return false;
+                return uniqueCategoryKeys.some(
+                    (key) => matchCategoryId == key || String(matchCategoryId) === key
+                );
+            });
         }
 
         if (bracketId) {
