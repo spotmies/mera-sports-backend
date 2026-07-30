@@ -372,6 +372,96 @@ export const getCategoryDraw = async (req, res) => {
 };
 
 /**
+ * Get a lightweight draw summary for EVERY category of an event in one request.
+ * GET /api/admin/events/:id/draws
+ *
+ * The Draws tab used to fire one getCategoryDraw per category on open — N round
+ * trips just to render the mode badge and decide which categories to list. This
+ * answers all of them from a single query and deliberately omits `bracket_data`:
+ * only `createdFrom` / `sourceRound` (the two fields the tab reads to detect
+ * pool/league-converted brackets) are kept. The full bracket is still loaded by
+ * getCategoryDraw when a category is actually selected.
+ */
+export const getEventDrawsSummary = async (req, res) => {
+    try {
+        const { id: eventId } = req.params;
+        if (!eventId) return res.status(400).json({ message: "Event ID required" });
+
+        // bracket_data is read but never returned: the flags below are derived from
+        // it here so the response stays small, while `hasBracket` keeps the exact
+        // semantics its callers relied on when they parsed the full draw themselves.
+        const { data, error } = await supabaseAdmin
+            .from("event_brackets")
+            .select("id, category, category_id, mode, published, media_urls, pdf_url, bracket_data")
+            .eq("event_id", eventId)
+            .order("created_at", { ascending: true });
+
+        if (error) throw error;
+
+        // Group rows into categories exactly the way getCategoryDraw looks them up:
+        // by category_id when the row carries one, by the stored label otherwise.
+        // (Some legacy rows store the UUID itself in `category`, so a UUID-keyed
+        // category can own both a "<uuid>" row and a human-labelled one.)
+        const groups = new Map();
+        for (const row of data || []) {
+            const key = row.category_id ? `id:${row.category_id}` : `label:${row.category || ""}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(row);
+        }
+
+        const draws = [];
+        for (const rows of groups.values()) {
+            const mediaDraw = rows.find(b => b.mode === "MEDIA");
+            const bracketDraw = rows.find(b => b.mode === "BRACKET");
+            const leaguePlaceholderRow = rows.find(b => b.mode === "LEAGUE_PLACEHOLDER" || !b.mode);
+            const hasActualMedia = mediaDraw && ((mediaDraw.media_urls && mediaDraw.media_urls.length > 0) || mediaDraw.pdf_url);
+            const bd = bracketDraw?.bracket_data || null;
+
+            // Prefer a human-readable label over a row that stored the raw UUID.
+            const labelRow = rows.find(r => r.category && !isUuid(r.category)) || rows[0];
+
+            draws.push({
+                categoryId: rows.find(r => r.category_id)?.category_id || null,
+                categoryLabel: labelRow?.category || null,
+                mode: bracketDraw ? "BRACKET" : (hasActualMedia ? "MEDIA" : null),
+                published: Boolean(
+                    (bracketDraw && bracketDraw.published) ||
+                    (mediaDraw && mediaDraw.published) ||
+                    (leaguePlaceholderRow && leaguePlaceholderRow.published)
+                ),
+                media: mediaDraw && hasActualMedia ? {
+                    id: mediaDraw.id,
+                    urls: mediaDraw.media_urls || [],
+                    pdfUrl: mediaDraw.pdf_url,
+                    published: mediaDraw.published
+                } : null,
+                bracket: bracketDraw ? {
+                    id: bracketDraw.id,
+                    published: bracketDraw.published,
+                    // Same test EventDetail used to run on the full draw: a bracket
+                    // "exists" if it has rounds OR carries a players/playerPool array.
+                    hasBracket: (() => {
+                        const bd = bracketDraw.bracket_data || {};
+                        const rounds = Array.isArray(bd.rounds) ? bd.rounds : [];
+                        return rounds.length > 0 || Array.isArray(bd.players) || Array.isArray(bd.playerPool);
+                    })(),
+                    // Origin markers only — NOT the rounds/players payload.
+                    bracketData: {
+                        createdFrom: bd?.createdFrom ?? bd?.created_from ?? null,
+                        sourceRound: bd?.sourceRound ?? bd?.source_round ?? null
+                    }
+                } : null
+            });
+        }
+
+        res.json({ success: true, draws });
+    } catch (err) {
+        console.error("GET EVENT DRAWS SUMMARY ERROR:", err);
+        res.status(500).json({ message: "Failed to fetch event draws", error: err.message });
+    }
+};
+
+/**
  * Validate bracket integrity (for Semifinal safety / admin tools)
  * GET /api/admin/events/:id/categories/:categoryId/draw/validate
  * Query: categoryLabel (if no categoryId)

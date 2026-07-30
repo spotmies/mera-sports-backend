@@ -9,6 +9,7 @@ import {
     finalizeByes,
     getCategoryDraw,
     getBulkDrawSummary,
+    getEventDrawsSummary,
     initBracket,
     notifyBracketPromotions,
     publishCategoryDraw,
@@ -26,6 +27,10 @@ const router = express.Router();
 
 // Bulk get draws summary for multiple events
 router.get("/events/draws/summary", verifyAdmin, getBulkDrawSummary);
+
+// All categories' draw summary for ONE event, in a single query.
+// Used by the Draws tab on open instead of one getCategoryDraw per category.
+router.get("/events/:id/draws", verifyAdmin, getEventDrawsSummary);
 
 // Get draw/bracket for category
 router.get("/events/:id/categories/:categoryId/draw", verifyAdmin, getCategoryDraw);
