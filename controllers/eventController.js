@@ -177,10 +177,14 @@ export const getEventDetails = async (req, res) => {
 
         // assigned admins, news and registration stats are independent of each
         // other — fetch them in one parallel batch instead of 3 sequential calls.
-        const [assignedAdmins, { data: newsData }, { data: regStats }] = await Promise.all([
+        const [assignedAdmins, { data: newsData }, { data: regStats }, { count: allRegCount }] = await Promise.all([
             loadAssignedAdminsForEvent(internalEventId),
             supabaseAdmin.from('event_news').select('*').eq('event_id', internalEventId).order('created_at', { ascending: false }),
             supabaseAdmin.from("event_registrations").select("categories, status, team_id, player_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]),
+            // Unfiltered row count — the stats above deliberately skip rejected
+            // registrations, but deletion must consider *every* row it would
+            // cascade away, so the admin UI needs the raw number too.
+            supabaseAdmin.from("event_registrations").select("id", { count: "exact", head: true }).eq("event_id", internalEventId),
         ]);
 
         if (assignedAdmins.length > 0) { 
@@ -248,6 +252,9 @@ export const getEventDetails = async (req, res) => {
         eventData.total_players_count = regStats
             ? new Set(regStats.map(r => r.player_id).filter(Boolean)).size
             : 0;
+        // Every registration row, rejected ones included. The admin hub gates the
+        // "Delete Event" button on this — see the matching guard in deleteEvent().
+        eventData.all_registrations_count = allRegCount || 0;
 
         await cacheSet(cacheKey, eventData, 60); // 60s TTL
         res.json({ success: true, event: eventData });
@@ -471,7 +478,26 @@ export const updateEvent = async (req, res) => {
 export const deleteEvent = async (req, res) => {
     try {
         const { id } = req.params;
-        await supabaseAdmin.from('event_registrations').delete().eq('event_id', id);
+
+        // An event with registrations must never be deleted — the cascade below
+        // would wipe the players' entries and their payment linkage with no
+        // recovery path. The admin UI disables the button, but the 60s event
+        // cache can hand out a stale count and the endpoint is reachable
+        // directly, so this is the authoritative check.
+        const { count: registrationCount, error: countError } = await supabaseAdmin
+            .from('event_registrations')
+            .select('id', { count: 'exact', head: true })
+            .eq('event_id', id);
+        if (countError) throw countError;
+
+        if (registrationCount > 0) {
+            return res.status(409).json({
+                success: false,
+                registrations_count: registrationCount,
+                message: `Cannot delete this event — ${registrationCount} registration${registrationCount === 1 ? '' : 's'} already exist. Remove the registrations first.`,
+            });
+        }
+
         await supabaseAdmin.from('event_news').delete().eq('event_id', id);
         await supabaseAdmin.from('event_brackets').delete().eq('event_id', id);
         const { error } = await supabaseAdmin.from('events').delete().eq('id', id);
@@ -480,7 +506,7 @@ export const deleteEvent = async (req, res) => {
         res.json({ success: true, message: "Event deleted" });
     } catch (err) {
         console.error("Delete Event Error:", err);
-        res.status(500).json({ message: err.message });
+        res.status(500).json({ success: false, message: err.message });
     }
 };
 
