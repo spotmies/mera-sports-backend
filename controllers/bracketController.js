@@ -3504,39 +3504,42 @@ export const recordResult = async (req, res) => {
             return res.status(400).json({ message: "Event ID required" });
         }
 
-        // If categoryId is not a valid UUID, try to look it up by categoryLabel
-        if (!categoryId || !isUuid(categoryId)) {
-            if (!categoryLabel) {
-                return res.status(400).json({ message: "Valid category ID or categoryLabel required" });
-            }
-
-            // Look up the category by eventId and label
-            const { data: category, error: categoryError } = await supabaseAdmin
-                .from("event_categories")
-                .select("id")
-                .eq("event_id", eventId)
-                .eq("label", categoryLabel)
-                .single();
-
-            if (categoryError || !category) {
-                console.error("[recordResult] Category lookup error:", categoryError);
-                return res.status(400).json({ message: `Category "${categoryLabel}" not found for event` });
-            }
-
-            categoryId = category.id;
-            console.log("[recordResult] Resolved categoryLabel to categoryId:", categoryId);
+        if (!categoryId && !categoryLabel) {
+            return res.status(400).json({ message: "Valid category ID or categoryLabel required" });
         }
 
         if (!matchId || !winner) {
             return res.status(400).json({ message: "Missing matchId or winner" });
         }
 
-        // Fetch bracket - select the most recent in case of duplicates
-        const { data: brackets, error: bracketError } = await supabaseAdmin
+        // Fetch bracket - select the most recent in case of duplicates.
+        //
+        // This used to resolve a non-UUID categoryId through a table called
+        // `event_categories` — which does not exist in this schema (categories live
+        // in the events.categories jsonb column). Every category created by the
+        // event form has a numeric-string id, so that lookup ALWAYS failed with
+        // `Category "..." not found for event`, and the bracket's own bracket_data
+        // never received the winner. The matches table still got updated further
+        // down by the scoreboard, which is why BracketRenderer looked correct while
+        // the bracket editor kept showing TBD.
+        //
+        // Resolve the same way every other bracket endpoint does: by category_id
+        // when it is a UUID, otherwise by the stored category label.
+        let bracketQuery = supabaseAdmin
             .from("event_brackets")
             .select("*")
-            .eq("event_id", eventId)
-            .eq("category_id", categoryId)
+            .eq("event_id", eventId);
+
+        if (categoryId && isUuid(categoryId)) {
+            bracketQuery = bracketQuery.eq("category_id", categoryId);
+        } else if (categoryLabel) {
+            bracketQuery = bracketQuery.eq("category", categoryLabel);
+        } else {
+            // Non-UUID id with no label: legacy rows store the id in `category`.
+            bracketQuery = bracketQuery.eq("category", String(categoryId));
+        }
+
+        const { data: brackets, error: bracketError } = await bracketQuery
             .order("created_at", { ascending: false })
             .limit(1);
 
@@ -3590,12 +3593,27 @@ export const recordResult = async (req, res) => {
             updated_at: new Date().toISOString()
         };
 
-        await supabaseAdmin
+        // bracket_match_id ("R1-M1") repeats across every category of an event, so the
+        // category filter is required here. It must accept BOTH keys: matches.category_id
+        // holds either the category id or its label depending on which screen created
+        // the round, and filtering on just one silently updated zero rows.
+        const matchCategoryKeys = Array.from(new Set(
+            [categoryId, categoryLabel, bracket.category_id, bracket.category]
+                .map((v) => (v == null ? "" : String(v).trim()))
+                .filter((v) => v.length > 0)
+        ));
+
+        let matchesUpdateQuery = supabaseAdmin
             .from("matches")
             .update(matchesUpdate)
             .eq("bracket_match_id", matchId)
-            .eq("event_id", eventId)
-            .eq("category_id", categoryId);
+            .eq("event_id", eventId);
+
+        matchesUpdateQuery = matchCategoryKeys.length === 1
+            ? matchesUpdateQuery.eq("category_id", matchCategoryKeys[0])
+            : matchesUpdateQuery.in("category_id", matchCategoryKeys);
+
+        await matchesUpdateQuery;
 
         // Update bracket_data (sync)
         match.winner = winner;
