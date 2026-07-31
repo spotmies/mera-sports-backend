@@ -25,6 +25,7 @@
  */
 
 import { supabaseAdmin } from "../../config/supabaseClient.js";
+import { invalidateMatchesCache } from "../../utils/matchesCache.js";
 import {
     hasRealPlayer,
     isUuid,
@@ -119,6 +120,8 @@ export const recordResult = async (req, res) => {
             .eq("bracket_match_id", matchId)
             .eq("event_id", eventId)
             .eq("category_id", categoryId);
+
+        await invalidateMatchesCache(eventId);
 
         // Update bracket_data (sync)
         match.winner = winner;
@@ -296,6 +299,10 @@ export const syncBracketToMatches = async (bracketData, eventId, categoryId) => 
         }
     } catch (e) {
         console.error("Error syncing bracket to matches:", e);
+    }
+
+    if (stats.updated > 0) {
+        await invalidateMatchesCache(eventId);
     }
 
     return stats;
