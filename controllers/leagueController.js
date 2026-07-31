@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
+import { invalidateMatchesCache } from "../utils/matchesCache.js";
 
 // Simple UUID checker (kept in sync with other controllers)
 const isUuid = (str) => {
@@ -630,6 +631,8 @@ export const deleteLeague = async (req, res) => {
                 }
             }
         }
+
+        await invalidateMatchesCache(eventId);
 
         // Delete the league record
         const { error: deleteError } = await supabaseAdmin

@@ -19,6 +19,7 @@ import fs from 'fs';
 import path from 'path';
 import { supabaseAdmin } from "../../config/supabaseClient.js";
 import { inferRoundLabelFromMatchCount, isUuid, makeEmptyMatch } from "./bracketHelpers.js";
+import { invalidateMatchesCache } from "../../utils/matchesCache.js";
 
 /**
  * Compute next power of two >= n (used for full bracket sizing)
@@ -722,6 +723,8 @@ export const createFullBracketStructure = async (req, res) => {
                 console.error("START ROUNDS - matches insert warning:", insertError);
             }
         }
+
+        await invalidateMatchesCache(eventId);
 
         return res.status(200).json({
             success: true,

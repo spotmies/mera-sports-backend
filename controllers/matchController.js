@@ -1,6 +1,13 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { validateBracketIntegrity } from "../middleware/bracketValidation.js";
 import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import {
+    MATCHES_CACHE_TTL,
+    invalidateMatchesCache,
+    matchesCacheKey,
+    matchesResolveKey,
+} from "../utils/matchesCache.js";
 
 // Helper function to check if string is UUID
 const isUuid = (str) => {
@@ -338,6 +345,7 @@ export const generateMatchesFromBracket = async (req, res) => {
             }
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Processed matches. Created/Updated: ${createdCount}, Skipped (no ID): ${skippedCount}, Updated (player changes): ${updatedCount}`,
@@ -464,6 +472,7 @@ export const updateRoundSelectedSets = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: "Selected sets updated for round",
@@ -878,6 +887,7 @@ export const generateLeagueMatches = async (req, res) => {
         }
 
         if (toInsert.length === 0) {
+        await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "League matches already generated for all participant pairs",
@@ -1100,6 +1110,7 @@ export const createMatch = async (req, res) => {
             throw error;
         }
 
+        await invalidateMatchesCache(data?.event_id);
         return res.status(201).json({ success: true, match: data });
 
     } catch (error) {
@@ -1245,6 +1256,11 @@ export const createMatchesBulk = async (req, res) => {
         if (error) {
             console.error("Bulk Create Matches Insert Error:", error);
             throw error;
+        }
+
+        // A bulk payload can in principle span events; purge every one it touched.
+        for (const insertedEventId of new Set((data || []).map(m => m?.event_id).filter(Boolean))) {
+            await invalidateMatchesCache(insertedEventId);
         }
 
         return res.status(201).json({
@@ -1659,6 +1675,7 @@ export const updateMatchScore = async (req, res) => {
 
         if (error) throw error;
 
+        await invalidateMatchesCache(data?.event_id);
         return res.status(200).json({ success: true, match: data });
 
     } catch (error) {
@@ -2459,6 +2476,7 @@ export const finalizeRoundMatches = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: skippedMatches.length > 0
@@ -2523,6 +2541,7 @@ export const deleteMatch = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(data[0]?.event_id);
         return res.status(200).json({
             success: true,
             message: "Match deleted successfully",
@@ -2563,6 +2582,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
+        await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2629,6 +2649,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (matchesToDelete.length === 0) {
+        await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found matching the specified category",
@@ -2655,6 +2676,7 @@ export const deleteCategoryMatches = async (req, res) => {
             deletedCount += deletedData?.length || 0;
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Deleted ${deletedCount} match(es) for this category`,
@@ -2696,6 +2718,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
+        await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2751,6 +2774,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!matchesToUpdate || matchesToUpdate.length === 0) {
+        await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found to clear scores for this category/round",
@@ -2781,6 +2805,7 @@ export const clearCategoryScores = async (req, res) => {
             updatedCount += Array.isArray(updated) ? updated.length : 0;
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Cleared scores for ${updatedCount} match(es)`,
@@ -2808,7 +2833,16 @@ export const getPublicMatches = async (req, res) => {
         });
     }
 
-    const eventId = await resolveEventIdByIdentifier(eventIdentifier);
+    // Identifier -> internal id. Cached because the mapping is immutable and
+    // resolving a public identifier costs up to two sequential `events` lookups
+    // that would otherwise be paid even on a cache hit.
+    let eventId = await cacheGet(matchesResolveKey(eventIdentifier));
+    if (!eventId) {
+        eventId = await resolveEventIdByIdentifier(eventIdentifier);
+        if (eventId) {
+            void cacheSet(matchesResolveKey(eventIdentifier), eventId, MATCHES_CACHE_TTL);
+        }
+    }
     if (!eventId) {
         return res.status(404).json({ success: false, message: "Event not found" });
     }
@@ -2816,6 +2850,24 @@ export const getPublicMatches = async (req, res) => {
     // 🔒 LEAGUE GOLDEN RULE: For LEAGUE matches, category_id is mandatory and exact
     // No bracket lookup. No label guessing. No partial matching.
     const isLeagueRequest = roundName === 'LEAGUE' || round_name === 'LEAGUE';
+
+    // Cache scope must name every input that changes the result set, so two
+    // different queries can never collide on one key.
+    const cacheScope = isLeagueRequest
+        ? `league:${categoryId || ''}`
+        : categoryId
+            ? `cat:${categoryId}|${categoryName || ''}`
+            : categoryName
+                ? `name:${categoryName}`
+                : 'all';
+    const cacheKey = matchesCacheKey(eventId, cacheScope);
+
+    const cachedPayload = await cacheGet(cacheKey);
+    if (cachedPayload) {
+        console.log(`[matches] cache HIT  ${cacheKey}`);
+        return res.status(200).json(cachedPayload);
+    }
+    console.log(`[matches] cache MISS ${cacheKey}`);
 
     try {
         // 🔒 LEAGUE MODE: HARD-ISOLATE AT QUERY LEVEL (CRITICAL)
@@ -2861,98 +2913,83 @@ export const getPublicMatches = async (req, res) => {
                 throw leagueError;
             }
 
-            return res.status(200).json({
-                success: true,
-                matches: leagueMatches || []
-            });
+            const leaguePayload = { success: true, matches: leagueMatches || [] };
+            void cacheSet(cacheKey, leaguePayload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+            return res.status(200).json(leaguePayload);
         }
 
-        // For non-LEAGUE requests, fetch all matches (existing logic for knockout brackets)
-        let query = supabaseAdmin
-            .from('matches')
-            .select('id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
-            .eq('event_id', eventId)
-            .order('round_name', { ascending: true })
-            .order('match_index', { ascending: true });
+        // ---------------------------------------------------------------
+        // NON-LEAGUE (knockout / bracket) PATH
+        //
+        // Previously this fetched EVERY match in the event and filtered them
+        // in JS. Two things were wrong with that:
+        //
+        //   1. It transferred the whole event. On the largest QA event that is
+        //      269 rows / 122KB to return 148 rows / 70KB, and it forced a
+        //      Seq Scan (521 rows discarded) where an index exists.
+        //   2. When categoryId was supplied it first ran up to three
+        //      event_brackets lookups plus one events lookup to widen the set
+        //      of accepted category keys -- and then rebuilt that set to hold
+        //      nothing but categoryId (and categoryName when given). Those
+        //      round trips could not affect the response.
+        //
+        // So: work out the accepted keys FIRST, then let Postgres do the
+        // filtering on idx_matches_event_category. Same rows, same order,
+        // same response shape.
+        // ---------------------------------------------------------------
+        const matchSelect = 'id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id';
 
-        const { data: allMatches, error: queryError } = await query;
-
-        if (queryError) {
-            throw queryError;
-        }
-
-        // If no category filter, return all matches
+        // No category filter: the caller genuinely wants the whole event.
         if (!categoryId && !categoryName) {
-            return res.status(200).json({ success: true, matches: allMatches || [] });
+            const { data: allMatches, error: allError } = await supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (allError) {
+                throw allError;
+            }
+
+            const allPayload = { success: true, matches: allMatches || [] };
+            void cacheSet(cacheKey, allPayload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+            return res.status(200).json(allPayload);
         }
 
-        // Try to find matching category IDs from event_brackets
-        // This handles cases where category_id in matches might differ from what frontend sends
-        let matchingCategoryIds = new Set();
+        const matchingCategoryIds = new Set();
 
         if (categoryId) {
+            // Exact keys only. This is what the old code narrowed down to after
+            // its lookups, so the lookups are skipped rather than reproduced.
             matchingCategoryIds.add(categoryId);
-        }
+            if (categoryName) matchingCategoryIds.add(categoryName);
+        } else {
+            // categoryName-only fallback: matches.category_id is not written
+            // consistently (sometimes the category's id, sometimes its display
+            // label), so here the widening lookups DO change the result and are
+            // kept exactly as they were.
+            matchingCategoryIds.add(categoryName);
 
-        // Also check event_brackets to find what category_id was used when creating matches
-        if (categoryName || categoryId) {
-            // Try to match by category name/label
-            if (categoryName) {
-                // Try exact match
-                const { data: exactBrackets } = await supabaseAdmin
+            const [{ data: exactBrackets }, { data: eventData }] = await Promise.all([
+                supabaseAdmin
                     .from('event_brackets')
                     .select('category_id, category')
                     .eq('event_id', eventId)
-                    .eq('category', categoryName);
+                    .eq('category', categoryName),
+                supabaseAdmin
+                    .from('events')
+                    .select('categories')
+                    .eq('id', eventId)
+                    .single(),
+            ]);
 
-                if (exactBrackets && exactBrackets.length > 0) {
-                    exactBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
+            if (exactBrackets && exactBrackets.length > 0) {
+                exactBrackets.forEach(b => {
+                    if (b.category_id) matchingCategoryIds.add(b.category_id);
+                    if (b.category) matchingCategoryIds.add(b.category);
+                });
             }
-
-            // If categoryId provided, check brackets by category_id
-            if (categoryId) {
-                const { data: idBrackets } = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('category_id, category')
-                    .eq('event_id', eventId)
-                    .eq('category_id', categoryId);
-
-                if (idBrackets && idBrackets.length > 0) {
-                    idBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
-
-                // If categoryId is not a UUID, also try matching as category name
-                if (!isUuid(categoryId)) {
-                    const { data: nameBrackets } = await supabaseAdmin
-                        .from('event_brackets')
-                        .select('category_id, category')
-                        .eq('event_id', eventId)
-                        .eq('category', categoryId);
-
-                    if (nameBrackets && nameBrackets.length > 0) {
-                        nameBrackets.forEach(b => {
-                            if (b.category_id) matchingCategoryIds.add(b.category_id);
-                            if (b.category) matchingCategoryIds.add(b.category);
-                        });
-                    }
-                }
-            }
-        }
-
-        // Also check event categories to find matching IDs
-        if (categoryId || categoryName) {
-            const { data: eventData } = await supabaseAdmin
-                .from('events')
-                .select('categories')
-                .eq('id', eventId)
-                .single();
 
             if (eventData && eventData.categories) {
                 const categories = Array.isArray(eventData.categories)
@@ -2963,24 +3000,13 @@ export const getPublicMatches = async (req, res) => {
                     if (typeof cat === 'object' && cat !== null) {
                         const catId = cat.id || cat.category_id;
                         const catName = cat.category || cat.name || cat.rawName;
-
-                        // If categoryId matches
-                        if (categoryId && (catId === categoryId || catName === categoryId)) {
-                            if (catId) matchingCategoryIds.add(catId);
-                            if (catName) matchingCategoryIds.add(catName);
-                        }
-
-                        // If categoryName matches - use EXACT match only to avoid cross-category issues
-                        if (categoryName) {
-                            const fullLabel = catName + (cat.gender ? ` - ${cat.gender}` : '') + (cat.match_type ? ` - ${cat.match_type}` : '');
-                            // Only exact match - don't use includes() as it causes U-15 Male to match U-15 Female
-                            if (fullLabel === categoryName || categoryName === fullLabel) {
-                                if (catId) matchingCategoryIds.add(catId);
-                            }
+                        // Exact match only - includes() would make U-15 Male match U-15 Female.
+                        const fullLabel = catName + (cat.gender ? ` - ${cat.gender}` : '') + (cat.match_type ? ` - ${cat.match_type}` : '');
+                        if (fullLabel === categoryName && catId) {
+                            matchingCategoryIds.add(catId);
                         }
                     } else if (typeof cat === 'string') {
-                        // Exact match only for string categories
-                        if (categoryId === cat || categoryName === cat) {
+                        if (categoryName === cat) {
                             matchingCategoryIds.add(cat);
                         }
                     }
@@ -2988,66 +3014,58 @@ export const getPublicMatches = async (req, res) => {
             }
         }
 
-        // CRITICAL: Only use exact categoryId match to prevent cross-category matches
-        // The problem: Adding base names like "U-15" causes all U-15 variants to match
-        // Solution: Only match the exact categoryId that was selected
-        if (categoryId) {
-            // Always prioritize exact categoryId - this is the most reliable
-            matchingCategoryIds.add(categoryId);
+        // Postgres does the filtering now (idx_matches_event_category). Rows with
+        // a NULL category_id never match, which is the same exclusion the old JS
+        // filter applied.
+        //
+        // One caveat: postgrest-js quotes values containing commas/spaces inside
+        // an in.(...) list but does NOT escape an embedded double quote, which
+        // would build a malformed filter. Category labels are admin-entered, so
+        // rather than risk a silently wrong query we detect that case and fall
+        // back to the original fetch-all-and-filter-in-JS behaviour.
+        const categoryKeys = Array.from(matchingCategoryIds);
+        const inListIsSafe = categoryKeys.every(key => !/["\\]/.test(String(key)));
+
+        let filteredMatches;
+
+        if (categoryKeys.length === 1 || inListIsSafe) {
+            let filterQuery = supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId);
+
+            // eq() carries the value in its own parameter, so it is safe for any label.
+            filterQuery = categoryKeys.length === 1
+                ? filterQuery.eq('category_id', categoryKeys[0])
+                : filterQuery.in('category_id', categoryKeys);
+
+            const { data, error: filteredError } = await filterQuery
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (filteredError) {
+                throw filteredError;
+            }
+            filteredMatches = data || [];
+        } else {
+            const { data: allMatches, error: allError } = await supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (allError) {
+                throw allError;
+            }
+            filteredMatches = (allMatches || []).filter(
+                match => match.category_id && matchingCategoryIds.has(match.category_id)
+            );
         }
 
-        // Add exact categoryName as well (in case category_id stores the name)
-        if (categoryName) {
-            matchingCategoryIds.add(categoryName);
-        }
-
-        // Filter out any matches that don't match the exact categoryId
-        // This prevents showing matches from other categories (e.g., U-15 Female when selecting U-15 Male)
-        if (categoryId) {
-            const filteredSet = new Set();
-
-            // Keep exact categoryId
-            if (matchingCategoryIds.has(categoryId)) {
-                filteredSet.add(categoryId);
-            }
-
-            // Keep exact categoryName
-            if (categoryName && matchingCategoryIds.has(categoryName)) {
-                filteredSet.add(categoryName);
-            }
-
-            // Keep bracket category_ids that match exactly
-            matchingCategoryIds.forEach(id => {
-                // Only keep if it's the exact categoryId or exact categoryName
-                if (id === categoryId || id === categoryName) {
-                    filteredSet.add(id);
-                }
-            });
-
-            // Only replace if we have matches (don't empty the set if we found some)
-            if (filteredSet.size > 0) {
-                matchingCategoryIds = filteredSet;
-            }
-        }
-
-        // Filter matches by any of the matching category IDs
-        // CRITICAL: Only show matches that exactly match the selected categoryId
-        const filteredMatches = (allMatches || []).filter(match => {
-            if (!match.category_id) {
-                return false;
-            }
-
-            // Primary check: exact categoryId match
-            const exactMatch = match.category_id === categoryId;
-
-            // Secondary check: check if it's in our matching set (from brackets/events)
-            const inMatchingSet = matchingCategoryIds.has(match.category_id);
-
-            // Only include if it's an exact match OR it's in our validated matching set
-            return exactMatch || inMatchingSet;
-        });
-
-        return res.status(200).json({ success: true, matches: filteredMatches });
+        const payload = { success: true, matches: filteredMatches || [] };
+        void cacheSet(cacheKey, payload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+        return res.status(200).json(payload);
 
     } catch (error) {
         console.error("Get Public Matches Error:", error);

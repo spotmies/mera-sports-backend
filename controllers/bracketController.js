@@ -2,6 +2,7 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { validateBracketIntegrity } from "../middleware/bracketValidation.js";
 import { createNotification } from "../services/notificationService.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { invalidateMatchesCache } from "../utils/matchesCache.js";
 
 // Simple UUID v4 validator (relaxed - checks standard 36-char UUID format)
 const isUuid = (value) => {
@@ -1257,6 +1258,7 @@ export const createFullBracketStructure = async (req, res) => {
             }
         }
 
+        await invalidateMatchesCache(eventId);
         return res.json({
             success: true,
             bracket: updatedBracket,
@@ -1669,6 +1671,7 @@ export const updateBracketMatch = async (req, res) => {
 
             if (error) throw error;
 
+            await invalidateMatchesCache(eventId);
             return res.json({
                 success: true,
                 bracket: data,
@@ -2888,6 +2891,7 @@ export const deleteCategoryBracket = async (req, res) => {
         if (deleteError) throw deleteError;
 
         console.log("[deleteCategoryBracket] Deleted", bracketIds.length, "bracket(s) for category", categoryId || categoryLabel);
+        await invalidateMatchesCache(eventId);
         return res.json({ success: true, message: `Deleted ${bracketIds.length} bracket(s) successfully` });
     } catch (err) {
         console.error("DELETE BRACKET ERROR:", err);
@@ -3060,6 +3064,7 @@ export const deleteBracketRound = async (req, res) => {
             ? `Round "${deletedRoundName}" deleted successfully. ${deletedMatchCount} match(es) removed from scoreboard.`
             : `Round "${deletedRoundName}" deleted successfully. No matches found for this round.`;
 
+        await invalidateMatchesCache(eventId);
         return res.json({
             success: true,
             bracket: data,
@@ -3639,6 +3644,7 @@ export const recordResult = async (req, res) => {
 
         if (updateError) throw updateError;
 
+        await invalidateMatchesCache(eventId);
         return res.json({
             success: true,
             message: "Result recorded successfully",

@@ -2,6 +2,7 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
+import { invalidateMatchesCache } from "../utils/matchesCache.js";
 
 // Fire-and-forget WhatsApp status update to the registration's player
 const notifyRegistrationStatusWhatsApp = (playerId, eventName, registrationNo, status) => {
@@ -513,6 +514,7 @@ export const deleteBracket = async (req, res) => {
             .eq("id", bracketId);
 
         if (deleteBracketError) throw deleteBracketError;
+        await invalidateMatchesCache(eventId);
         res.json({ success: true, message: "Bracket and related matches deleted" });
     } catch (err) {
         console.error("DELETE BRACKET ERROR:", err);
