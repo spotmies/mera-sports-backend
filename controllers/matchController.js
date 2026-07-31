@@ -2153,19 +2153,6 @@ export const finalizeRoundMatches = async (req, res) => {
                 bracketRows = r2.data;
                 bracketErr = r2.error;
 
-                // Partial match fallback (matches getCategoryDraw behavior)
-                if ((!bracketRows || bracketRows.length === 0) && categoryName) {
-                    const baseCategory = String(categoryName).split(" - ").filter(p => String(p).trim())[0] || String(categoryName);
-                    const r3 = await supabaseAdmin
-                        .from('event_brackets')
-                        .select('*')
-                        .eq('event_id', eventId)
-                        .eq('mode', 'BRACKET')
-                        .ilike('category', `%${baseCategory}%`)
-                        .order('created_at', { ascending: true });
-                    bracketRows = r3.data;
-                    bracketErr = r3.error;
-                }
             }
 
             if (!bracketErr && bracketRows && bracketRows.length > 0) {
@@ -2920,21 +2907,6 @@ export const getPublicMatches = async (req, res) => {
 
                 if (exactBrackets && exactBrackets.length > 0) {
                     exactBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
-
-                // Try partial match (in case categoryName is a full label like "U-11 - Male - Singles")
-                const baseCategoryName = categoryName.split(' - ')[0]; // Get "U-11" from "U-11 - Male - Singles"
-                const { data: partialBrackets } = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('category_id, category')
-                    .eq('event_id', eventId)
-                    .ilike('category', `%${baseCategoryName}%`);
-
-                if (partialBrackets && partialBrackets.length > 0) {
-                    partialBrackets.forEach(b => {
                         if (b.category_id) matchingCategoryIds.add(b.category_id);
                         if (b.category) matchingCategoryIds.add(b.category);
                     });

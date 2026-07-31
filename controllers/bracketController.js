@@ -283,44 +283,6 @@ export const getCategoryDraw = async (req, res) => {
 
         let { data, error } = await query.order("created_at", { ascending: true });
 
-        // If no exact match and categoryLabel provided, try partial matching
-        // IMPORTANT: Only match when the base category name matches the START of the stored
-        // category label, to avoid cross-category contamination (e.g., "U-1" matching "U-14")
-        if ((!data || data.length === 0) && categoryLabel && !categoryId) {
-            const labelParts = categoryLabel.split(" - ").filter(p => p.trim());
-            if (labelParts.length > 0) {
-                const baseCategory = labelParts[0]; // e.g., "U-11 (Male)" or "U-11"
-                // Use prefix match (baseCategory%) instead of substring match (%baseCategory%)
-                // to prevent "U-1" from matching "U-14", "U-17", etc.
-                const { data: partialData, error: partialError } = await supabaseAdmin
-                    .from("event_brackets")
-                    .select("*")
-                    .eq("event_id", eventId)
-                    .ilike("category", `${baseCategory}%`)
-                    .order("created_at", { ascending: true });
-
-                if (!partialError && partialData && partialData.length > 0) {
-                    // If multiple results, try to find the one that best matches the full label
-                    if (partialData.length === 1) {
-                        data = partialData;
-                        error = null;
-                    } else {
-                        // Multiple partial matches — only use if we can narrow down to exactly one
-                        // by comparing more label parts (gender, matchType)
-                        const exactishMatch = partialData.filter(row => {
-                            const storedLabel = (row.category || "").toLowerCase();
-                            return labelParts.every(part => storedLabel.includes(part.toLowerCase()));
-                        });
-                        if (exactishMatch.length > 0) {
-                            data = exactishMatch;
-                            error = null;
-                        }
-                        // If still ambiguous, don't use partial match to avoid cross-category contamination
-                    }
-                }
-            }
-        }
-
         if (error) throw error;
 
         // Group by mode - prioritize BRACKET over MEDIA if both exist
