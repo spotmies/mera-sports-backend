@@ -2,6 +2,8 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheGet, cacheSet } from "../config/redisClient.js";
+import { dashboardCacheKey, DASHBOARD_CACHE_TTL, invalidateDashboardCache } from "../utils/dashboardCache.js";
 import { resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
@@ -11,6 +13,15 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 export const getPlayerDashboard = async (req, res) => {
     try {
         const userId = req.user.id;
+
+        const dashboardKey = dashboardCacheKey(userId);
+        const cachedDashboard = await cacheGet(dashboardKey);
+        if (cachedDashboard) {
+            console.log(`[dashboard] cache HIT  ${dashboardKey}`);
+            return res.json(cachedDashboard);
+        }
+        console.log(`[dashboard] cache MISS ${dashboardKey}`);
+
         const { data: player, error } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
         if (error) throw error;
         if (!player) return res.status(404).json({ message: "Player not found" });
@@ -102,12 +113,16 @@ export const getPlayerDashboard = async (req, res) => {
             };
         });
 
-        res.json({
+        const payload = {
             success: true,
             // age recomputed from dob so the client never sees a stale value
             player: withResolvedAge(player),
             registrations: detailedRegistrations
-        });
+        };
+
+        // Fire-and-forget: a cache write must not delay the response.
+        void cacheSet(dashboardKey, payload, DASHBOARD_CACHE_TTL);
+        res.json(payload);
 
     } catch (err) {
         console.error("DASHBOARD ERROR:", err);
@@ -206,6 +221,7 @@ export const updateProfile = async (req, res) => {
         const { data: updatedPlayer, error } = await supabaseAdmin.from("users").update(updates).eq("id", userId).select();
         if (error) throw error;
 
+        await invalidateDashboardCache(userId);
         res.json({ success: true, player: withResolvedAge(updatedPlayer?.[0] || updates), message: "Profile updated" });
 
     } catch (err) {
@@ -246,6 +262,7 @@ export const changePassword = async (req, res) => {
         }
         const { error } = await supabaseAdmin.from("users").update({ password: hashedNewPassword }).eq("id", req.user.id);
         if (error) throw error;
+        await invalidateDashboardCache(userId);
         res.json({ success: true, message: "Password updated" });
     } catch (err) { res.status(500).json({ message: "Failed to change password" }); }
 };
@@ -261,6 +278,7 @@ export const deleteAccount = async (req, res) => {
         const { error } = await supabaseAdmin.from("users").delete().eq("id", userId);
 
         if (error) throw error;
+        await invalidateDashboardCache(userId);
         res.json({ success: true, message: "Account deleted" });
     } catch (err) {
         console.error("DELETE ACCOUNT ERROR:", err);
@@ -385,6 +403,7 @@ export const addFamilyMember = async (req, res) => {
             throw relError;
         }
 
+        await invalidateDashboardCache(userId);
         res.json({
             success: true,
             familyMember: {
@@ -478,6 +497,7 @@ export const updateFamilyMember = async (req, res) => {
                 .eq("id", relRecord.id);
         }
 
+        await invalidateDashboardCache(userId);
         res.json({
             success: true,
             familyMember: {
@@ -528,10 +548,12 @@ export const deleteFamilyMember = async (req, res) => {
         if (mode === 'full') {
             // Delete the user entirely
             await supabaseAdmin.from("users").delete().eq("id", familyMemberId);
+            await invalidateDashboardCache(userId);
             res.json({ success: true, message: "Family member removed and account deleted" });
         } else {
             // Unlink — clear mobile so they operate independently
             await supabaseAdmin.from("users").update({ mobile: null }).eq("id", familyMemberId);
+            await invalidateDashboardCache(userId);
             res.json({ success: true, message: "Family member unlinked. They can now operate independently." });
         }
     } catch (err) {

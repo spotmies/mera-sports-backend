@@ -91,16 +91,59 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
     return results.some(({ data }) => Array.isArray(data) && data.length > 0);
 };
 
+/**
+ * Columns the public events list actually serves.
+ *
+ * Replaces `select("*")`, which shipped all 31 event columns — including
+ * qr_code, payment_qr_image and upi_id, i.e. payment credentials, on an
+ * unauthenticated endpoint. Everything listed here is read by a consumer;
+ * anything not listed had no reader. Add a column here if a client needs it.
+ */
+const PUBLIC_EVENT_LIST_COLUMNS = [
+    "id",
+    "public_id",
+    "name",
+    "sport",
+    "location",
+    "venue",
+    "start_date",
+    "end_date",
+    "start_time",
+    "banner_url",
+    "categories",
+    "created_at",
+].join(", ");
+
+/** Public events list cache lifetime, seconds. Override with EVENTS_LIST_CACHE_TTL_SECONDS. */
+const EVENTS_LIST_CACHE_TTL = Number(process.env.EVENTS_LIST_CACHE_TTL_SECONDS || 300);
+
+/**
+ * Cache key. The endpoint takes no page/filter/search/sort parameters — the
+ * client fetches the list once and filters, sorts and paginates in memory — so
+ * there is exactly one response variant and the key is a constant. Parameter
+ * segments would be dead weight here; add them only if the endpoint ever grows
+ * real query parameters.
+ */
+const EVENTS_LIST_CACHE_KEY = "public:events:list";
+
 // GET /api/public/events/list
 export const listPublicEvents = async (_req, res) => {
     try {
         // Cache-aside: serve the public events list from Redis when warm.
-        const cached = await cacheGet("public:events:list");
-        if (cached) return res.json({ success: true, events: cached });
+        const cached = await cacheGet(EVENTS_LIST_CACHE_KEY);
+        if (cached) {
+            console.log(`[events:list] cache HIT  ${EVENTS_LIST_CACHE_KEY}`);
+            return res.json({ success: true, events: cached });
+        }
+        console.log(`[events:list] cache MISS ${EVENTS_LIST_CACHE_KEY}`);
 
+        // The dropped `event_registrations(count)` embed made PostgREST run a
+        // correlated count per event — 17 sequential scans of an event_registrations
+        // table that has no index on event_id (1088 shared buffers vs ~30 without).
+        // No consumer read the result.
         const { data, error } = await supabaseAdmin
             .from("events")
-            .select("*, event_registrations(count)")
+            .select(PUBLIC_EVENT_LIST_COLUMNS)
             .order("start_date", { ascending: true });
 
         if (error) throw error;
@@ -115,7 +158,7 @@ export const listPublicEvents = async (_req, res) => {
             };
         });
 
-        await cacheSet("public:events:list", events, 60); // 60s TTL
+        await cacheSet(EVENTS_LIST_CACHE_KEY, events, EVENTS_LIST_CACHE_TTL);
         return res.json({ success: true, events });
     } catch (err) {
         console.error("PUBLIC EVENTS LIST ERROR:", err);
