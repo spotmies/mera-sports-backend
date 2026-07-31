@@ -2823,7 +2823,7 @@ export const clearCategoryScores = async (req, res) => {
 // Get Matches (Scoreboard) - Public version (no auth required)
 export const getPublicMatches = async (req, res) => {
     const eventIdentifier = req.params.id || req.params.eventId; // Support both :id and :eventId routes
-    const { categoryId, categoryName, roundName, round_name } = req.query;
+    const { categoryId, categoryName, roundName, round_name, bracketId } = req.query;
 
     if (!eventIdentifier) {
         return res.status(400).json({
@@ -2853,13 +2853,15 @@ export const getPublicMatches = async (req, res) => {
 
     // Cache scope must name every input that changes the result set, so two
     // different queries can never collide on one key.
-    const cacheScope = isLeagueRequest
-        ? `league:${categoryId || ''}`
-        : categoryId
-            ? `cat:${categoryId}|${categoryName || ''}`
-            : categoryName
-                ? `name:${categoryName}`
-                : 'all';
+    const cacheScope = bracketId
+        ? `bracket:${bracketId}`
+        : isLeagueRequest
+            ? `league:${categoryId || ''}`
+            : categoryId
+                ? `cat:${categoryId}|${categoryName || ''}`
+                : categoryName
+                    ? `name:${categoryName}`
+                    : 'all';
     const cacheKey = matchesCacheKey(eventId, cacheScope);
 
     const cachedPayload = await cacheGet(cacheKey);
@@ -2870,6 +2872,27 @@ export const getPublicMatches = async (req, res) => {
     console.log(`[matches] cache MISS ${cacheKey}`);
 
     try {
+        // ── BRACKET-ID FAST PATH ────────────────────────────────────────────
+        // When the caller supplies a bracketId (UUID of an event_brackets row)
+        // we can skip all category-id guessing and fetch by bracket_id directly.
+        // This is the most precise filter and works even when matches were stored
+        // under a different category_id than the league category.
+        if (bracketId && isUuid(bracketId)) {
+            const { data: bracketMatches, error: bracketMatchError } = await supabaseAdmin
+                .from('matches')
+                .select('id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
+                .eq('event_id', eventId)
+                .eq('bracket_id', bracketId)
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (bracketMatchError) throw bracketMatchError;
+
+            const bracketPayload = { success: true, matches: bracketMatches || [] };
+            void cacheSet(cacheKey, bracketPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(bracketPayload);
+        }
+
         // 🔒 LEAGUE MODE: HARD-ISOLATE AT QUERY LEVEL (CRITICAL)
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
