@@ -2511,6 +2511,13 @@ export const publishCategoryDraw = async (req, res) => {
             resultData = data;
         }
 
+        // The public matches endpoint now filters on the bracket's `published`
+        // flag, and it caches its responses. Without this, publishing a draw
+        // would leave players looking at an empty bracket until the cache aged
+        // out (MATCHES_CACHE_TTL, 5 minutes by default) — and unpublishing would
+        // keep serving it for just as long.
+        await invalidateMatchesCache(eventId);
+
         res.json({
             success: true,
             message: published ? "Draw published successfully" : "Draw unpublished",

@@ -99,6 +99,27 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
     return anyPublished;
 };
 
+/**
+ * The brackets of an event that are published, i.e. visible to the public.
+ *
+ * Every row in `matches` carries a `bracket_id` (812/812 in QA), so the bracket
+ * row's own `published` flag is an exact gate for its matches — no category-key
+ * guessing required, which matters because that key is not written consistently.
+ *
+ * Returns null when the event has nothing published, so callers can short-circuit
+ * to an empty list rather than build an `in.()` filter on an empty array.
+ */
+const getPublishedBracketIds = async (eventId) => {
+    const { data, error } = await supabaseAdmin
+        .from('event_brackets')
+        .select('id')
+        .eq('event_id', eventId)
+        .eq('published', true);
+    if (error) throw error;
+    const ids = (data || []).map((row) => row.id).filter(Boolean);
+    return ids.length > 0 ? ids : null;
+};
+
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
     // Clamp the fallback itself so callers can't accidentally pass an out-of-range default.
     const safeFallback = Number.isInteger(fallback) && fallback >= 1 && fallback <= MAX_SETS_PER_MATCH
@@ -2786,7 +2807,15 @@ export const clearCategoryScores = async (req, res) => {
 // Get Matches (Scoreboard) - Public version (no auth required)
 export const getPublicMatches = async (req, res) => {
     const eventIdentifier = req.params.id || req.params.eventId; // Support both :id and :eventId routes
-    const { categoryId, categoryName, roundName, round_name } = req.query;
+    // `bracketId` is the most precise filter there is — one bracket row owns its
+    // matches outright, whatever key they ended up with in `category_id`. It was
+    // NOT read here, only by the admin getMatches, so a caller that sent it (the
+    // public league view's bracket overlay does) supplied no category either and
+    // fell through to "no filter = the whole event". The bracket then rendered
+    // every other category's matches: a U-15 Singles draw showing U-17 doubles
+    // pairs.
+    const { categoryId, categoryName, roundName, round_name, bracketId } = req.query;
+    const bracketFilter = bracketId == null ? "" : String(bracketId).trim();
 
     if (!eventIdentifier) {
         return res.status(400).json({
@@ -2815,14 +2844,18 @@ export const getPublicMatches = async (req, res) => {
     const isLeagueRequest = roundName === 'LEAGUE' || round_name === 'LEAGUE';
 
     // Cache scope must name every input that changes the result set, so two
-    // different queries can never collide on one key.
+    // different queries can never collide on one key. `bracketId` narrows the
+    // result, so leaving it out would have let a bracket-scoped response be
+    // served from — or written over — the whole-event 'all' entry.
     const cacheScope = isLeagueRequest
         ? `league:${categoryId || ''}`
-        : categoryId
-            ? `cat:${categoryId}|${categoryName || ''}`
-            : categoryName
-                ? `name:${categoryName}`
-                : 'all';
+        : bracketFilter
+            ? `bracket:${bracketFilter}|${categoryId || ''}|${categoryName || ''}`
+            : categoryId
+                ? `cat:${categoryId}|${categoryName || ''}`
+                : categoryName
+                    ? `name:${categoryName}`
+                    : 'all';
     const cacheKey = matchesCacheKey(eventId, cacheScope);
 
     const cachedPayload = await cacheGet(cacheKey);
@@ -2902,12 +2935,63 @@ export const getPublicMatches = async (req, res) => {
         // ---------------------------------------------------------------
         const matchSelect = 'id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id';
 
-        // No category filter: the caller genuinely wants the whole event.
+        // THIS IS A PUBLIC ENDPOINT — nothing unpublished may leave it.
+        //
+        // The LEAGUE path above has always checked publication; these knockout
+        // paths never did, so an anonymous caller could read draws the admin had
+        // not released yet (497 of 812 match rows in QA belong to unpublished
+        // brackets). Resolve the published set once and gate every branch below
+        // on it.
+        const publishedBracketIds = await getPublishedBracketIds(eventId);
+        if (!publishedBracketIds) {
+            const emptyPayload = { success: true, matches: [] };
+            void cacheSet(cacheKey, emptyPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(emptyPayload);
+        }
+
+        // Bracket-scoped request. `bracket_id` is a foreign key to the bracket row
+        // that owns these matches, so it is exact on its own — no category widening
+        // and no label guessing. It is checked BEFORE the whole-event branch below,
+        // which is the branch a bracketId-only request used to land in.
+        if (bracketFilter) {
+            // An unpublished bracket is simply not visible here.
+            if (!publishedBracketIds.includes(bracketFilter)) {
+                const hiddenPayload = { success: true, matches: [] };
+                void cacheSet(cacheKey, hiddenPayload, MATCHES_CACHE_TTL);
+                return res.status(200).json(hiddenPayload);
+            }
+
+            let bracketQuery = supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .eq('bracket_id', bracketFilter);
+
+            // A category, when supplied alongside, only narrows further.
+            if (categoryId) bracketQuery = bracketQuery.eq('category_id', categoryId);
+            if (roundName) bracketQuery = bracketQuery.eq('round_name', roundName);
+
+            const { data: bracketMatches, error: bracketMatchError } = await bracketQuery
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (bracketMatchError) {
+                throw bracketMatchError;
+            }
+
+            const bracketPayload = { success: true, matches: bracketMatches || [] };
+            void cacheSet(cacheKey, bracketPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(bracketPayload);
+        }
+
+        // No category filter: the caller genuinely wants the whole event —
+        // restricted to what has actually been published.
         if (!categoryId && !categoryName) {
             const { data: allMatches, error: allError } = await supabaseAdmin
                 .from('matches')
                 .select(matchSelect)
                 .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
                 .order('round_name', { ascending: true })
                 .order('match_index', { ascending: true });
 
@@ -2995,7 +3079,8 @@ export const getPublicMatches = async (req, res) => {
             let filterQuery = supabaseAdmin
                 .from('matches')
                 .select(matchSelect)
-                .eq('event_id', eventId);
+                .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds);
 
             // eq() carries the value in its own parameter, so it is safe for any label.
             filterQuery = categoryKeys.length === 1
@@ -3015,6 +3100,7 @@ export const getPublicMatches = async (req, res) => {
                 .from('matches')
                 .select(matchSelect)
                 .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
                 .order('round_name', { ascending: true })
                 .order('match_index', { ascending: true });
 
