@@ -380,11 +380,15 @@ export const getEventDrawsSummary = async (req, res) => {
             const bd = bracketDraw?.bracket_data || null;
 
             // Prefer a human-readable label over a row that stored the raw UUID.
+            // Prefer a human-readable label over a row that stored the raw UUID.
             const labelRow = rows.find(r => r.category && !isUuid(r.category)) || rows[0];
+            const catStr = labelRow?.category || "";
+            // Detect synthetic IDs (e.g., "1785400000042" or "1785400000042_R2")
+            const isSyntheticId = catStr && /^\d+/.test(catStr) && !catStr.includes(" ");
 
             draws.push({
-                categoryId: rows.find(r => r.category_id)?.category_id || null,
-                categoryLabel: labelRow?.category || null,
+                categoryId: rows.find(r => r.category_id)?.category_id || (isSyntheticId ? catStr : null),
+                categoryLabel: isSyntheticId ? null : catStr,
                 mode: bracketDraw ? "BRACKET" : (hasActualMedia ? "MEDIA" : null),
                 published: Boolean(
                     (bracketDraw && bracketDraw.published) ||
@@ -445,6 +449,8 @@ export const validateBracketDraw = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -489,6 +495,8 @@ export const initBracket = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             checkQuery = checkQuery.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            checkQuery = checkQuery.eq("category", categoryId);
         } else {
             checkQuery = checkQuery.eq("category", categoryLabel);
         }
@@ -539,7 +547,7 @@ export const initBracket = async (req, res) => {
 
         const insertData = {
             event_id: eventId,
-            category: categoryLabel,
+            category: (categoryId && !isUuid(categoryId)) ? categoryId : categoryLabel,
             category_id: categoryId && isUuid(categoryId) ? categoryId : null,
             round_name: "Bracket",
             draw_type: "bracket",
@@ -1299,6 +1307,8 @@ export const uploadCategoryMedia = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             checkQuery = checkQuery.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            checkQuery = checkQuery.eq("category", categoryId);
         } else {
             checkQuery = checkQuery.eq("category", categoryLabel);
         }
@@ -1403,7 +1413,7 @@ export const uploadCategoryMedia = async (req, res) => {
             // Create new
             const insertData = {
                 event_id: eventId,
-                category: categoryLabel,
+                category: (categoryId && !isUuid(categoryId)) ? categoryId : categoryLabel,
                 category_id: categoryId && isUuid(categoryId) ? categoryId : null,
                 // legacy required column
                 round_name: LEGACY_ROUND_NAME_MEDIA,
@@ -1471,6 +1481,8 @@ export const updateBracketMatch = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -1860,6 +1872,8 @@ export const replaceRoundMatches = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -1962,6 +1976,8 @@ export const setMatchResult = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -2080,6 +2096,8 @@ export const addBracketRound = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -2678,6 +2696,8 @@ export const deleteCategoryMedia = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -2760,6 +2780,8 @@ export const resetBracket = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
@@ -2916,6 +2938,8 @@ export const deleteBracketRound = async (req, res) => {
 
         if (categoryId && isUuid(categoryId)) {
             query = query.eq("category_id", categoryId);
+        } else if (categoryId && !isUuid(categoryId)) {
+            query = query.eq("category", categoryId);
         } else {
             query = query.eq("category", categoryLabel);
         }
