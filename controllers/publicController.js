@@ -418,36 +418,7 @@ export const getPublicCategoryDraw = async (req, res) => {
 
         let { data, error } = await query.order("created_at", { ascending: true });
 
-        // Partial matching fallback — ONLY for label-based lookups (no UUID).
-        // When a UUID categoryId is provided, never attempt a label fallback.
-        if ((!data || data.length === 0) && categoryLabel && !categoryIsUuid) {
-            const labelParts = categoryLabel.split(" - ").filter(p => p.trim()).map(p => sanitizeFilterInput(p));
-            if (labelParts.length > 0) {
-                const baseCategory = sanitizeFilterInput(labelParts[0]);
-                const { data: partialData, error: partialError } = await supabaseAdmin
-                    .from("event_brackets")
-                    .select("*")
-                    .eq("event_id", eventId)
-                    .ilike("category", `${baseCategory}%`)
-                    .order("created_at", { ascending: true });
 
-                if (!partialError && partialData && partialData.length > 0) {
-                    if (partialData.length === 1) {
-                        data = partialData;
-                        error = null;
-                    } else {
-                        const exactishMatch = partialData.filter(row => {
-                            const storedLabel = (row.category || "").toLowerCase();
-                            return labelParts.every(part => storedLabel.includes(part.toLowerCase()));
-                        });
-                        if (exactishMatch.length > 0) {
-                            data = exactishMatch;
-                            error = null;
-                        }
-                    }
-                }
-            }
-        }
 
         // Additional safety: if we got results via label lookup but one of the rows has a
         // different UUID category_id, filter those out to prevent cross-category leaking.
