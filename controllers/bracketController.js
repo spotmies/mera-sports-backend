@@ -3,14 +3,8 @@ import { validateBracketIntegrity } from "../middleware/bracketValidation.js";
 import { createNotification } from "../services/notificationService.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
-
-// Simple UUID v4 validator (relaxed - checks standard 36-char UUID format)
-const isUuid = (value) => {
-    if (!value || typeof value !== "string") return false;
-    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        value.trim()
-    );
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid, resolveMatchCategoryKey } from "../utils/categoryKeys.js";
 
 // Backward-compat: legacy schema has round_name NOT NULL. Our v2 is per-category,
 // so we store a stable value in round_name to satisfy the constraint.
@@ -264,27 +258,11 @@ export const getCategoryDraw = async (req, res) => {
         const categoryLabel = req.query.categoryLabel || req.query.category;
 
         if (!eventId) return res.status(400).json({ message: "Event ID required" });
-
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            // Synthetic IDs MUST take precedence over categoryLabel to avoid polluting base categories
-            query = query.eq("category", categoryId);
-        } else if (categoryLabel) {
-            // Try exact match last
-            query = query.eq("category", categoryLabel);
-        } else {
+        if (!categoryId && !categoryLabel) {
             return res.status(400).json({ message: "Category ID or label required" });
         }
 
-        let { data, error } = await query.order("created_at", { ascending: true });
-
-        if (error) throw error;
+        const data = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
         // Group by mode - prioritize BRACKET over MEDIA if both exist
         const mediaDraw = data.find(b => b.mode === 'MEDIA');
@@ -442,23 +420,8 @@ export const validateBracketDraw = async (req, res) => {
             return res.status(400).json({ message: "Event ID and category (ID or label) required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("id, bracket_data")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: list, error } = await query.limit(1);
-        if (error) throw error;
-        const row = Array.isArray(list) ? list[0] : list;
+        const list = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
+        const row = list[0];
         if (!row || !row.bracket_data) {
             return res.status(404).json({ message: "Bracket not found", valid: false, errors: ["No bracket data"] });
         }
@@ -488,21 +451,10 @@ export const initBracket = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        // Check if category already has a draw
-        let checkQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryId && isUuid(categoryId)) {
-            checkQuery = checkQuery.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            checkQuery = checkQuery.eq("category", categoryId);
-        } else {
-            checkQuery = checkQuery.eq("category", categoryLabel);
-        }
-
-        const { data: existing } = await checkQuery;
+        // Check if category already has a draw. This looks under the legacy label
+        // too, so re-initializing a category whose bracket predates id-keying is
+        // still refused instead of silently creating a second, id-keyed bracket.
+        const existing = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
         if (existing && existing.length > 0) {
             const hasMedia = existing.some(b => b.mode === 'MEDIA' &&
@@ -602,21 +554,12 @@ export const createFullBracketStructure = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        // Fetch existing bracket row (must be initialized first)
-        let bracketQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            bracketQuery = bracketQuery.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await bracketQuery;
-        if (fetchError) throw fetchError;
+        // Fetch existing bracket row (must be initialized first).
+        // This has to resolve the category exactly the way initBracket stored it:
+        // a non-UUID id is written into `category`, so searching only by label
+        // returned nothing and every league-to-bracket conversion died here with
+        // "Initialize bracket first" on a bracket that had just been initialized.
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found. Initialize bracket first." });
         }
@@ -1225,7 +1168,7 @@ export const createFullBracketStructure = async (req, res) => {
 
                 const payload = {
                     event_id: eventId,
-                    category_id: bracket.category_id || (categoryId && isUuid(categoryId) ? categoryId : categoryLabel || bracket.category),
+                    category_id: resolveMatchCategoryKey(categoryId, categoryLabel, bracket),
                     bracket_id: bracket.id,
                     round_name: round.name,
                     match_index: matchIndex,
@@ -1302,20 +1245,7 @@ export const uploadCategoryMedia = async (req, res) => {
         }
 
         // Check if bracket exists
-        let checkQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryId && isUuid(categoryId)) {
-            checkQuery = checkQuery.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            checkQuery = checkQuery.eq("category", categoryId);
-        } else {
-            checkQuery = checkQuery.eq("category", categoryLabel);
-        }
-
-        const { data: existing } = await checkQuery;
+        const existing = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
         if (existing && existing.length > 0) {
             const hasBracket = existing.some(b => b.mode === 'BRACKET');
@@ -1475,23 +1405,7 @@ export const updateBracketMatch = async (req, res) => {
         }
 
         // Get bracket
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found. Initialize bracket first." });
         }
@@ -1626,11 +1540,14 @@ export const updateBracketMatch = async (req, res) => {
                             .eq('event_id', eventId)
                             .eq('round_name', roundName);
 
-                        if (categoryId && isUuid(categoryId)) {
-                            matchQuery = matchQuery.eq('category_id', categoryId);
-                        } else if (categoryLabel) {
-                            // Try to match by categoryLabel if categoryId not available
-                            matchQuery = matchQuery.eq('category_id', categoryLabel);
+                        // `matches.category_id` is text and carries whatever key the
+                        // bracket's matches were written with — see
+                        // resolveMatchCategoryKey. Reaching for the label whenever the
+                        // id was non-UUID looked in the wrong place for every
+                        // event-form category.
+                        const matchCategoryKey = resolveMatchCategoryKey(categoryId, categoryLabel, bracket);
+                        if (matchCategoryKey) {
+                            matchQuery = matchQuery.eq('category_id', matchCategoryKey);
                         }
 
                         const { data: matchesInRound, error: fetchMatchesError } = await matchQuery;
@@ -1867,22 +1784,7 @@ export const replaceRoundMatches = async (req, res) => {
             return res.status(400).json({ message: "roundName and matches array required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found. Initialize bracket first." });
         }
@@ -1971,23 +1873,7 @@ export const setMatchResult = async (req, res) => {
         }
 
         // Get bracket
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
         }
@@ -2091,22 +1977,7 @@ export const addBracketRound = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found. Initialize bracket first." });
         }
@@ -2581,69 +2452,42 @@ export const publishCategoryDraw = async (req, res) => {
             return res.status(400).json({ message: "Published must be boolean" });
         }
 
-        let findQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
+        // Resolve the category's rows FIRST, then publish exactly those ids.
+        //
+        // This used to re-derive the target with its own if/else instead of the
+        // shared rule, and a non-UUID category was updated only where
+        // `category` = the id. A league bracket stored under the legacy label
+        // therefore never flipped to published while the same category's
+        // id-keyed MEDIA rows did — the draw stayed invisible to players with
+        // the Draws tab reporting it as published.
+        const targetRows = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
+        // Rows where `category` holds a UUID are legacy siblings of a UUID
+        // category and belong to it too; the resolver keys those off category_id.
         if (categoryId && isUuid(categoryId)) {
-            findQuery = findQuery.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            // Synthetic IDs MUST be isolated from base category label updates
-            findQuery = findQuery.eq("category", categoryId);
-        } else if (categoryLabel) {
-            findQuery = findQuery.eq("category", categoryLabel);
-        } else {
-            return res.status(400).json({ message: "Valid Category ID or Category Label required" });
+            const legacy = await supabaseAdmin
+                .from("event_brackets")
+                .select("*")
+                .eq("event_id", eventId)
+                .eq("category", categoryId);
+            if (legacy.error) throw legacy.error;
+            const known = new Set(targetRows.map((r) => r.id));
+            for (const row of legacy.data || []) if (!known.has(row.id)) targetRows.push(row);
         }
 
-        console.log(`[publishCategoryDraw] eventId=${eventId}, categoryId=${categoryId}, categoryLabel=${categoryLabel}, published=${published}`);
+        console.log(`[publishCategoryDraw] eventId=${eventId}, categoryId=${categoryId}, categoryLabel=${categoryLabel}, published=${published}, rows=${targetRows.length}`);
 
-        // DIRECT APPROACH: Update ALL rows matching this category in one shot.
-        // This covers ALL modes (MEDIA, BRACKET, LEAGUE_SCOREBOARD, etc.)
-        // and prevents ANY stale published=true rows from being missed.
-        
+        // Update ALL modes of this category in one shot (MEDIA, BRACKET,
+        // LEAGUE_SCOREBOARD…) so no stale published=true row is left behind.
         let updateCount = 0;
-
-        if (categoryId && isUuid(categoryId)) {
-            // Update by category_id (UUID column)
-            const { data: d1, error: e1 } = await supabaseAdmin
+        if (targetRows.length > 0) {
+            const { data: updated, error: updateErr } = await supabaseAdmin
                 .from("event_brackets")
                 .update({ published, updated_at: new Date().toISOString() })
-                .eq("event_id", eventId)
-                .eq("category_id", categoryId)
+                .in("id", targetRows.map((r) => r.id))
                 .select("id");
-            if (e1) throw e1;
-            updateCount += (d1 || []).length;
-
-            // Also update rows where category TEXT = UUID string (legacy rows with null category_id)
-            const { data: d2, error: e2 } = await supabaseAdmin
-                .from("event_brackets")
-                .update({ published, updated_at: new Date().toISOString() })
-                .eq("event_id", eventId)
-                .eq("category", categoryId)
-                .select("id");
-            if (e2) throw e2;
-            updateCount += (d2 || []).length;
-        } else if (categoryId) {
-            // Synthetic ID like uuid_R2 — update by category text
-            const { data: d1, error: e1 } = await supabaseAdmin
-                .from("event_brackets")
-                .update({ published, updated_at: new Date().toISOString() })
-                .eq("event_id", eventId)
-                .eq("category", categoryId)
-                .select("id");
-            if (e1) throw e1;
-            updateCount += (d1 || []).length;
-        } else if (categoryLabel) {
-            const { data: d1, error: e1 } = await supabaseAdmin
-                .from("event_brackets")
-                .update({ published, updated_at: new Date().toISOString() })
-                .eq("event_id", eventId)
-                .eq("category", categoryLabel)
-                .select("id");
-            if (e1) throw e1;
-            updateCount += (d1 || []).length;
+            if (updateErr) throw updateErr;
+            updateCount = (updated || []).length;
         }
 
         console.log(`[publishCategoryDraw] Updated ${updateCount} rows to published=${published}`);
@@ -2691,23 +2535,7 @@ export const deleteCategoryMedia = async (req, res) => {
             return res.status(400).json({ message: "Missing required parameters" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "MEDIA");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: draws, error: fetchError } = await query;
-
-        if (fetchError) throw fetchError;
+        const draws = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "MEDIA" });
         if (!draws || draws.length === 0) {
             return res.status(404).json({ message: "Media draw not found" });
         }
@@ -2775,23 +2603,7 @@ export const resetBracket = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
         }
@@ -2867,8 +2679,13 @@ export const deleteCategoryBracket = async (req, res) => {
                 ""
             ).trim();
 
-            if (normalizedLabel && rowCategory === normalizedLabel) return true;
+            // The id first: since brackets became id-keyed, `category` holds the
+            // non-UUID category id itself. Without this the pre-delete step of a
+            // league-to-bracket regeneration left the previous bracket in place
+            // and init then refused with BRACKET_EXISTS.
+            if (normalizedParamId && rowCategory === normalizedParamId.toLowerCase()) return true;
             if (normalizedParamId && sourceCategoryId === normalizedParamId) return true;
+            if (normalizedLabel && rowCategory === normalizedLabel) return true;
             return false;
         });
 
@@ -2934,22 +2751,7 @@ export const deleteBracketRound = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId && isUuid(categoryId)) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryId && !isUuid(categoryId)) {
-            query = query.eq("category", categoryId);
-        } else {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-        if (fetchError) throw fetchError;
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
         }
@@ -3118,20 +2920,10 @@ export const randomizeRound1Byes = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-        if (fetchError) throw fetchError;
+        // `category_id` is a UUID column: filtering it with the numeric-string id
+        // every event-form category carries matched nothing (or errored), so BYE
+        // handling only ever worked for UUID categories.
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
         }
@@ -3353,20 +3145,10 @@ export const assignByeToPlayer = async (req, res) => {
             return res.status(400).json({ message: "matchId and playerId are required" });
         }
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
-
-        if (categoryId) {
-            query = query.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            query = query.eq("category", categoryLabel);
-        }
-
-        const { data: brackets, error: fetchError } = await query;
-        if (fetchError) throw fetchError;
+        // `category_id` is a UUID column: filtering it with the numeric-string id
+        // every event-form category carries matched nothing (or errored), so BYE
+        // handling only ever worked for UUID categories.
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
         }
@@ -3440,17 +3222,17 @@ export const assignByeToPlayer = async (req, res) => {
 export const finalizeByes = async (req, res) => {
     try {
         const { id: eventId, categoryId } = req.params;
+        const categoryLabel = req.body?.categoryLabel || req.query?.categoryLabel;
 
-        if (!eventId || !isUuid(categoryId)) {
-            return res.status(400).json({ message: "Event ID and valid category ID required" });
+        // This demanded a UUID and rejected everything else, so it was unreachable
+        // for every category the event form creates. Resolve it the same way the
+        // rest of this controller does.
+        if (!eventId || (!categoryId && !categoryLabel)) {
+            return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        const { data: bracket } = await supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("category_id", categoryId)
-            .single();
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
+        const bracket = brackets[0];
 
         if (!bracket) {
             return res.status(404).json({ message: "Bracket not found" });
@@ -3514,37 +3296,20 @@ export const recordResult = async (req, res) => {
         // down by the scoreboard, which is why BracketRenderer looked correct while
         // the bracket editor kept showing TBD.
         //
-        // Resolve the same way every other bracket endpoint does: by category_id
-        // when it is a UUID, otherwise by the stored category label.
-        let bracketQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            bracketQuery = bracketQuery.eq("category", categoryLabel);
-        } else {
-            // Non-UUID id with no label: legacy rows store the id in `category`.
-            bracketQuery = bracketQuery.eq("category", String(categoryId));
-        }
-
-        const { data: brackets, error: bracketError } = await bracketQuery
-            .order("created_at", { ascending: false })
-            .limit(1);
-
-        if (bracketError) {
-            console.error("[recordResult] Bracket fetch error:", { eventId, categoryId, error: bracketError });
-            return res.status(404).json({ message: "Bracket not found", error: bracketError.message });
-        }
+        // Resolve the same way every other bracket endpoint does. The label was
+        // consulted BEFORE the non-UUID id here, so a league bracket stored under
+        // its numeric id was never found and recording a winner silently left
+        // bracket_data untouched — which is what made the next round's Promote
+        // controls stay hidden.
+        const brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
 
         if (!brackets || brackets.length === 0) {
-            console.error("[recordResult] No bracket found for:", { eventId, categoryId });
+            console.error("[recordResult] No bracket found for:", { eventId, categoryId, categoryLabel });
             return res.status(404).json({ message: "Bracket not found" });
         }
 
-        const bracket = brackets[0];
+        // Newest wins, as before, when a category somehow owns more than one.
+        const bracket = brackets[brackets.length - 1];
 
         const bracketData = bracket.bracket_data || {};
         const normalizedRound = normalizeRoundName(roundName);

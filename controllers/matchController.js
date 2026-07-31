@@ -9,11 +9,8 @@ import {
     matchesResolveKey,
 } from "../utils/matchesCache.js";
 
-// Helper function to check if string is UUID
-const isUuid = (str) => {
-    if (!str || typeof str !== 'string') return false;
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
 
 /** Normalize round name for consistent matching. ALWAYS use for any round_name comparison. */
 const normalizeRoundName = (s) => String(s ?? "").trim().toLowerCase();
@@ -144,35 +141,22 @@ export const generateMatchesFromBracket = async (req, res) => {
     const winnerMode = req.body?.winnerMode || 'set_based'; // Winner mode: 'set_based', 'score_based', or 'match_based'
 
     try {
-        // 1. Fetch Bracket Data with UUID-safe query
-        let bracketQuery = supabaseAdmin
-            .from('event_brackets')
-            .select('*')
-            .eq('event_id', eventId)
-            .eq('mode', 'BRACKET');
+        // 1. Fetch Bracket Data. The label used to be preferred over a non-UUID id,
+        // which looked past the row a league-to-bracket conversion had just written
+        // under that id — see utils/categoryKeys.js.
+        const bracketRows = await fetchCategoryBracketRows(
+            eventId,
+            categoryId && categoryId !== 'label' ? categoryId : null,
+            categoryLabel,
+            { mode: 'BRACKET' }
+        );
+        const bracketData = bracketRows[0] || null;
 
-        // Only filter by category_id if it's a valid UUID
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq('category_id', categoryId);
-        } else if (categoryLabel) {
-            // If not UUID, use categoryLabel from query/body
-            bracketQuery = bracketQuery.eq('category', categoryLabel);
-        } else if (categoryId && categoryId !== 'label') {
-            // Fallback: try to match by categoryId as category name (for backward compatibility)
-            bracketQuery = bracketQuery.eq('category', categoryId);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: `Bracket not found or not in BRACKET mode. Category: ${categoryLabel || categoryId}`,
-                debug: {
-                    categoryId,
-                    categoryLabel,
-                    error: bracketError?.message
-                }
+                debug: { categoryId, categoryLabel }
             });
         }
 
@@ -254,17 +238,17 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const isEmpty = !hasPlayer1 && !hasPlayer2;
 
                 // Must agree with createFullBracketStructure (bracketController "START
-                // ROUNDS"), which writes `bracket.category_id || (uuid ? categoryId :
-                // categoryLabel || bracket.category)`. This path used to write the raw
-                // `categoryId` param instead, so when the Scoreboard regenerated round 1
-                // it rewrote those rows' category_id to a numeric id while the rounds
-                // created by the bracket builder kept the label — one category, two keys,
-                // and every read that filtered on one key lost the other's rounds.
+                // ROUNDS") — one category with two keys means every read that filters
+                // on one loses the other's rounds. Both now write the caller's
+                // category id, because that is what every reader of
+                // `matches.category_id` filters with (the column is text, so a
+                // numeric-string id is a legitimate value). The bracket row's own key
+                // is the fallback for callers that pass no id at all.
                 const matchCategoryId =
+                    (categoryId ? String(categoryId) : null) ||
                     bracketCategoryId ||
-                    (categoryId && isUuid(categoryId)
-                        ? categoryId
-                        : (categoryLabel || bracketData.category || categoryId));
+                    bracketData.category ||
+                    categoryLabel;
 
                 // Check if this match already exists and is COMPLETED
                 const existingMatch = existingMatchesMap.get(bracketMatchId);
@@ -380,22 +364,12 @@ export const updateRoundSelectedSets = async (req, res) => {
             });
         }
 
-        // Fetch bracket for this event/category
-        let bracketQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
+        // Fetch bracket for this event/category — id first, label only as fallback
+        // (see utils/categoryKeys.js).
+        const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: "BRACKET" });
+        const bracketData = bracketRows[0] || null;
 
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq("category_id", categoryId);
-        } else if (categoryName) {
-            bracketQuery = bracketQuery.eq("category", categoryName);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: "Bracket not found for this event/category"
@@ -1751,20 +1725,9 @@ export const finalizeRoundMatches = async (req, res) => {
         let bracketDataObjForFinalize = null;
         try {
             // Always try to fetch bracket data if we have eventId and category info
-            let bracketQuery = supabaseAdmin
-                .from('event_brackets')
-                .select('id, bracket_data, draw_data')
-                .eq('event_id', eventId)
-                .eq('mode', 'BRACKET');
-            if (categoryId && isUuid(categoryId)) {
-                bracketQuery = bracketQuery.eq('category_id', categoryId);
-            } else if (categoryName) {
-                bracketQuery = bracketQuery.eq('category', categoryName);
-            }
-            const { data: bracketData, error: bracketFetchError } = await bracketQuery.maybeSingle();
-            if (bracketFetchError) {
-                console.error("[Finalize] Error fetching bracket:", bracketFetchError);
-            } else if (bracketData) {
+            const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: 'BRACKET' });
+            const bracketData = bracketRows[0] || null;
+            if (bracketData) {
                 // Try bracket_data first, then draw_data
                 bracketDataObjForFinalize = bracketData.bracket_data || bracketData.draw_data || {};
                 const rounds = bracketDataObjForFinalize.rounds || [];
