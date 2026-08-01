@@ -9,11 +9,8 @@ import {
     matchesResolveKey,
 } from "../utils/matchesCache.js";
 
-// Helper function to check if string is UUID
-const isUuid = (str) => {
-    if (!str || typeof str !== 'string') return false;
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
 
 /** Normalize round name for consistent matching. ALWAYS use for any round_name comparison. */
 const normalizeRoundName = (s) => String(s ?? "").trim().toLowerCase();
@@ -102,6 +99,27 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
     return anyPublished;
 };
 
+/**
+ * The brackets of an event that are published, i.e. visible to the public.
+ *
+ * Every row in `matches` carries a `bracket_id` (812/812 in QA), so the bracket
+ * row's own `published` flag is an exact gate for its matches — no category-key
+ * guessing required, which matters because that key is not written consistently.
+ *
+ * Returns null when the event has nothing published, so callers can short-circuit
+ * to an empty list rather than build an `in.()` filter on an empty array.
+ */
+const getPublishedBracketIds = async (eventId) => {
+    const { data, error } = await supabaseAdmin
+        .from('event_brackets')
+        .select('id')
+        .eq('event_id', eventId)
+        .eq('published', true);
+    if (error) throw error;
+    const ids = (data || []).map((row) => row.id).filter(Boolean);
+    return ids.length > 0 ? ids : null;
+};
+
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
     // Clamp the fallback itself so callers can't accidentally pass an out-of-range default.
     const safeFallback = Number.isInteger(fallback) && fallback >= 1 && fallback <= MAX_SETS_PER_MATCH
@@ -144,35 +162,22 @@ export const generateMatchesFromBracket = async (req, res) => {
     const winnerMode = req.body?.winnerMode || 'set_based'; // Winner mode: 'set_based', 'score_based', or 'match_based'
 
     try {
-        // 1. Fetch Bracket Data with UUID-safe query
-        let bracketQuery = supabaseAdmin
-            .from('event_brackets')
-            .select('*')
-            .eq('event_id', eventId)
-            .eq('mode', 'BRACKET');
+        // 1. Fetch Bracket Data. The label used to be preferred over a non-UUID id,
+        // which looked past the row a league-to-bracket conversion had just written
+        // under that id — see utils/categoryKeys.js.
+        const bracketRows = await fetchCategoryBracketRows(
+            eventId,
+            categoryId && categoryId !== 'label' ? categoryId : null,
+            categoryLabel,
+            { mode: 'BRACKET' }
+        );
+        const bracketData = bracketRows[0] || null;
 
-        // Only filter by category_id if it's a valid UUID
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq('category_id', categoryId);
-        } else if (categoryLabel) {
-            // If not UUID, use categoryLabel from query/body
-            bracketQuery = bracketQuery.eq('category', categoryLabel);
-        } else if (categoryId && categoryId !== 'label') {
-            // Fallback: try to match by categoryId as category name (for backward compatibility)
-            bracketQuery = bracketQuery.eq('category', categoryId);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: `Bracket not found or not in BRACKET mode. Category: ${categoryLabel || categoryId}`,
-                debug: {
-                    categoryId,
-                    categoryLabel,
-                    error: bracketError?.message
-                }
+                debug: { categoryId, categoryLabel }
             });
         }
 
@@ -254,17 +259,17 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const isEmpty = !hasPlayer1 && !hasPlayer2;
 
                 // Must agree with createFullBracketStructure (bracketController "START
-                // ROUNDS"), which writes `bracket.category_id || (uuid ? categoryId :
-                // categoryLabel || bracket.category)`. This path used to write the raw
-                // `categoryId` param instead, so when the Scoreboard regenerated round 1
-                // it rewrote those rows' category_id to a numeric id while the rounds
-                // created by the bracket builder kept the label — one category, two keys,
-                // and every read that filtered on one key lost the other's rounds.
+                // ROUNDS") — one category with two keys means every read that filters
+                // on one loses the other's rounds. Both now write the caller's
+                // category id, because that is what every reader of
+                // `matches.category_id` filters with (the column is text, so a
+                // numeric-string id is a legitimate value). The bracket row's own key
+                // is the fallback for callers that pass no id at all.
                 const matchCategoryId =
+                    (categoryId ? String(categoryId) : null) ||
                     bracketCategoryId ||
-                    (categoryId && isUuid(categoryId)
-                        ? categoryId
-                        : (categoryLabel || bracketData.category || categoryId));
+                    bracketData.category ||
+                    categoryLabel;
 
                 // Check if this match already exists and is COMPLETED
                 const existingMatch = existingMatchesMap.get(bracketMatchId);
@@ -314,7 +319,7 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const bracketDataObj = bracketData.bracket_data || bracketData.bracketData || {};
                 const rounds = bracketDataObj.rounds || [];
                 const roundIndex = rounds.findIndex((r) => r && r.name === roundName);
-                
+
                 if (roundIndex !== -1) {
                     // Update the round's setsConfig with the selected sets
                     if (!rounds[roundIndex].setsConfig) {
@@ -324,13 +329,13 @@ export const generateMatchesFromBracket = async (req, res) => {
                     rounds[roundIndex].setsConfig.selectedSets = setsPerMatch;
                     // Store the winner mode (set_based or score_based)
                     rounds[roundIndex].setsConfig.winnerMode = winnerMode;
-                    
+
                     // Update bracket_data in database
                     const updatedBracketData = {
                         ...bracketDataObj,
                         rounds: rounds
                     };
-                    
+
                     await supabaseAdmin
                         .from('event_brackets')
                         .update({
@@ -380,22 +385,12 @@ export const updateRoundSelectedSets = async (req, res) => {
             });
         }
 
-        // Fetch bracket for this event/category
-        let bracketQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
+        // Fetch bracket for this event/category — id first, label only as fallback
+        // (see utils/categoryKeys.js).
+        const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: "BRACKET" });
+        const bracketData = bracketRows[0] || null;
 
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq("category_id", categoryId);
-        } else if (categoryName) {
-            bracketQuery = bracketQuery.eq("category", categoryName);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: "Bracket not found for this event/category"
@@ -887,7 +882,7 @@ export const generateLeagueMatches = async (req, res) => {
         }
 
         if (toInsert.length === 0) {
-        await invalidateMatchesCache(eventId);
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "League matches already generated for all participant pairs",
@@ -1290,18 +1285,18 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
         }
         return false;
     };
-    
+
     // If match row already has valid players, use them
     if (hasValidPlayer(matchRow.player_a) && hasValidPlayer(matchRow.player_b)) {
         return { playerA: matchRow.player_a, playerB: matchRow.player_b };
     }
-    
+
     // Try to get from bracket if bracket_match_id exists
     if (bracketDataObj && matchRow.bracket_match_id) {
         const rounds = bracketDataObj.rounds || [];
         const bid = String(matchRow.bracket_match_id).trim();
         let foundMatch = null;
-        
+
         for (const round of rounds) {
             const ms = round.matches || [];
             for (const m of ms) {
@@ -1315,7 +1310,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
             }
             if (foundMatch) break;
         }
-        
+
         if (foundMatch) {
             // Helper: resolve the winner feeding into a specific side ("player1"/"player2")
             // for this bracket match, by looking at feeder matches with winnerTo === this id
@@ -1421,7 +1416,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
                     p2 = feederWinnerForP2;
                 }
             }
-            
+
             // Debug logging
             if (!p1 || !p2) {
                 console.warn(`[getMatchPlayers] Found bracket match ${bid} but players are missing:`, {
@@ -1431,7 +1426,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
                     dbPlayerB: matchRow.player_b
                 });
             }
-            
+
             return { playerA: p1, playerB: p2 };
         } else {
             // Debug: log what we're looking for vs what's available
@@ -1447,7 +1442,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
             console.warn(`[getMatchPlayers] Could not find bracket match with id "${bid}". Available match IDs:`, allMatchIds.slice(0, 10));
         }
     }
-    
+
     // Fallback: return from match row if valid, otherwise null
     return {
         playerA: hasValidPlayer(matchRow.player_a) ? matchRow.player_a : null,
@@ -1507,7 +1502,7 @@ export const updateMatchScore = async (req, res) => {
         // Resolve effective players for winner calculation (use updatePayload if we just set them)
         const effectivePlayerA = updatePayload.player_a ?? currentMatch.player_a;
         const effectivePlayerB = updatePayload.player_b ?? currentMatch.player_b;
-        
+
         // Helper to extract valid player id (never return empty object)
         const getPlayerId = (player) => {
             if (!player) return null;
@@ -1526,15 +1521,15 @@ export const updateMatchScore = async (req, res) => {
         // CRITICAL: When status is COMPLETED, always compute winner from score if missing or invalid.
         // This ensures scores from scoreboard result in proper winner storage (never {}).
         // Check if winner is missing or invalid (empty object, null, undefined)
-        const hasValidWinner = updatePayload.winner && 
+        const hasValidWinner = updatePayload.winner &&
             (typeof updatePayload.winner === 'string' || typeof updatePayload.winner === 'number' ||
-             (typeof updatePayload.winner === 'object' && Object.keys(updatePayload.winner).length > 0 && (updatePayload.winner.id || updatePayload.winner.player_id)));
-        
+                (typeof updatePayload.winner === 'object' && Object.keys(updatePayload.winner).length > 0 && (updatePayload.winner.id || updatePayload.winner.player_id)));
+
         if (status === 'COMPLETED' && !hasValidWinner) {
             const finalScore = score || currentMatch.score;
             // Determine winnerMode: prefer explicit request body, then score payload, then bracket config
             const requestWinnerMode = req.body?.winnerMode || finalScore?.winnerMode || null;
-            
+
             if (finalScore) {
                 // Check if score uses sets format
                 if (Array.isArray(finalScore.sets) && finalScore.sets.length > 0) {
@@ -1597,7 +1592,7 @@ export const updateMatchScore = async (req, res) => {
                     const winnerIdA = getPlayerId(effectivePlayerA);
                     const winnerIdB = getPlayerId(effectivePlayerB);
                     const isLeagueMatch = String(currentMatch.round_name || '').trim().toUpperCase() === 'LEAGUE';
-                    
+
                     if (!winnerIdA || !winnerIdB) {
                         console.warn(`Cannot compute winner for match ${matchId}: missing valid player_a or player_b. player_a:`, effectivePlayerA, 'player_b:', effectivePlayerB);
                         // Don't set winner if we can't determine it - let admin fix player_a/player_b first
@@ -1648,7 +1643,7 @@ export const updateMatchScore = async (req, res) => {
                     const p2Score = parseInt(finalScore.player2 || finalScore.player_b || 0);
                     const winnerIdA = getPlayerId(effectivePlayerA);
                     const winnerIdB = getPlayerId(effectivePlayerB);
-                    
+
                     if (!winnerIdA || !winnerIdB) {
                         console.warn(`Cannot compute winner for match ${matchId}: missing valid player_a or player_b. player_a:`, effectivePlayerA, 'player_b:', effectivePlayerB);
                         // Don't set winner if we can't determine it
@@ -1751,25 +1746,14 @@ export const finalizeRoundMatches = async (req, res) => {
         let bracketDataObjForFinalize = null;
         try {
             // Always try to fetch bracket data if we have eventId and category info
-            let bracketQuery = supabaseAdmin
-                .from('event_brackets')
-                .select('id, bracket_data, draw_data')
-                .eq('event_id', eventId)
-                .eq('mode', 'BRACKET');
-            if (categoryId && isUuid(categoryId)) {
-                bracketQuery = bracketQuery.eq('category_id', categoryId);
-            } else if (categoryName) {
-                bracketQuery = bracketQuery.eq('category', categoryName);
-            }
-            const { data: bracketData, error: bracketFetchError } = await bracketQuery.maybeSingle();
-            if (bracketFetchError) {
-                console.error("[Finalize] Error fetching bracket:", bracketFetchError);
-            } else if (bracketData) {
+            const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: 'BRACKET' });
+            const bracketData = bracketRows[0] || null;
+            if (bracketData) {
                 // Try bracket_data first, then draw_data
                 bracketDataObjForFinalize = bracketData.bracket_data || bracketData.draw_data || {};
                 const rounds = bracketDataObjForFinalize.rounds || [];
                 console.log(`[Finalize] Fetched bracket with ${rounds.length} rounds:`, rounds.map(r => r.name));
-                
+
                 // If roundName provided, try to get setsPerMatch and winnerMode from that specific round
                 if (roundName) {
                     // Normalize round name comparison (case-insensitive, trim whitespace)
@@ -1859,11 +1843,11 @@ export const finalizeRoundMatches = async (req, res) => {
             let effectivePlayerA = existingMatch.player_a;
             let effectivePlayerB = existingMatch.player_b;
             let bracketDataForMatch = bracketDataObjForFinalize;
-            
+
             // Check if players are missing or empty
             const hasValidA = effectivePlayerA && typeof effectivePlayerA === 'object' && Object.keys(effectivePlayerA).length > 0 && (effectivePlayerA.id || effectivePlayerA.player_id);
             const hasValidB = effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id);
-            
+
             // If players are missing, try to get from bracket
             if ((!hasValidA || !hasValidB) && existingMatch.bracket_id && existingMatch.bracket_match_id) {
                 // Only fetch bracket if we don't have it cached yet (avoid redundant per-match fetches)
@@ -1886,7 +1870,7 @@ export const finalizeRoundMatches = async (req, res) => {
                         console.error(`[Finalize] Exception fetching bracket for match ${matchData.matchId}:`, err);
                     }
                 }
-                
+
                 // Try bracket lookup with current bracket data
                 if (bracketDataForMatch) {
                     const enriched = getMatchPlayers(existingMatch, bracketDataForMatch, allMatchesByBracketId);
@@ -1897,7 +1881,7 @@ export const finalizeRoundMatches = async (req, res) => {
                         effectivePlayerB = enriched.playerB;
                     }
                 }
-                
+
                 // Debug logging if players still missing
                 if (!effectivePlayerA || !effectivePlayerB) {
                     const bracketRounds = bracketDataForMatch?.rounds || [];
@@ -1920,10 +1904,10 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                 }
             }
-            
+
             // Check if we need to persist players (when they were enriched from bracket)
             const needPersistPlayers = (!hasValidA && effectivePlayerA && typeof effectivePlayerA === 'object' && Object.keys(effectivePlayerA).length > 0 && (effectivePlayerA.id || effectivePlayerA.player_id)) ||
-                                      (!hasValidB && effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id));
+                (!hasValidB && effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id));
 
             const score = matchData.score;
             let finalScore;
@@ -1965,7 +1949,7 @@ export const finalizeRoundMatches = async (req, res) => {
                 // Extract valid player ids (never use empty objects)
                 const winnerIdA = getPlayerId(effectivePlayerA);
                 const winnerIdB = getPlayerId(effectivePlayerB);
-                
+
                 if (!winnerIdA || !winnerIdB) {
                     // Skip this match instead of failing the entire batch
                     const matchInfo = `Match ${matchData.matchId} (${existingMatch.round_name}, bracket_match_id: ${existingMatch.bracket_match_id || 'none'})`;
@@ -1980,7 +1964,7 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                     continue;
                 }
-                
+
                 if (categoryWinnerMode === 'score_based') {
                     // Score-based: winner decided by total points across ALL sets
                     // Tiebreak: player who won more sets
@@ -2057,7 +2041,7 @@ export const finalizeRoundMatches = async (req, res) => {
                 // Extract valid player ids (never use empty objects)
                 const winnerIdA = getPlayerId(effectivePlayerA);
                 const winnerIdB = getPlayerId(effectivePlayerB);
-                
+
                 if (!winnerIdA || !winnerIdB) {
                     // Skip this match instead of failing the entire batch
                     const matchInfo = `Match ${matchData.matchId} (${existingMatch.round_name}, bracket_match_id: ${existingMatch.bracket_match_id || 'none'})`;
@@ -2072,7 +2056,7 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                     continue;
                 }
-                
+
                 if (p1Score > p2Score) {
                     winner = winnerIdA;
                 } else if (p2Score > p1Score) {
@@ -2109,362 +2093,362 @@ export const finalizeRoundMatches = async (req, res) => {
         // Update all matches in DB (include player_a/player_b when enriched)
         let results = [];
         if (updates.length > 0) {
-        const updatePromises = updates.map(update => {
-            const payload = {
-                score: update.score,
-                winner: update.winner,
-                status: update.status,
-                updated_at: update.updated_at
-            };
-            if (update.player_a !== undefined) payload.player_a = update.player_a;
-            if (update.player_b !== undefined) payload.player_b = update.player_b;
-            return supabaseAdmin
-                .from('matches')
-                .update(payload)
-                .eq('id', update.id)
-                .select()
-                .single();
-        });
-
-        results = await Promise.all(updatePromises);
-        const errors = results.filter(r => r.error);
-
-        if (errors.length > 0) {
-            console.error("Finalize matches errors:", errors);
-            return res.status(500).json({
-                success: false,
-                message: "Failed to finalize some matches",
-                errors: errors.map(e => e.error?.message)
+            const updatePromises = updates.map(update => {
+                const payload = {
+                    score: update.score,
+                    winner: update.winner,
+                    status: update.status,
+                    updated_at: update.updated_at
+                };
+                if (update.player_a !== undefined) payload.player_a = update.player_a;
+                if (update.player_b !== undefined) payload.player_b = update.player_b;
+                return supabaseAdmin
+                    .from('matches')
+                    .update(payload)
+                    .eq('id', update.id)
+                    .select()
+                    .single();
             });
-        }
+
+            results = await Promise.all(updatePromises);
+            const errors = results.filter(r => r.error);
+
+            if (errors.length > 0) {
+                console.error("Finalize matches errors:", errors);
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to finalize some matches",
+                    errors: errors.map(e => e.error?.message)
+                });
+            }
         } // end if (updates.length > 0)
 
         // ---- Winner propagation through bracket_data using bracket_match_id ----
         if (updates.length > 0) {
-        try {
-            // Bracket lookup must be robust:
-            // - Some deployments store non-UUID category IDs (numeric/string) in category_id
-            // - Some UIs pass categoryName with extra suffixes; exact equality can fail
-            // Strategy: try category_id first (any string), then exact category name, then partial match.
-            let bracketRows = null;
-            let bracketErr = null;
+            try {
+                // Bracket lookup must be robust:
+                // - Some deployments store non-UUID category IDs (numeric/string) in category_id
+                // - Some UIs pass categoryName with extra suffixes; exact equality can fail
+                // Strategy: try category_id first (any string), then exact category name, then partial match.
+                let bracketRows = null;
+                let bracketErr = null;
 
-            if (categoryId) {
-                const r1 = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('*')
-                    .eq('event_id', eventId)
-                    .eq('mode', 'BRACKET')
-                    .eq('category_id', categoryId);
-                bracketRows = r1.data;
-                bracketErr = r1.error;
-            }
+                if (categoryId) {
+                    const r1 = await supabaseAdmin
+                        .from('event_brackets')
+                        .select('*')
+                        .eq('event_id', eventId)
+                        .eq('mode', 'BRACKET')
+                        .eq('category_id', categoryId);
+                    bracketRows = r1.data;
+                    bracketErr = r1.error;
+                }
 
-            if ((!bracketRows || bracketRows.length === 0) && categoryName) {
-                const r2 = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('*')
-                    .eq('event_id', eventId)
-                    .eq('mode', 'BRACKET')
-                    .eq('category', categoryName);
-                bracketRows = r2.data;
-                bracketErr = r2.error;
+                if ((!bracketRows || bracketRows.length === 0) && categoryName) {
+                    const r2 = await supabaseAdmin
+                        .from('event_brackets')
+                        .select('*')
+                        .eq('event_id', eventId)
+                        .eq('mode', 'BRACKET')
+                        .eq('category', categoryName);
+                    bracketRows = r2.data;
+                    bracketErr = r2.error;
 
-            }
+                }
 
-            if (!bracketErr && bracketRows && bracketRows.length > 0) {
-                const bracket = bracketRows[0];
-                const bracketDataObj = bracket.bracket_data || bracket.bracketData || { rounds: [], players: [] };
-                const rounds = Array.isArray(bracketDataObj.rounds) ? bracketDataObj.rounds : [];
+                if (!bracketErr && bracketRows && bracketRows.length > 0) {
+                    const bracket = bracketRows[0];
+                    const bracketDataObj = bracket.bracket_data || bracket.bracketData || { rounds: [], players: [] };
+                    const rounds = Array.isArray(bracketDataObj.rounds) ? bracketDataObj.rounds : [];
 
-                const integrity = validateBracketIntegrity(bracketDataObj);
-                if (!integrity.valid) {
-                    // AUTO-REPAIR: Reconstruct missing winnerTo/winnerToSlot linkage.
-                    // Old brackets (created before linkage was added) may lack these fields.
-                    // Without them, winner propagation to the next round is impossible.
-                    let repaired = false;
-                    const roundCount = rounds.length;
-                    for (let rIdx = 0; rIdx < roundCount - 1; rIdx++) {
-                        const round = rounds[rIdx];
-                        const matches = Array.isArray(round?.matches) ? round.matches : [];
-                        for (let mIdx = 0; mIdx < matches.length; mIdx++) {
-                            const m = matches[mIdx];
-                            if (!m) continue;
-                            if (m.winnerTo == null || m.winnerToSlot == null) {
-                                // matchNumber is 1-based (mIdx is 0-based)
-                                const matchNum = mIdx + 1;
-                                const nextRoundIndex = rIdx + 1;
-                                const nextMatchNumber = Math.ceil(matchNum / 2);
-                                m.winnerTo = `R${nextRoundIndex + 1}-M${nextMatchNumber}`;
-                                m.winnerToSlot = matchNum % 2 === 1 ? "player1" : "player2";
-                                repaired = true;
+                    const integrity = validateBracketIntegrity(bracketDataObj);
+                    if (!integrity.valid) {
+                        // AUTO-REPAIR: Reconstruct missing winnerTo/winnerToSlot linkage.
+                        // Old brackets (created before linkage was added) may lack these fields.
+                        // Without them, winner propagation to the next round is impossible.
+                        let repaired = false;
+                        const roundCount = rounds.length;
+                        for (let rIdx = 0; rIdx < roundCount - 1; rIdx++) {
+                            const round = rounds[rIdx];
+                            const matches = Array.isArray(round?.matches) ? round.matches : [];
+                            for (let mIdx = 0; mIdx < matches.length; mIdx++) {
+                                const m = matches[mIdx];
+                                if (!m) continue;
+                                if (m.winnerTo == null || m.winnerToSlot == null) {
+                                    // matchNumber is 1-based (mIdx is 0-based)
+                                    const matchNum = mIdx + 1;
+                                    const nextRoundIndex = rIdx + 1;
+                                    const nextMatchNumber = Math.ceil(matchNum / 2);
+                                    m.winnerTo = `R${nextRoundIndex + 1}-M${nextMatchNumber}`;
+                                    m.winnerToSlot = matchNum % 2 === 1 ? "player1" : "player2";
+                                    repaired = true;
+                                }
                             }
                         }
-                    }
-                    if (repaired) {
-                        console.log("[Finalize] Auto-repaired missing winnerTo/winnerToSlot in bracket_data");
-                        // Re-validate after repair
-                        const recheck = validateBracketIntegrity(bracketDataObj);
-                        if (!recheck.valid) {
-                            console.warn("Bracket integrity still invalid after repair:", recheck.errors);
-                            // Skip propagation to avoid wrong mapping; scores are still saved
+                        if (repaired) {
+                            console.log("[Finalize] Auto-repaired missing winnerTo/winnerToSlot in bracket_data");
+                            // Re-validate after repair
+                            const recheck = validateBracketIntegrity(bracketDataObj);
+                            if (!recheck.valid) {
+                                console.warn("Bracket integrity still invalid after repair:", recheck.errors);
+                                // Skip propagation to avoid wrong mapping; scores are still saved
+                            }
+                        }
+                        if (!repaired) {
+                            console.warn("Bracket integrity check failed before propagation:", integrity.errors);
+                            // Skip propagation to avoid Semifinal wrong mapping; scores are still saved
                         }
                     }
-                    if (!repaired) {
-                        console.warn("Bracket integrity check failed before propagation:", integrity.errors);
-                        // Skip propagation to avoid Semifinal wrong mapping; scores are still saved
-                    }
-                }
-                // Proceed with propagation if integrity is valid (either originally or after repair)
-                if (validateBracketIntegrity(bracketDataObj).valid) {
+                    // Proceed with propagation if integrity is valid (either originally or after repair)
+                    if (validateBracketIntegrity(bracketDataObj).valid) {
 
-                const matchIndexById = new Map();
-                const roundIndexByName = new Map();
-                rounds.forEach((round, rIdx) => {
-                    if (round && typeof round.name === "string") {
-                        roundIndexByName.set(normalizeRoundName(round.name), rIdx);
-                    }
-                    const ms = Array.isArray(round.matches) ? round.matches : [];
-                    ms.forEach((m, mIdx) => {
-                        if (m && m.id) {
-                            matchIndexById.set(String(m.id).trim(), { roundIndex: rIdx, matchIndex: mIdx });
+                        const matchIndexById = new Map();
+                        const roundIndexByName = new Map();
+                        rounds.forEach((round, rIdx) => {
+                            if (round && typeof round.name === "string") {
+                                roundIndexByName.set(normalizeRoundName(round.name), rIdx);
+                            }
+                            const ms = Array.isArray(round.matches) ? round.matches : [];
+                            ms.forEach((m, mIdx) => {
+                                if (m && m.id) {
+                                    matchIndexById.set(String(m.id).trim(), { roundIndex: rIdx, matchIndex: mIdx });
+                                }
+                            });
+                        });
+
+                        const downstreamUpdates = new Map();
+                        for (const update of updates) {
+                            if (!update.winner) continue;
+                            const existingMatch = existingMatches.find(m => m.id === update.id);
+                            if (!existingMatch) continue;
+
+                            let loc = null;
+                            const key = existingMatch.bracket_match_id ? String(existingMatch.bracket_match_id).trim() : null;
+                            if (key) {
+                                loc = matchIndexById.get(key) || null;
+                            }
+                            if (!loc) {
+                                const rn = normalizeRoundName(existingMatch.round_name);
+                                const rIdx = roundIndexByName.has(rn) ? roundIndexByName.get(rn) : rounds.findIndex((r) => r && normalizeRoundName(r.name) === rn);
+                                const mIdx = typeof existingMatch.match_index === "number" ? existingMatch.match_index : -1;
+                                if (rIdx >= 0 && mIdx >= 0 && rounds[rIdx]?.matches?.[mIdx]) {
+                                    loc = { roundIndex: rIdx, matchIndex: mIdx };
+                                    try {
+                                        await supabaseAdmin
+                                            .from("matches")
+                                            .update({ bracket_match_id: String(rounds[rIdx].matches[mIdx].id) })
+                                            .eq("id", existingMatch.id);
+                                    } catch (e) { /* ignore */ }
+                                }
+                            }
+                            if (!loc) continue;
+
+                            const currentRound = rounds[loc.roundIndex];
+                            const bracketMatch = currentRound?.matches?.[loc.matchIndex] || null;
+                            if (!bracketMatch) continue;
+
+                            // Bracket player ids (used for winner resolution and for setting bracketMatch.winner)
+                            const bP1Id = bracketMatch.player1 && (bracketMatch.player1.id || bracketMatch.player1);
+                            const bP2Id = bracketMatch.player2 && (bracketMatch.player2.id || bracketMatch.player2);
+
+                            // Determine winner player object – prefer authoritative matches table players,
+                            // then fall back to bracket_data players if needed. This avoids cases where
+                            // bracket_data player1/player2 order doesn't match player_a/player_b.
+                            const winnerId = String(update.winner);
+                            let winnerPlayer = null;
+
+                            // 1) Prefer matches table player_a / player_b (authoritative for A/B sides)
+                            const mP1 = existingMatch.player_a;
+                            const mP2 = existingMatch.player_b;
+                            const mP1Id = mP1 && (mP1.id || mP1.player_id || mP1);
+                            const mP2Id = mP2 && (mP2.id || mP2.player_id || mP2);
+
+                            if (mP1Id && String(mP1Id) === winnerId) {
+                                winnerPlayer = mP1;
+                            } else if (mP2Id && String(mP2Id) === winnerId) {
+                                winnerPlayer = mP2;
+                            }
+
+                            // 2) Fallback: use bracket_data player1 / player2 if they match the winner id
+                            if (!winnerPlayer) {
+                                if (bP1Id && String(bP1Id) === winnerId) {
+                                    winnerPlayer = bracketMatch.player1;
+                                } else if (bP2Id && String(bP2Id) === winnerId) {
+                                    winnerPlayer = bracketMatch.player2;
+                                }
+                            }
+
+                            if (!winnerPlayer) continue;
+
+                            // Store winner reference on this bracket node (for visualization)
+                            if (!bracketMatch.winner) {
+                                if (bP1Id && String(bP1Id) === winnerId) {
+                                    bracketMatch.winner = "player1";
+                                } else if (bP2Id && String(bP2Id) === winnerId) {
+                                    bracketMatch.winner = "player2";
+                                }
+                            }
+
+                            // HARDENED: Use ONLY winnerTo/winnerToSlot from bracket. Never derive slot from index.
+                            let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
+                            let targetSlot = bracketMatch.winnerToSlot || null;
+
+                            // Legacy: only if bracket has no linkage (old data), infer from index once
+                            if ((!targetId || !targetSlot) && (loc.roundIndex < rounds.length - 1)) {
+                                const fallbackRoundIndex = loc.roundIndex + 1;
+                                const nextMatchIndex = Math.floor(loc.matchIndex / 2);
+                                const nextSlot = (loc.matchIndex % 2 === 0) ? "player1" : "player2";
+                                const downstreamRound = rounds[fallbackRoundIndex];
+                                if (downstreamRound?.matches?.[nextMatchIndex]?.id) {
+                                    targetId = String(downstreamRound.matches[nextMatchIndex].id);
+                                    targetSlot = nextSlot;
+                                }
+                            }
+
+                            if (!targetId || !targetSlot) continue;
+
+                            const downstreamLoc = matchIndexById.get(String(targetId));
+                            if (!downstreamLoc) continue;
+
+                            const downstreamRound = rounds[downstreamLoc.roundIndex];
+                            if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
+
+                            const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
+                            if (!downstreamMatch) continue;
+
+                            // Assign winner to the correct slot; this supports partial completion
+                            downstreamMatch[targetSlot] = winnerPlayer;
+
+                            // Collect downstream match update for bulk execution
+                            const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
+                            const targetKey = String(targetId);
+
+                            if (!downstreamUpdates.has(targetKey)) {
+                                downstreamUpdates.set(targetKey, {
+                                    bracket_id: bracket.id,
+                                    bracket_match_id: targetKey,
+                                    updated_at: new Date().toISOString()
+                                });
+                            }
+                            downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
                         }
-                    });
-                });
 
-                const downstreamUpdates = new Map();
-                for (const update of updates) {
-                    if (!update.winner) continue;
-                    const existingMatch = existingMatches.find(m => m.id === update.id);
-                    if (!existingMatch) continue;
+                        // ── BYE winner propagation ──
+                        // The frontend skips BYE matches when finalizing (no scores to enter),
+                        // so their winners are never in the `updates` array above. We must
+                        // propagate them here for the current round so that downstream matches
+                        // (e.g., Quarterfinal) get BOTH feeder players.
+                        const normalizedFinalizingRound = normalizeRoundName(roundName);
+                        const finalizingRoundIdx = roundIndexByName.has(normalizedFinalizingRound)
+                            ? roundIndexByName.get(normalizedFinalizingRound)
+                            : rounds.findIndex(r => r && normalizeRoundName(r.name) === normalizedFinalizingRound);
 
-                    let loc = null;
-                    const key = existingMatch.bracket_match_id ? String(existingMatch.bracket_match_id).trim() : null;
-                    if (key) {
-                        loc = matchIndexById.get(key) || null;
-                    }
-                    if (!loc) {
-                        const rn = normalizeRoundName(existingMatch.round_name);
-                        const rIdx = roundIndexByName.has(rn) ? roundIndexByName.get(rn) : rounds.findIndex((r) => r && normalizeRoundName(r.name) === rn);
-                        const mIdx = typeof existingMatch.match_index === "number" ? existingMatch.match_index : -1;
-                        if (rIdx >= 0 && mIdx >= 0 && rounds[rIdx]?.matches?.[mIdx]) {
-                            loc = { roundIndex: rIdx, matchIndex: mIdx };
+                        if (finalizingRoundIdx >= 0 && finalizingRoundIdx < rounds.length) {
+                            const currentRoundObj = rounds[finalizingRoundIdx];
+                            const currentRoundMatches = Array.isArray(currentRoundObj.matches) ? currentRoundObj.matches : [];
+
+                            // Set of bracket_match_ids already processed in the normal propagation loop above
+                            const alreadyPropagatedIds = new Set();
+                            for (const update of updates) {
+                                const em = existingMatches.find(m => m.id === update.id);
+                                if (em && em.bracket_match_id) alreadyPropagatedIds.add(String(em.bracket_match_id).trim());
+                            }
+
+                            for (let mIdx = 0; mIdx < currentRoundMatches.length; mIdx++) {
+                                const bracketMatch = currentRoundMatches[mIdx];
+                                if (!bracketMatch) continue;
+                                const bmId = String(bracketMatch.id || "").trim();
+                                if (alreadyPropagatedIds.has(bmId)) continue; // already handled
+
+                                // Detect BYE: one real player, one empty
+                                const hasP1 = bracketMatch.player1 && typeof bracketMatch.player1 === 'object' && (bracketMatch.player1.id || bracketMatch.player1.player_id);
+                                const hasP2 = bracketMatch.player2 && typeof bracketMatch.player2 === 'object' && (bracketMatch.player2.id || bracketMatch.player2.player_id);
+                                const isBye = (hasP1 && !hasP2) || (!hasP1 && hasP2);
+                                if (!isBye) continue;
+
+                                const winnerPlayer = hasP1 ? bracketMatch.player1 : bracketMatch.player2;
+                                const winnerSide = hasP1 ? "player1" : "player2";
+
+                                // Mark winner on the bracket node if not already set
+                                if (!bracketMatch.winner) {
+                                    bracketMatch.winner = winnerSide;
+                                }
+
+                                // Find downstream target
+                                let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
+                                let targetSlot = bracketMatch.winnerToSlot || null;
+
+                                // Legacy fallback: derive from index
+                                if ((!targetId || !targetSlot) && (finalizingRoundIdx < rounds.length - 1)) {
+                                    const nextRoundIndex = finalizingRoundIdx + 1;
+                                    const nextMatchIndex = Math.floor(mIdx / 2);
+                                    const slot = (mIdx % 2 === 0) ? "player1" : "player2";
+                                    const downRound = rounds[nextRoundIndex];
+                                    if (downRound?.matches?.[nextMatchIndex]?.id) {
+                                        targetId = String(downRound.matches[nextMatchIndex].id);
+                                        targetSlot = slot;
+                                    }
+                                }
+
+                                if (!targetId || !targetSlot) continue;
+
+                                const downstreamLoc = matchIndexById.get(String(targetId));
+                                if (!downstreamLoc) continue;
+
+                                const downstreamRound = rounds[downstreamLoc.roundIndex];
+                                if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
+                                const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
+                                if (!downstreamMatch) continue;
+
+                                downstreamMatch[targetSlot] = winnerPlayer;
+                                console.log(`[Finalize] BYE winner propagated: ${bmId} → ${targetId}.${targetSlot}`);
+
+                                const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
+                                const targetKey = String(targetId);
+                                if (!downstreamUpdates.has(targetKey)) {
+                                    downstreamUpdates.set(targetKey, {
+                                        bracket_id: bracket.id,
+                                        bracket_match_id: targetKey,
+                                        updated_at: new Date().toISOString()
+                                    });
+                                }
+                                downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
+                            }
+                        }
+
+                        // Perform bulk update for downstream matches
+                        if (downstreamUpdates.size > 0) {
                             try {
                                 await supabaseAdmin
-                                    .from("matches")
-                                    .update({ bracket_match_id: String(rounds[rIdx].matches[mIdx].id) })
-                                    .eq("id", existingMatch.id);
-                            } catch (e) { /* ignore */ }
-                        }
-                    }
-                    if (!loc) continue;
-
-                    const currentRound = rounds[loc.roundIndex];
-                    const bracketMatch = currentRound?.matches?.[loc.matchIndex] || null;
-                    if (!bracketMatch) continue;
-
-                    // Bracket player ids (used for winner resolution and for setting bracketMatch.winner)
-                    const bP1Id = bracketMatch.player1 && (bracketMatch.player1.id || bracketMatch.player1);
-                    const bP2Id = bracketMatch.player2 && (bracketMatch.player2.id || bracketMatch.player2);
-
-                    // Determine winner player object – prefer authoritative matches table players,
-                    // then fall back to bracket_data players if needed. This avoids cases where
-                    // bracket_data player1/player2 order doesn't match player_a/player_b.
-                    const winnerId = String(update.winner);
-                    let winnerPlayer = null;
-
-                    // 1) Prefer matches table player_a / player_b (authoritative for A/B sides)
-                    const mP1 = existingMatch.player_a;
-                    const mP2 = existingMatch.player_b;
-                    const mP1Id = mP1 && (mP1.id || mP1.player_id || mP1);
-                    const mP2Id = mP2 && (mP2.id || mP2.player_id || mP2);
-
-                    if (mP1Id && String(mP1Id) === winnerId) {
-                        winnerPlayer = mP1;
-                    } else if (mP2Id && String(mP2Id) === winnerId) {
-                        winnerPlayer = mP2;
-                    }
-
-                    // 2) Fallback: use bracket_data player1 / player2 if they match the winner id
-                    if (!winnerPlayer) {
-                        if (bP1Id && String(bP1Id) === winnerId) {
-                            winnerPlayer = bracketMatch.player1;
-                        } else if (bP2Id && String(bP2Id) === winnerId) {
-                            winnerPlayer = bracketMatch.player2;
-                        }
-                    }
-
-                    if (!winnerPlayer) continue;
-
-                    // Store winner reference on this bracket node (for visualization)
-                    if (!bracketMatch.winner) {
-                        if (bP1Id && String(bP1Id) === winnerId) {
-                            bracketMatch.winner = "player1";
-                        } else if (bP2Id && String(bP2Id) === winnerId) {
-                            bracketMatch.winner = "player2";
-                        }
-                    }
-
-                    // HARDENED: Use ONLY winnerTo/winnerToSlot from bracket. Never derive slot from index.
-                    let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
-                    let targetSlot = bracketMatch.winnerToSlot || null;
-
-                    // Legacy: only if bracket has no linkage (old data), infer from index once
-                    if ((!targetId || !targetSlot) && (loc.roundIndex < rounds.length - 1)) {
-                        const fallbackRoundIndex = loc.roundIndex + 1;
-                        const nextMatchIndex = Math.floor(loc.matchIndex / 2);
-                        const nextSlot = (loc.matchIndex % 2 === 0) ? "player1" : "player2";
-                        const downstreamRound = rounds[fallbackRoundIndex];
-                        if (downstreamRound?.matches?.[nextMatchIndex]?.id) {
-                            targetId = String(downstreamRound.matches[nextMatchIndex].id);
-                            targetSlot = nextSlot;
-                        }
-                    }
-
-                    if (!targetId || !targetSlot) continue;
-
-                    const downstreamLoc = matchIndexById.get(String(targetId));
-                    if (!downstreamLoc) continue;
-
-                    const downstreamRound = rounds[downstreamLoc.roundIndex];
-                    if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
-
-                    const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
-                    if (!downstreamMatch) continue;
-
-                    // Assign winner to the correct slot; this supports partial completion
-                    downstreamMatch[targetSlot] = winnerPlayer;
-
-                    // Collect downstream match update for bulk execution
-                    const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
-                    const targetKey = String(targetId);
-                    
-                    if (!downstreamUpdates.has(targetKey)) {
-                        downstreamUpdates.set(targetKey, {
-                            bracket_id: bracket.id,
-                            bracket_match_id: targetKey,
-                            updated_at: new Date().toISOString()
-                        });
-                    }
-                    downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
-                }
-
-                // ── BYE winner propagation ──
-                // The frontend skips BYE matches when finalizing (no scores to enter),
-                // so their winners are never in the `updates` array above. We must
-                // propagate them here for the current round so that downstream matches
-                // (e.g., Quarterfinal) get BOTH feeder players.
-                const normalizedFinalizingRound = normalizeRoundName(roundName);
-                const finalizingRoundIdx = roundIndexByName.has(normalizedFinalizingRound)
-                    ? roundIndexByName.get(normalizedFinalizingRound)
-                    : rounds.findIndex(r => r && normalizeRoundName(r.name) === normalizedFinalizingRound);
-
-                if (finalizingRoundIdx >= 0 && finalizingRoundIdx < rounds.length) {
-                    const currentRoundObj = rounds[finalizingRoundIdx];
-                    const currentRoundMatches = Array.isArray(currentRoundObj.matches) ? currentRoundObj.matches : [];
-
-                    // Set of bracket_match_ids already processed in the normal propagation loop above
-                    const alreadyPropagatedIds = new Set();
-                    for (const update of updates) {
-                        const em = existingMatches.find(m => m.id === update.id);
-                        if (em && em.bracket_match_id) alreadyPropagatedIds.add(String(em.bracket_match_id).trim());
-                    }
-
-                    for (let mIdx = 0; mIdx < currentRoundMatches.length; mIdx++) {
-                        const bracketMatch = currentRoundMatches[mIdx];
-                        if (!bracketMatch) continue;
-                        const bmId = String(bracketMatch.id || "").trim();
-                        if (alreadyPropagatedIds.has(bmId)) continue; // already handled
-
-                        // Detect BYE: one real player, one empty
-                        const hasP1 = bracketMatch.player1 && typeof bracketMatch.player1 === 'object' && (bracketMatch.player1.id || bracketMatch.player1.player_id);
-                        const hasP2 = bracketMatch.player2 && typeof bracketMatch.player2 === 'object' && (bracketMatch.player2.id || bracketMatch.player2.player_id);
-                        const isBye = (hasP1 && !hasP2) || (!hasP1 && hasP2);
-                        if (!isBye) continue;
-
-                        const winnerPlayer = hasP1 ? bracketMatch.player1 : bracketMatch.player2;
-                        const winnerSide = hasP1 ? "player1" : "player2";
-
-                        // Mark winner on the bracket node if not already set
-                        if (!bracketMatch.winner) {
-                            bracketMatch.winner = winnerSide;
-                        }
-
-                        // Find downstream target
-                        let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
-                        let targetSlot = bracketMatch.winnerToSlot || null;
-
-                        // Legacy fallback: derive from index
-                        if ((!targetId || !targetSlot) && (finalizingRoundIdx < rounds.length - 1)) {
-                            const nextRoundIndex = finalizingRoundIdx + 1;
-                            const nextMatchIndex = Math.floor(mIdx / 2);
-                            const slot = (mIdx % 2 === 0) ? "player1" : "player2";
-                            const downRound = rounds[nextRoundIndex];
-                            if (downRound?.matches?.[nextMatchIndex]?.id) {
-                                targetId = String(downRound.matches[nextMatchIndex].id);
-                                targetSlot = slot;
+                                    .from('matches')
+                                    .upsert(Array.from(downstreamUpdates.values()), {
+                                        onConflict: 'bracket_id,bracket_match_id'
+                                    });
+                            } catch (dbUpdateErr) {
+                                console.error("Failed to bulk update downstream matches in DB:", dbUpdateErr);
                             }
                         }
 
-                        if (!targetId || !targetSlot) continue;
+                    } // end integrity.valid
 
-                        const downstreamLoc = matchIndexById.get(String(targetId));
-                        if (!downstreamLoc) continue;
+                    // Persist updated bracket_data if any changes were made
+                    const { error: updErr } = await supabaseAdmin
+                        .from('event_brackets')
+                        .update({
+                            bracket_data: { ...bracketDataObj, rounds },
+                            draw_data: { ...bracketDataObj, rounds },
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq('id', bracket.id);
 
-                        const downstreamRound = rounds[downstreamLoc.roundIndex];
-                        if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
-                        const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
-                        if (!downstreamMatch) continue;
-
-                        downstreamMatch[targetSlot] = winnerPlayer;
-                        console.log(`[Finalize] BYE winner propagated: ${bmId} → ${targetId}.${targetSlot}`);
-
-                        const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
-                        const targetKey = String(targetId);
-                        if (!downstreamUpdates.has(targetKey)) {
-                            downstreamUpdates.set(targetKey, {
-                                bracket_id: bracket.id,
-                                bracket_match_id: targetKey,
-                                updated_at: new Date().toISOString()
-                            });
-                        }
-                        downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
+                    if (updErr) {
+                        console.error("Bracket winner propagation update error:", updErr);
                     }
                 }
-
-                // Perform bulk update for downstream matches
-                if (downstreamUpdates.size > 0) {
-                    try {
-                        await supabaseAdmin
-                            .from('matches')
-                            .upsert(Array.from(downstreamUpdates.values()), { 
-                                onConflict: 'bracket_id,bracket_match_id' 
-                            });
-                    } catch (dbUpdateErr) {
-                        console.error("Failed to bulk update downstream matches in DB:", dbUpdateErr);
-                    }
-                }
-
-                } // end integrity.valid
-
-                // Persist updated bracket_data if any changes were made
-                const { error: updErr } = await supabaseAdmin
-                    .from('event_brackets')
-                    .update({
-                        bracket_data: { ...bracketDataObj, rounds },
-                        draw_data: { ...bracketDataObj, rounds },
-                        updated_at: new Date().toISOString()
-                    })
-                    .eq('id', bracket.id);
-
-                if (updErr) {
-                    console.error("Bracket winner propagation update error:", updErr);
-                }
+            } catch (propErr) {
+                console.error("Winner propagation through bracket_data failed:", propErr);
+                // Non-fatal: scores are still saved, bracket view just won't update for this call.
             }
-        } catch (propErr) {
-            console.error("Winner propagation through bracket_data failed:", propErr);
-            // Non-fatal: scores are still saved, bracket view just won't update for this call.
-        }
         } // end if (updates.length > 0) for winner propagation
 
         // If all matches were skipped (none could be finalized), report as error
@@ -2582,7 +2566,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
-        await invalidateMatchesCache(eventId);
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2649,7 +2633,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (matchesToDelete.length === 0) {
-        await invalidateMatchesCache(eventId);
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found matching the specified category",
@@ -2718,7 +2702,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
-        await invalidateMatchesCache(eventId);
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2774,7 +2758,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!matchesToUpdate || matchesToUpdate.length === 0) {
-        await invalidateMatchesCache(eventId);
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found to clear scores for this category/round",
@@ -2823,7 +2807,7 @@ export const clearCategoryScores = async (req, res) => {
 // Get Matches (Scoreboard) - Public version (no auth required)
 export const getPublicMatches = async (req, res) => {
     const eventIdentifier = req.params.id || req.params.eventId; // Support both :id and :eventId routes
-    const { categoryId, categoryName, roundName, round_name, bracketId } = req.query;
+    const { categoryId, categoryName, roundName, round_name } = req.query;
 
     if (!eventIdentifier) {
         return res.status(400).json({
@@ -2853,15 +2837,13 @@ export const getPublicMatches = async (req, res) => {
 
     // Cache scope must name every input that changes the result set, so two
     // different queries can never collide on one key.
-    const cacheScope = bracketId
-        ? `bracket:${bracketId}`
-        : isLeagueRequest
-            ? `league:${categoryId || ''}`
-            : categoryId
-                ? `cat:${categoryId}|${categoryName || ''}`
-                : categoryName
-                    ? `name:${categoryName}`
-                    : 'all';
+    const cacheScope = isLeagueRequest
+        ? `league:${categoryId || ''}`
+        : categoryId
+            ? `cat:${categoryId}|${categoryName || ''}`
+            : categoryName
+                ? `name:${categoryName}`
+                : 'all';
     const cacheKey = matchesCacheKey(eventId, cacheScope);
 
     const cachedPayload = await cacheGet(cacheKey);
@@ -2926,10 +2908,10 @@ export const getPublicMatches = async (req, res) => {
                 .eq('event_id', eventId)
                 .eq('round_name', 'LEAGUE')
                 .order('match_index', { ascending: true });
-                
+
             // Apply category filter to matches (category_id in matches table is a text/varchar so it accepts string IDs)
             matchQuery = matchQuery.eq('category_id', categoryId);
-            
+
             const { data: leagueMatches, error: leagueError } = await matchQuery;
 
             if (leagueError) {
@@ -2962,12 +2944,63 @@ export const getPublicMatches = async (req, res) => {
         // ---------------------------------------------------------------
         const matchSelect = 'id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id';
 
-        // No category filter: the caller genuinely wants the whole event.
+        // THIS IS A PUBLIC ENDPOINT — nothing unpublished may leave it.
+        //
+        // The LEAGUE path above has always checked publication; these knockout
+        // paths never did, so an anonymous caller could read draws the admin had
+        // not released yet (497 of 812 match rows in QA belong to unpublished
+        // brackets). Resolve the published set once and gate every branch below
+        // on it.
+        const publishedBracketIds = await getPublishedBracketIds(eventId);
+        if (!publishedBracketIds) {
+            const emptyPayload = { success: true, matches: [] };
+            void cacheSet(cacheKey, emptyPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(emptyPayload);
+        }
+
+        // Bracket-scoped request. `bracket_id` is a foreign key to the bracket row
+        // that owns these matches, so it is exact on its own — no category widening
+        // and no label guessing. It is checked BEFORE the whole-event branch below,
+        // which is the branch a bracketId-only request used to land in.
+        if (bracketFilter) {
+            // An unpublished bracket is simply not visible here.
+            if (!publishedBracketIds.includes(bracketFilter)) {
+                const hiddenPayload = { success: true, matches: [] };
+                void cacheSet(cacheKey, hiddenPayload, MATCHES_CACHE_TTL);
+                return res.status(200).json(hiddenPayload);
+            }
+
+            let bracketQuery = supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .eq('bracket_id', bracketFilter);
+
+            // A category, when supplied alongside, only narrows further.
+            if (categoryId) bracketQuery = bracketQuery.eq('category_id', categoryId);
+            if (roundName) bracketQuery = bracketQuery.eq('round_name', roundName);
+
+            const { data: bracketMatches, error: bracketMatchError } = await bracketQuery
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (bracketMatchError) {
+                throw bracketMatchError;
+            }
+
+            const bracketPayload = { success: true, matches: bracketMatches || [] };
+            void cacheSet(cacheKey, bracketPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(bracketPayload);
+        }
+
+        // No category filter: the caller genuinely wants the whole event —
+        // restricted to what has actually been published.
         if (!categoryId && !categoryName) {
             const { data: allMatches, error: allError } = await supabaseAdmin
                 .from('matches')
                 .select(matchSelect)
                 .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
                 .order('round_name', { ascending: true })
                 .order('match_index', { ascending: true });
 
@@ -3055,7 +3088,8 @@ export const getPublicMatches = async (req, res) => {
             let filterQuery = supabaseAdmin
                 .from('matches')
                 .select(matchSelect)
-                .eq('event_id', eventId);
+                .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds);
 
             // eq() carries the value in its own parameter, so it is safe for any label.
             filterQuery = categoryKeys.length === 1
@@ -3075,6 +3109,7 @@ export const getPublicMatches = async (req, res) => {
                 .from('matches')
                 .select(matchSelect)
                 .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
                 .order('round_name', { ascending: true })
                 .order('match_index', { ascending: true });
 
