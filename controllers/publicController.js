@@ -1,14 +1,8 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
-
-// Simple UUID v4 validator
-const isUuid = (value) => {
-    if (!value || typeof value !== "string") return false;
-    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        value.trim()
-    );
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
 
 /**
  * Sanitize a string for safe use in Supabase ilike / eq filters.
@@ -443,29 +437,23 @@ export const getPublicCategoryDraw = async (req, res) => {
 
         const categoryIsUuid = categoryId && isUuid(categoryId);
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryIsUuid) {
-            // STRICT: UUID-based lookup only — never fall back to label for UUID categories.
-            // This prevents a bracket stored under the SAME display name but a DIFFERENT
-            // category UUID from bleeding into this category's draw view.
-            query = query.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            query = query.eq("category", categoryLabel);
-        } else {
+        if (!categoryId && !categoryLabel) {
             return res.status(400).json({ message: "Category ID or label required" });
         }
 
-        let { data, error } = await query.order("created_at", { ascending: true });
-
-
+        // A non-UUID category id had NO branch here at all: the UUID test failed, the
+        // public app deliberately sends no categoryLabel (a name-based lookup can
+        // match a same-named sibling category), and the fall-through returned 400.
+        // Every category the event form creates has a numeric-string id, so the
+        // public draw endpoint answered 400 for all of them.
+        //
+        // The shared resolver keeps the strict UUID behaviour intact and adds the
+        // id-in-`category` case that brackets are actually stored under.
+        let data = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
         // Additional safety: if we got results via label lookup but one of the rows has a
         // different UUID category_id, filter those out to prevent cross-category leaking.
-        if (data && data.length > 0 && !categoryIsUuid && categoryId) {
+        if (data.length > 0 && !categoryIsUuid && categoryId) {
             const exactIdMatches = data.filter(row =>
                 !row.category_id || !isUuid(row.category_id) || row.category_id === categoryId
             );
@@ -473,8 +461,6 @@ export const getPublicCategoryDraw = async (req, res) => {
                 data = exactIdMatches;
             }
         }
-
-        if (error) throw error;
 
         // If no rows found at all, return empty draw
         if (!data || data.length === 0) {
@@ -565,14 +551,20 @@ export const getPublicEventDraws = async (req, res) => {
 
         if (error) throw error;
 
-        // Group by category_id or category label
+        // Group by category_id or category label.
+        // `category` holds the category ID itself for every non-UUID category (the
+        // id-keyed form), so reporting it as `categoryLabel` with a null
+        // `categoryId` hands callers a "label" of "1785400000042" and no id to
+        // match on. Detect that shape and report it as the id it is.
         const categoryMap = {};
         for (const row of (data || [])) {
             const key = row.category_id || row.category || row.id;
             if (!categoryMap[key]) {
+                const catStr = row.category || "";
+                const isIdKeyed = Boolean(catStr) && /^\d/.test(catStr) && !catStr.includes(" ");
                 categoryMap[key] = {
-                    categoryId: row.category_id,
-                    categoryLabel: row.category,
+                    categoryId: row.category_id || (isIdKeyed ? catStr : null),
+                    categoryLabel: isIdKeyed ? null : row.category,
                     media: null,
                     bracket: null
                 };
