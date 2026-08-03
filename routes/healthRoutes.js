@@ -4,6 +4,20 @@ import { redis, isRedisReady } from "../config/redisClient.js";
 const router = express.Router();
 
 /**
+ * GET /health/  (and /api/health/)
+ * Basic liveness probe — returns 200 OK with uptime so load balancers and
+ * deployment platforms (Railway, etc.) can confirm the server is alive.
+ */
+router.get("/", (_req, res) => {
+    res.status(200).json({
+        ok: true,
+        status: "healthy",
+        uptime_s: Math.floor(process.uptime()),
+        timestamp: new Date().toISOString(),
+    });
+});
+
+/**
  * GET /api/health/redis
  * Proves the Redis wiring end-to-end: PING + a real write→read round-trip.
  * Returns latency so you can confirm it's actually reachable and fast.
