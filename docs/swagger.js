@@ -11,12 +11,17 @@
  * ── The gates ────────────────────────────────────────────────────────────────
  *   1. `ENABLE_SWAGGER` must be exactly `"true"`. Absent ⇒ off. Production
  *      simply never sets it.
- *   2. `NODE_ENV=production` ⇒ off, whatever gate 1 says.
- *   3. A **live** Razorpay key (`rzp_live_…`) ⇒ off, whatever gates 1 and 2 say.
- *      This is the backstop that matters: this codebase does not otherwise use
- *      NODE_ENV, so if someone copies the QA env vars onto the prod service the
- *      first two gates would both pass. The payment key cannot be wrong about
- *      which environment it is — prod runs live keys, QA runs test keys.
+ *   2. A **live** Razorpay key (`rzp_live_…`) ⇒ off, whatever gate 1 says.
+ *      The payment key cannot be wrong about which environment it is: prod runs
+ *      live keys, QA runs test keys. This is the backstop for the one realistic
+ *      accident — someone copying the QA env vars onto the prod service.
+ *
+ * ── Why NODE_ENV is deliberately not a gate ──────────────────────────────────
+ * It looks like the obvious check and it is the wrong one here. Railway's
+ * builder sets `NODE_ENV=production` on every Node service it deploys, QA
+ * included, and nothing else in this codebase reads the variable. Gating on it
+ * disabled the docs on QA — the exact environment they exist for — while adding
+ * nothing on prod, which gate 1 already excludes and gate 2 backstops.
  *
  * ── Optional password ────────────────────────────────────────────────────────
  * QA is internet-facing. Set `SWAGGER_USER` and `SWAGGER_PASSWORD` to put HTTP
@@ -36,10 +41,7 @@ const SPEC_PATH = "/api/docs.json";
  */
 export function resolveSwaggerGate(env = process.env) {
     if (env.ENABLE_SWAGGER !== "true") {
-        return { enabled: false, reason: "ENABLE_SWAGGER is not \"true\"" };
-    }
-    if (env.NODE_ENV === "production") {
-        return { enabled: false, reason: "NODE_ENV=production" };
+        return { enabled: false, reason: `ENABLE_SWAGGER is ${env.ENABLE_SWAGGER === undefined ? "not set" : `"${env.ENABLE_SWAGGER}"`}, not "true"` };
     }
     if (String(env.RAZORPAY_KEY_ID || "").startsWith("rzp_live_")) {
         return { enabled: false, reason: "a live Razorpay key is configured — this looks like production" };
