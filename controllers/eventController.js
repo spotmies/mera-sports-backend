@@ -511,12 +511,86 @@ export const deleteEvent = async (req, res) => {
 };
 
 // GET /api/events/:id/brackets
+/**
+ * Human label for every category id on an event, keyed by id.
+ *
+ * `event_brackets.category` is a join key, not a display string: for the numeric
+ * ids the event form creates it deliberately holds the **id** (see
+ * utils/categoryKeys.js). Handing that column straight to the public page is what
+ * put "1785388790049" in the category tabs. Resolving the label here — from the
+ * event's own `categories` jsonb — fixes rows that were already written, because
+ * nothing about the stored row has to change.
+ *
+ * The label format matches what the public league view builds for the same
+ * categories, so a player sees one naming convention across both pages.
+ */
+const buildCategoryLabelMap = (categories) => {
+    const map = new Map();
+    if (!Array.isArray(categories)) return map;
+
+    categories.forEach((cat) => {
+        if (!cat || typeof cat !== "object") return;
+
+        const catId = cat.id ?? cat.category_id ?? cat._id;
+        if (catId === undefined || catId === null) return;
+
+        const rawName = String(
+            cat.category || cat.name || cat.rawName || cat.category_name || cat.categoryName || ""
+        ).trim();
+        const base = rawName || String(catId);
+        const gender = cat.gender || cat.Gender || null;
+        const matchType = cat.match_type || cat.matchType || cat.match_type_name || null;
+
+        let label = base;
+        if (gender && matchType) label = `${base} (${gender}) - ${matchType}`;
+        else if (gender) label = `${base} (${gender})`;
+        else if (matchType) label = `${base} - ${matchType}`;
+
+        map.set(String(catId), label);
+    });
+
+    return map;
+};
+
+/**
+ * Display label for one `event_brackets.category` value.
+ *
+ * Falls back to the stored value whenever it cannot be resolved, so a legacy row
+ * that already holds a label keeps showing it. Round-scoped keys ("<id>_R2") are
+ * resolved off their base id and labelled with the round, since those rows exist
+ * for every pool/league round past the first.
+ */
+const resolveBracketCategoryLabel = (categoryKey, labelMap) => {
+    const key = String(categoryKey ?? "").trim();
+    if (!key) return key;
+
+    const direct = labelMap.get(key);
+    if (direct) return direct;
+
+    const roundMatch = key.match(/^(.*?)_(?:R|HR)(\d+)$/i);
+    if (roundMatch) {
+        const baseLabel = labelMap.get(roundMatch[1]);
+        if (baseLabel) return `${baseLabel} - Round ${roundMatch[2]}`;
+    }
+
+    // Unresolvable — most likely a label-keyed legacy row, which is already
+    // readable as-is.
+    return key;
+};
+
 export const getEventBrackets = async (req, res) => {
     try {
         const eventIdQuery = await resolveEventIdByIdentifier(req.params.id);
         if (!eventIdQuery) {
             return res.status(404).json({ success: false, message: "Event not found", brackets: [] });
         }
+
+        const { data: eventRow } = await supabaseAdmin
+            .from('events')
+            .select('categories')
+            .eq('id', eventIdQuery)
+            .maybeSingle();
+        const categoryLabels = buildCategoryLabelMap(eventRow?.categories);
 
         const { data, error } = await supabaseAdmin
             .from('event_brackets')
@@ -591,10 +665,16 @@ export const getEventBrackets = async (req, res) => {
                 drawData = fullBracketData;
             }
 
+            const categoryKey = bracket.category || 'Unknown';
+
             return {
                 id: bracket.id,
                 event_id: bracket.event_id,
-                category: bracket.category || 'Unknown',
+                category: categoryKey,
+                // Display-only companion to `category`. The key itself stays
+                // untouched: it is what the frontend selects and routes on, and
+                // what every bracket lookup joins against.
+                category_label: resolveBracketCategoryLabel(categoryKey, categoryLabels),
                 round_name: bracket.round_name || 'Round 1',
                 draw_type: drawType,
                 draw_data: drawData,
