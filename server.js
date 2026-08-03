@@ -26,6 +26,7 @@ import playerDashboardRoutes from "./routes/playerDashboardroutes.js";
 import publicRoutes from "./routes/publicRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
+import { mountSwagger } from "./docs/swagger.js";
 
 dotenv.config({ quiet: true });
 
@@ -66,6 +67,10 @@ app.use("/api/public", publicRoutes);
 app.use("/api/whatsapp", whatsappRoutes); // Meta delivery-status callbacks for broadcasts
 app.use("/api/files", fileRoutes); // Signed-URL delivery for Railway bucket files
 app.use("/api/health", healthRoutes); // Redis (and future) health checks
+
+// Swagger UI at /api/docs — QA only, and a no-op unless ENABLE_SWAGGER=true.
+// See docs/swagger.js for the gates that keep it off production.
+mountSwagger(app);
 
 
 const PORT = process.env.PORT || 5001;
