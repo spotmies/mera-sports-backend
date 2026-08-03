@@ -25,19 +25,23 @@ SWAGGER_PASSWORD=<something>
 
 ## Why it can't leak to production
 
-`mountSwagger()` is fail-closed and has three independent gates. All three must pass:
+`mountSwagger()` is fail-closed and has two independent gates. Both must pass:
 
 1. `ENABLE_SWAGGER === "true"`. Unset ⇒ off. Production simply never sets it.
-2. `NODE_ENV !== "production"`.
-3. **No live Razorpay key.** A `RAZORPAY_KEY_ID` starting with `rzp_live_` disables the docs regardless of the other two.
+2. **No live Razorpay key.** A `RAZORPAY_KEY_ID` starting with `rzp_live_` disables the docs regardless of gate 1.
 
-Gate 3 is the one that actually protects you. This codebase does not otherwise use `NODE_ENV`, so if someone ever copies the QA environment variables onto the prod service, gates 1 and 2 both pass and only the payment key knows the difference — prod runs live keys, QA runs test keys.
+Gate 2 is the backstop for the one realistic accident — someone copying the QA environment variables onto the prod service. The payment key cannot be wrong about which environment it is: prod runs live keys, QA runs test keys.
+
+> **`NODE_ENV` is deliberately not a gate.** It looks like the obvious check and it is the wrong one here. Railway's builder sets `NODE_ENV=production` on every Node service it deploys, **QA included**, and nothing else in this codebase reads the variable. Gating on it disabled the docs on QA — the exact environment they exist for — while adding nothing on prod, which gate 1 already excludes and gate 2 backstops.
 
 When the docs are blocked, the reason is printed at boot and `/api/docs` is a plain 404:
 
 ```
+📕 API docs disabled (ENABLE_SWAGGER is not set, not "true").
 📕 API docs disabled (a live Razorpay key is configured — this looks like production).
 ```
+
+**Debugging a 404 on QA:** grep the deploy log for `API docs`. One of those `📕` lines tells you which gate closed; `📗 API docs on /api/docs` means it mounted and the problem is elsewhere; *no* line at all means the running build predates this feature and needs a redeploy.
 
 ## Using it (for the testing team)
 
