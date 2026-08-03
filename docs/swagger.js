@@ -85,31 +85,34 @@ export function mountSwagger(app) {
         console.warn("⚠️  API docs are unauthenticated. Set SWAGGER_USER and SWAGGER_PASSWORD to require a login.");
     }
 
-    // The spec is built per request so `servers` reflects the host the tester
-    // actually reached — localhost, the Railway domain, a tunnel — which is
-    // what makes "Try it out" fire at the right origin without any config.
-    const specFor = (req) => buildOpenApiSpec({ serverUrl: `${req.protocol}://${req.get("host")}` });
+    // Built once, here — not per request.
+    //
+    // The obvious-looking `serveFiles(undefined, …)` + per-request `setup()`
+    // does not work: `serveFiles` is what generates `swagger-ui-init.js`, and it
+    // bakes in the document handed to *it*. A later `setup()` never gets a look
+    // in, so the page shipped `swaggerDoc: undefined`, fell back to
+    // `url = window.location.origin`, fetched the site root, and tried to parse
+    // the HTML as YAML — "Parser error on line 14".
+    const spec = buildOpenApiSpec();
 
-    app.get(SPEC_PATH, ...guards, (req, res) => {
-        res.json(specFor(req));
+    app.get(SPEC_PATH, ...guards, (_req, res) => {
+        res.json(spec);
     });
 
     app.use(
         DOCS_PATH,
         ...guards,
-        swaggerUi.serveFiles(undefined, {}),
-        (req, res, next) => {
-            swaggerUi.setup(specFor(req), {
-                customSiteTitle: "Sports Paramount API — QA",
-                swaggerOptions: {
-                    persistAuthorization: true,   // survives a page refresh mid-session
-                    displayRequestDuration: true,
-                    docExpansion: "none",
-                    filter: true,                 // search box over the tag list
-                    tryItOutEnabled: true,
-                },
-            })(req, res, next);
-        }
+        swaggerUi.serve,
+        swaggerUi.setup(spec, {
+            customSiteTitle: "Sports Paramount API — QA",
+            swaggerOptions: {
+                persistAuthorization: true,   // survives a page refresh mid-session
+                displayRequestDuration: true,
+                docExpansion: "none",
+                filter: true,                 // search box over the tag list
+                tryItOutEnabled: true,
+            },
+        })
     );
 
     console.log(`📗 API docs on ${DOCS_PATH} (spec: ${SPEC_PATH})${guards.length ? " — password protected" : ""}`);
