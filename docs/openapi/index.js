@@ -13,6 +13,7 @@ import { commonResponses, parameters, schemas, securitySchemes } from "./compone
 import { adminPaths } from "./paths/admin.js";
 import { authPaths } from "./paths/auth.js";
 import { eventPaths } from "./paths/events.js";
+import { healthPaths } from "./paths/health.js";
 import { playerPaths } from "./paths/player.js";
 import { tournamentPaths } from "./paths/tournament.js";
 
@@ -99,6 +100,7 @@ export function buildOpenApiSpec() {
             ...playerPaths,
             ...adminPaths,
             ...tournamentPaths,
+            ...healthPaths,
         },
         components: {
             securitySchemes,
