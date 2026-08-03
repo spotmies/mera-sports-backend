@@ -2807,7 +2807,11 @@ export const clearCategoryScores = async (req, res) => {
 // Get Matches (Scoreboard) - Public version (no auth required)
 export const getPublicMatches = async (req, res) => {
     const eventIdentifier = req.params.id || req.params.eventId; // Support both :id and :eventId routes
-    const { categoryId, categoryName, roundName, round_name } = req.query;
+    // `bracketId` was read further down but never destructured here, and this
+    // module is ESM (always strict), so the bare reference threw ReferenceError
+    // inside the try — turning EVERY call to this public endpoint into a 500,
+    // league and knockout alike.
+    const { categoryId, categoryName, roundName, round_name, bracketId } = req.query;
 
     if (!eventIdentifier) {
         return res.status(400).json({
@@ -2835,15 +2839,27 @@ export const getPublicMatches = async (req, res) => {
     // No bracket lookup. No label guessing. No partial matching.
     const isLeagueRequest = roundName === 'LEAGUE' || round_name === 'LEAGUE';
 
+    // A bracket-scoped request, normalised once. Only a UUID is honoured:
+    // `matches.bracket_id` is a uuid column, so filtering it by arbitrary text
+    // is a database error rather than an empty result. Anything else falls
+    // through to the category paths below.
+    const bracketFilter = bracketId && isUuid(bracketId) ? bracketId : null;
+
     // Cache scope must name every input that changes the result set, so two
     // different queries can never collide on one key.
     const cacheScope = isLeagueRequest
         ? `league:${categoryId || ''}`
-        : categoryId
-            ? `cat:${categoryId}|${categoryName || ''}`
-            : categoryName
-                ? `name:${categoryName}`
-                : 'all';
+        : bracketFilter
+            // The bracket branch also narrows by category and round, so both
+            // belong in the key. Without the bracket named here every
+            // bracket-only request shared the 'all' scope — and so served the
+            // first one's rows to all the others.
+            ? `bracket:${bracketFilter}|${categoryId || ''}|${roundName || ''}`
+            : categoryId
+                ? `cat:${categoryId}|${categoryName || ''}`
+                : categoryName
+                    ? `name:${categoryName}`
+                    : 'all';
     const cacheKey = matchesCacheKey(eventId, cacheScope);
 
     const cachedPayload = await cacheGet(cacheKey);
@@ -2854,26 +2870,13 @@ export const getPublicMatches = async (req, res) => {
     console.log(`[matches] cache MISS ${cacheKey}`);
 
     try {
-        // ── BRACKET-ID FAST PATH ────────────────────────────────────────────
-        // When the caller supplies a bracketId (UUID of an event_brackets row)
-        // we can skip all category-id guessing and fetch by bracket_id directly.
-        // This is the most precise filter and works even when matches were stored
-        // under a different category_id than the league category.
-        if (bracketId && isUuid(bracketId)) {
-            const { data: bracketMatches, error: bracketMatchError } = await supabaseAdmin
-                .from('matches')
-                .select('id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
-                .eq('event_id', eventId)
-                .eq('bracket_id', bracketId)
-                .order('round_name', { ascending: true })
-                .order('match_index', { ascending: true });
-
-            if (bracketMatchError) throw bracketMatchError;
-
-            const bracketPayload = { success: true, matches: bracketMatches || [] };
-            void cacheSet(cacheKey, bracketPayload, MATCHES_CACHE_TTL);
-            return res.status(200).json(bracketPayload);
-        }
+        // A bracket-scoped fast path used to sit here, running the same query as
+        // the `bracketFilter` branch below but WITHOUT the publication check —
+        // and reached first, so it decided every bracketId request. It never
+        // actually ran (the ReferenceError above killed the request before it),
+        // so restoring the identifier would have opened a hole rather than
+        // preserved behaviour: unpublished draws would leave a public endpoint.
+        // The gated branch below is a strict superset of it, so it is gone.
 
         // 🔒 LEAGUE MODE: HARD-ISOLATE AT QUERY LEVEL (CRITICAL)
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
