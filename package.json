@@ -17,7 +17,9 @@
     "seed:volleyball-league": "node scripts/seed_volleyball_league_event.js",
     "seed:chess-league": "node scripts/seed_chess_league_event.js",
     "seed:heat-events": "node scripts/seed_heat_events.js",
+    "seed:heat-test-event": "node scripts/seed_heat_test_event.js",
     "migrate:passwords": "node scripts/migrate_passwords_bcrypt.js",
+    "docs:check": "node scripts/check_openapi_coverage.mjs",
     "db:local": "node scripts/start-local-postgrest.mjs"
   },
   "dependencies": {
@@ -44,6 +46,7 @@
     "razorpay": "^2.9.6",
     "resend": "^6.18.1",
     "socket.io": "^4.8.3",
+    "swagger-ui-express": "^5.0.1",
     "uuid": "^13.0.0",
     "xlsx": "^0.18.5"
   },
