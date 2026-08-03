@@ -69,16 +69,18 @@ const tags = [
     { name: "Webhooks", description: "Inbound calls from Razorpay and Meta. Not for clients." },
 ];
 
-/**
- * @param {{ serverUrl?: string }} [options]
- */
-export function buildOpenApiSpec({ serverUrl } = {}) {
-    const servers = [];
-    if (serverUrl) servers.push({ url: serverUrl, description: "This server" });
-    if (process.env.SWAGGER_SERVER_URL && process.env.SWAGGER_SERVER_URL !== serverUrl) {
+export function buildOpenApiSpec() {
+    // A relative server URL means "wherever this page is served from", so
+    // Try-it-out inherits the browser's origin *and scheme* automatically.
+    //
+    // Deriving it from the request instead (`${req.protocol}://${req.get('host')}`)
+    // looks more precise and is actively wrong behind Railway: TLS terminates at
+    // the proxy and the app is reached over plain HTTP, so `req.protocol` reports
+    // `http` and every request the docs fire gets blocked as mixed content.
+    const servers = [{ url: "/", description: "This server" }];
+    if (process.env.SWAGGER_SERVER_URL) {
         servers.push({ url: process.env.SWAGGER_SERVER_URL, description: "Configured QA base URL" });
     }
-    if (servers.length === 0) servers.push({ url: "/", description: "This server" });
 
     return {
         openapi: "3.0.3",
