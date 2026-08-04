@@ -2,6 +2,7 @@ import crypto from "crypto";
 import Razorpay from "razorpay";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
+import { invalidateDashboardForRegistration } from "../utils/dashboardCache.js";
 import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { publishReceiptPdf } from "../utils/receiptDelivery.js";
@@ -241,6 +242,11 @@ const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId,
         await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
         throw regError;
     }
+
+    // The player's dashboard is cached for 15 minutes. Without this the person
+    // who just paid keeps seeing "No events found" until the TTL lapses, while
+    // the admin screen already shows their verified registration.
+    await invalidateDashboardForRegistration({ userId, teamId });
 
     return { transaction, registrationNo };
 };
@@ -828,6 +834,10 @@ export const submitManualPayment = async (req, res) => {
             await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
             throw regError;
         }
+
+        // Same reason as the verified path: the cached dashboard predates this
+        // registration and would hide it for up to 15 minutes.
+        await invalidateDashboardForRegistration({ userId, teamId });
 
         // 3. Email + WhatsApp + team notifications (Async)
         dispatchRegistrationSideEffects({

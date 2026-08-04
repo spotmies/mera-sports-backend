@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
+import { invalidateDashboardForRegistration } from "../utils/dashboardCache.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
@@ -183,11 +184,18 @@ export const verifyTransaction = async (req, res) => {
             .from("event_registrations")
             .update({ status: "verified" })
             .eq("id", id)
-            .select("player_id, registration_no, events(name)")
+            .select("player_id, team_id, registration_no, events(name)")
             .maybeSingle();
 
         if (error) throw error;
         if (updatedReg) {
+            // Without this the player's cached dashboard keeps showing the old
+            // status for up to 15 minutes — they get the "verified" WhatsApp
+            // below, open the app, and still see it pending.
+            await invalidateDashboardForRegistration({
+                userId: updatedReg.player_id,
+                teamId: updatedReg.team_id,
+            });
             createNotification(
                 updatedReg.player_id,
                 "Registration Verified",
@@ -210,11 +218,15 @@ export const rejectTransaction = async (req, res) => {
             .from("event_registrations")
             .update({ status: "rejected" })
             .eq("id", id)
-            .select("player_id, registration_no, events(name)")
+            .select("player_id, team_id, registration_no, events(name)")
             .maybeSingle();
 
         if (error) throw error;
         if (updatedReg) {
+            await invalidateDashboardForRegistration({
+                userId: updatedReg.player_id,
+                teamId: updatedReg.team_id,
+            });
             createNotification(
                 updatedReg.player_id,
                 "Registration Rejected",
@@ -240,11 +252,19 @@ export const bulkUpdateTransactions = async (req, res) => {
             .from("event_registrations")
             .update({ status })
             .in("id", ids)
-            .select('id, player_id, registration_no, events(name)');
+            .select('id, player_id, team_id, registration_no, events(name)');
 
         if (error) throw error;
 
         if (updatedRegs) {
+            // Invalidated together, before the notifications go out, so nobody is
+            // told their status changed while the app still shows the old one.
+            await Promise.allSettled(
+                updatedRegs.map(reg =>
+                    invalidateDashboardForRegistration({ userId: reg.player_id, teamId: reg.team_id })
+                )
+            );
+
             const statusLabel = status === 'verified' ? "Verified" : "Rejected";
             updatedRegs.forEach(reg => {
                 const title = status === 'verified' ? "Registration Verified" : "Registration Rejected";
