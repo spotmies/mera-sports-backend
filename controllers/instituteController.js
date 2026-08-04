@@ -3,6 +3,7 @@ import crypto from "crypto";
 import * as xlsx from "xlsx";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { calculateAge } from "../utils/age.js";
+import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { sendWelcomeWhatsApp } from "../utils/whatsapp.js";
 
 /**
@@ -410,9 +411,17 @@ export const finalizeBulkImport = async (req, res) => {
         // the DB sequence (P1001, P1002 …) is assigned without gaps or races.
         // A 30ms yield between inserts prevents Supabase connection pool saturation
         // and ensures concurrent individual registrations always find a free slot.
+        //
+        // Goes through getNextPlayerId() rather than calling the RPC directly, so
+        // this path and individual registration share one generator. When they were
+        // separate — this on the sequence, registration on a JS MAX(player_id)+1 —
+        // the sequence lagged behind the real data and reissued live IDs, which is
+        // how two players ended up holding P100133 and two more P100134 in prod.
         for (const { row, nrow, fName, lName, parsedDob, plainPassword, hashedPassword } of hashedStudents) {
-            const { data: newPlayerId, error: pidError } = await supabaseAdmin.rpc("get_next_player_id");
-            if (pidError || !newPlayerId) {
+            let newPlayerId;
+            try {
+                newPlayerId = await getNextPlayerId();
+            } catch (pidError) {
                 console.error("Failed to generate player_id:", pidError);
                 failed.push({ row, errorField: null, reason: "Failed to generate a Player ID for system registration." });
                 continue;
@@ -461,7 +470,16 @@ export const finalizeBulkImport = async (req, res) => {
                 const msg = insertError.message?.toLowerCase() || "";
 
                 if (msg.includes("duplicate key value") || insertError.code === "23505") {
-                    if (msg.includes("email")) { reason = "Email already exists in the users table."; errorField = "email"; }
+                    // player_id is checked first: it is never a value the institute
+                    // typed, so blaming a sheet column would send them hunting for a
+                    // problem that is not in their data. Reaching here means the
+                    // sequence collided with a live ID despite the RPC's skip loop —
+                    // an infrastructure fault, and the row is safe to retry.
+                    if (msg.includes("player_id")) {
+                        reason = "Player ID generation collided — retry this row. If it repeats, player_id_seq needs resyncing.";
+                        errorField = null;
+                    }
+                    else if (msg.includes("email")) { reason = "Email already exists in the users table."; errorField = "email"; }
                     else if (msg.includes("mobile")) { reason = "Mobile number already exists in the users table."; errorField = "mobile"; }
                     else if (msg.includes("aadhaar")) { reason = "Aadhaar number already exists in the users table."; errorField = "aadhaar"; }
                     else { reason = "Duplicate unique field already exists."; }
