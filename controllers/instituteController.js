@@ -63,6 +63,83 @@ const pickDigits = (normalizedRow, ...aliases) => {
     return val === null ? "" : String(val).replace(/\D/g, "");
 };
 
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/**
+ * Calendar validity, not just range validity — rejects 31-02, 30-02, 31-04.
+ * Postgres would reject those too, but as an opaque insert error attributed to
+ * no particular column; catching them here names the field.
+ */
+const isRealDate = (y, m, d) => {
+    if (!(y >= 1900 && m >= 1 && m <= 12 && d >= 1)) return false;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+};
+
+const toIsoDate = (y, m, d) => (isRealDate(y, m, d) ? `${y}-${pad2(m)}-${pad2(d)}` : null);
+
+/** The date formats a sheet may legitimately use, for error messages. */
+export const ACCEPTED_DOB_FORMATS = "DD-MM-YYYY (e.g. 05-08-2011) or YYYY-MM-DD";
+
+/**
+ * Most students one bulk import may carry.
+ *
+ * Import is sequential by design (bcrypt throttled to 2 at a time, a player-id
+ * round trip and an insert per row, with deliberate yields between) so that a
+ * large import cannot starve concurrent individual registrations. That costs
+ * roughly 150-200ms per student, so this ceiling bounds a single request to a
+ * couple of minutes — under any sane proxy timeout. Raise it only alongside a
+ * resumable/batched import; raising it alone just moves the timeout cliff.
+ */
+export const MAX_BULK_IMPORT_ROWS = Number(process.env.MAX_BULK_IMPORT_ROWS || 500);
+
+/**
+ * Parse a date of birth out of a sheet cell.
+ *
+ * Two bugs previously lived here, both silent:
+ *
+ * 1. The day-first pattern demanded exactly two digits (`\d{2}`), so "1-5-2005"
+ *    fell through to `new Date(text)` — which applies US month-day-year rules and
+ *    turned it into 5 January 2005. The player then got a wrong DOB, a wrong
+ *    DDMMYYYY password they could not log in with, and a wrong age for category
+ *    eligibility. Nothing reported an error.
+ * 2. A real Date cell was serialised with `toISOString()`. xlsx (cellDates:true)
+ *    builds Dates at LOCAL midnight, and in any timezone ahead of UTC — IST
+ *    included — converting to UTC lands on the previous day, shifting every such
+ *    DOB back by one.
+ *
+ * There is deliberately no `new Date(text)` fallback now. An ambiguous string is
+ * rejected so the institute corrects it, because a silently wrong date of birth
+ * is worse than a row that comes back for a fix.
+ */
+const parseSheetDob = (raw) => {
+    if (raw instanceof Date) {
+        if (Number.isNaN(raw.getTime())) return null;
+        // Local getters, matching how the value was constructed.
+        return toIsoDate(raw.getFullYear(), raw.getMonth() + 1, raw.getDate());
+    }
+
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+        // Excel serial date: days since the 1899-12-30 epoch. Built and read back
+        // in UTC so no local timezone can shift it.
+        const d = new Date(Date.UTC(1899, 11, 30) + Math.round(raw) * 86400000);
+        return toIsoDate(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate());
+    }
+
+    const text = String(raw ?? "").trim();
+    if (!text) return null;
+
+    // ISO first — the only unambiguous ordering.
+    const iso = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    if (iso) return toIsoDate(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+
+    // Day-first, the convention the downloadable template documents.
+    const dmy = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+    if (dmy) return toIsoDate(Number(dmy[3]), Number(dmy[2]), Number(dmy[1]));
+
+    return null;
+};
+
 // Mirrors the register form and registerInstitute. Without these the profile
 // endpoint is a back door around every limit the signup form enforces.
 const PROFILE_LIMITS = {
@@ -196,6 +273,27 @@ export const requestBulkApproval = async (req, res) => {
 
         const resolvedInstituteName = institute.institute_name || institute.name || "Unknown Institute";
 
+        // A new request SUPERSEDES anything outstanding for this institute.
+        //
+        // This used to be a bare insert, and nothing anywhere deleted the older
+        // rows, so tickets accumulated indefinitely — one QA institute had ten,
+        // seven of them approved, going back months. Because getApprovalStatus
+        // reads the most recent row, a leftover `is_approved = true` from an
+        // abandoned batch meant the NEXT upload was auto-approved: the institute
+        // staged a fresh sheet, the screen jumped straight to "Approval Granted",
+        // and no admin ever saw the new count. Combined with an unchecked row
+        // count that let an approval for 1 student import an arbitrary number.
+        //
+        // Clearing first also means the admin's pending list never shows two
+        // competing rows for one institute, which is what allowed them to approve
+        // a stale request while the institute waited on a newer one.
+        const { error: clearError } = await supabaseAdmin
+            .from("institute_approvals")
+            .delete()
+            .eq("institute_id", institute_id);
+
+        if (clearError) throw clearError;
+
         // Create approval request
         const { error: insertError } = await supabaseAdmin
             .from("institute_approvals")
@@ -220,13 +318,19 @@ export const cancelBulkApproval = async (req, res) => {
     try {
         const { id: institute_id } = req.user;
 
-        // Only delete rows that are still pending — once approved the institute
-        // must finalize (or the admin must reject it from their side).
+        // Withdraw EVERY ticket for this institute, approved ones included.
+        //
+        // This previously spared approved rows, on the reasoning that consuming
+        // an approval was the institute's call. In practice the institute is
+        // cancelling precisely because the batch is being discarded — and the
+        // spared row then sat there granting silent approval to whatever sheet
+        // was uploaded next, since getApprovalStatus reads the newest row and
+        // does not care which batch it was granted for. An approval is only
+        // meaningful for the specific list of students the admin saw a count of.
         const { error } = await supabaseAdmin
             .from("institute_approvals")
             .delete()
-            .eq("institute_id", institute_id)
-            .eq("is_approved", false);
+            .eq("institute_id", institute_id);
 
         if (error) throw error;
 
@@ -277,7 +381,7 @@ export const finalizeBulkImport = async (req, res) => {
         // CRITICAL SECURITY CHECK: Verify if this institute is approved
         const { data: approval, error: checkError } = await supabaseAdmin
             .from("institute_approvals")
-            .select("id, is_approved, institute_name")
+            .select("id, is_approved, institute_name, student_count")
             .eq("institute_id", institute_id)
             .order("created_at", { ascending: false })
             .limit(1)
@@ -305,6 +409,37 @@ export const finalizeBulkImport = async (req, res) => {
             return res.status(400).json({ success: false, message: "The uploaded Excel sheet is empty." });
         }
 
+        // The approval the admin granted was for a specific number of students —
+        // that count is the whole basis on which they said yes. Nothing used to
+        // check it, so an approval for 5 could finalize a sheet of 500: the
+        // institute only had to clear the staged batch (which leaves an approved
+        // ticket alive, since cancel only withdraws *pending* ones), upload a
+        // different file, and finalize. Fewer rows than approved is fine — rows
+        // get deleted during correction — but more is the hole.
+        const approvedCount = Number(approval.student_count);
+        if (Number.isFinite(approvedCount) && rawStudents.length > approvedCount) {
+            return res.status(403).json({
+                success: false,
+                message: `This sheet has ${rawStudents.length} students but only ${approvedCount} were approved. `
+                    + "Request approval again for the current list."
+            });
+        }
+
+        // Hard ceiling on one import. Each row costs a bcrypt hash, a player-id
+        // round trip and an insert — roughly 150-200ms — so an unbounded sheet
+        // runs for minutes and will hit a proxy or gateway timeout. The client
+        // then sees a failure for an import that is still running and has
+        // already created users, while the approval ticket is deleted at the end
+        // regardless, making a clean retry impossible. Splitting into batches is
+        // the safe shape, so refuse oversized sheets up front with a clear count.
+        if (rawStudents.length > MAX_BULK_IMPORT_ROWS) {
+            return res.status(413).json({
+                success: false,
+                message: `This sheet has ${rawStudents.length} students. `
+                    + `Please split it into batches of ${MAX_BULK_IMPORT_ROWS} or fewer and import them one at a time.`
+            });
+        }
+
         const successful = [];
         const failed = [];
 
@@ -319,32 +454,21 @@ export const finalizeBulkImport = async (req, res) => {
             const lName = pickText(nrow, "lastname", "lname", "surname");
 
             // ── Parse Date of Birth ──────────────────────────────────────────
-            let parsedDob = pickField(nrow, "dob", "dateofbirth", "birthdate", "birthday");
-
-            if (parsedDob instanceof Date) {
-                parsedDob = parsedDob.toISOString().split("T")[0];               // JS Date → YYYY-MM-DD
-            } else if (typeof parsedDob === "number") {
-                // Excel serial date fallback
-                const excelEpoch = new Date(Date.UTC(1899, 11, 30));
-                parsedDob = new Date(excelEpoch.getTime() + parsedDob * 86400000).toISOString().split("T")[0];
-            } else if (typeof parsedDob === "string" && parsedDob.trim() !== "") {
-                // Handle DD-MM-YYYY string
-                const ddmmyyyy = parsedDob.trim().match(/^(\d{2})[-\/](\d{2})[-\/](\d{4})$/);
-                if (ddmmyyyy) {
-                    parsedDob = `${ddmmyyyy[3]}-${ddmmyyyy[2]}-${ddmmyyyy[1]}`;  // → YYYY-MM-DD
-                } else {
-                    const d = new Date(parsedDob);
-                    parsedDob = !isNaN(d.getTime()) ? d.toISOString().split("T")[0] : null;
-                }
-            } else {
-                parsedDob = null;
-            }
+            // See parseSheetDob: day-first with 1-or-2-digit parts, ISO, real
+            // Date cells and Excel serials — but no ambiguous fallback, because
+            // guessing wrong here writes a wrong DOB, a wrong password and a
+            // wrong age with nothing reporting a problem.
+            const rawDob = pickField(nrow, "dob", "dateofbirth", "birthdate", "birthday");
+            const parsedDob = parseSheetDob(rawDob);
 
             if (!parsedDob) {
+                const shown = rawDob instanceof Date ? rawDob.toDateString() : String(rawDob ?? "").trim();
                 failed.push({
                     row,
                     errorField: "dob",
-                    reason: "Date of Birth is required to generate password or date format is invalid."
+                    reason: shown
+                        ? `"${shown}" is not a valid date of birth. Use ${ACCEPTED_DOB_FORMATS}.`
+                        : `Date of Birth is required. Use ${ACCEPTED_DOB_FORMATS}.`
                 });
                 continue;
             }
@@ -458,6 +582,23 @@ export const finalizeBulkImport = async (req, res) => {
                 institute_name: resolvedInstituteName
             };
 
+            // ── Detailed insert logging so Railway console shows exactly what happened ──
+            // Without this, a silent 23505 (duplicate aadhaar/email) looks like a win
+            // because the API always returned 200. The log line includes the field values
+            // (minus the password hash) so we can diagnose header-mapping or constraint issues.
+            const logPayload = {
+                player_id: student.player_id,
+                first_name: student.first_name,
+                last_name: student.last_name,
+                email: student.email,
+                mobile: student.mobile,
+                aadhaar: student.aadhaar ? `***${String(student.aadhaar).slice(-4)}` : null,
+                dob: student.dob,
+                gender: student.gender,
+                institute_name: student.institute_name,
+            };
+            console.log(`[BULK-IMPORT] Attempting insert for: ${JSON.stringify(logPayload)}`);
+
             const { error: insertError } = await supabaseAdmin.from("users").insert(student);
 
             // 30ms yield after each insert — lets other pending DB requests (individual
@@ -469,6 +610,14 @@ export const finalizeBulkImport = async (req, res) => {
                 let errorField = null;
                 const msg = insertError.message?.toLowerCase() || "";
 
+                // Log the full error so Railway shows exactly which constraint fired
+                console.error(`[BULK-IMPORT] INSERT FAILED for ${student.first_name} (${student.player_id}):`, {
+                    code: insertError.code,
+                    message: insertError.message,
+                    details: insertError.details,
+                    hint: insertError.hint,
+                });
+
                 if (msg.includes("duplicate key value") || insertError.code === "23505") {
                     // player_id is checked first: it is never a value the institute
                     // typed, so blaming a sheet column would send them hunting for a
@@ -479,15 +628,20 @@ export const finalizeBulkImport = async (req, res) => {
                         reason = "Player ID generation collided — retry this row. If it repeats, player_id_seq needs resyncing.";
                         errorField = null;
                     }
-                    else if (msg.includes("email")) { reason = "Email already exists in the users table."; errorField = "email"; }
-                    else if (msg.includes("mobile")) { reason = "Mobile number already exists in the users table."; errorField = "mobile"; }
-                    else if (msg.includes("aadhaar")) { reason = "Aadhaar number already exists in the users table."; errorField = "aadhaar"; }
-                    else { reason = "Duplicate unique field already exists."; }
+                    else if (msg.includes("email")) { reason = `Email already registered in the system: ${student.email}`; errorField = "email"; }
+                    else if (msg.includes("mobile")) { reason = `Mobile number already registered: ${student.mobile}`; errorField = "mobile"; }
+                    else if (msg.includes("aadhaar")) { reason = "Aadhaar number already exists in the system."; errorField = "aadhaar"; }
+                    else { reason = `Duplicate unique field: ${insertError.message}`; }
+                } else if (insertError.code === "23502") {
+                    // NOT NULL violation — a required column got a null value
+                    reason = `Required field missing: ${insertError.message}`;
+                    console.error("[BULK-IMPORT] NOT NULL violation — check column mapping:", insertError.message);
                 }
 
                 failed.push({ row, errorField, reason });
             } else {
-                successful.push({ first_name: student.first_name, email: student.email });
+                console.log(`[BULK-IMPORT] ✓ Inserted ${student.first_name} ${student.last_name} as ${student.player_id}`);
+                successful.push({ first_name: student.first_name, last_name: student.last_name, email: student.email, player_id: student.player_id });
 
                 // Welcome WhatsApp — sends name, Player ID and plain-text password.
                 // sendWelcomeWhatsApp catches all errors internally and returns {ok}
@@ -507,14 +661,21 @@ export const finalizeBulkImport = async (req, res) => {
             }
         }
 
-        // DELETE the approval record so it cannot be reused
-        await supabaseAdmin.from("institute_approvals").delete().eq("id", approval.id);
+        // Clear EVERY ticket for this institute, not just the one consumed here.
+        // Deleting only `approval.id` left any older row in place, and since
+        // getApprovalStatus reads the newest row, a stale approved leftover
+        // silently pre-approved the institute's next upload.
+        await supabaseAdmin.from("institute_approvals").delete().eq("institute_id", institute_id);
+
+        console.log(`[BULK-IMPORT] Done. Successful: ${successful.length}, Failed: ${failed.length}`);
 
         return res.status(200).json({
             success: true,
-            message: failed.length > 0
-                ? "Import finished. Some records require correction."
-                : "Import finished successfully.",
+            message: successful.length === 0 && failed.length > 0
+                ? `Import failed — all ${failed.length} record${failed.length !== 1 ? "s" : ""} were rejected. Check the failed panel for reasons.`
+                : failed.length > 0
+                    ? `Import finished. ${successful.length} registered, ${failed.length} require correction.`
+                    : "Import finished successfully.",
             results: { successful, failed }
         });
 

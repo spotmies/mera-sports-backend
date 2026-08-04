@@ -30,9 +30,9 @@ export const getPlayerDashboard = async (req, res) => {
         // instead of ~5 sequential round-trips.
         const [
             { data: schoolDetails },
-            { data: captainTeams },
-            { data: memberTeams },
-            { data: allTeams },
+            { data: captainTeams, error: captainTeamsError },
+            { data: memberTeams, error: memberTeamsError },
+            { data: allTeams, error: allTeamsError },
             { data: transactions },
         ] = await Promise.all([
             supabaseAdmin.from("player_school_details").select("*").eq("player_id", userId).maybeSingle(),
@@ -46,6 +46,14 @@ export const getPlayerDashboard = async (req, res) => {
             supabaseAdmin.from("player_teams").select("id, members"),
             supabaseAdmin.from("transactions").select("*").eq("user_id", userId),
         ]);
+
+        // These three decide `relevantTeamIds`, which decides whether team
+        // registrations appear at all. Swallowing a failure here silently drops
+        // every event the player entered as part of a squad, and the result is
+        // then cached — so it must fail loudly rather than under-report.
+        // schoolDetails and transactions are presentational and stay tolerant.
+        const teamLookupError = captainTeamsError || memberTeamsError || allTeamsError;
+        if (teamLookupError) throw teamLookupError;
 
         if (schoolDetails) player.schoolDetails = schoolDetails;
 
@@ -71,7 +79,16 @@ export const getPlayerDashboard = async (req, res) => {
         } else {
             query = query.eq("player_id", userId);
         }
-        const { data: registrations } = await query;
+        // The error MUST be inspected. Discarding it left `registrations`
+        // undefined, which fell through to `(registrations || [])` and returned
+        // `{ success: true, registrations: [] }` — a 200 that is indistinguishable
+        // from "this player has registered for nothing". Worse, that empty result
+        // was then cached for DASHBOARD_CACHE_TTL, so one transient PostgREST
+        // failure turned into 15 minutes of a paid-up player being told
+        // "No events found" while the admin screen showed their registration.
+        // Failing loudly means the client retries instead of trusting a lie.
+        const { data: registrations, error: registrationsError } = await query;
+        if (registrationsError) throw registrationsError;
 
         // Batch-fetch team details for ALL registrations in one query (was an N+1:
         // one player_teams query per registration → dozens of round-trips).
