@@ -1,39 +1,43 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
 /**
- * Generates the next sequential player ID by parsing the 'P' prefix
- * and finding the maximum numeric value.
+ * The single source of truth for Player IDs.
+ *
+ * This used to compute `MAX(player_id) + 1` in JavaScript: fetch every P-prefixed
+ * id, parse the numeric tail, take the max, add one. That had two fatal flaws.
+ *
+ * 1. It never advanced `player_id_seq`, while the institute bulk importer drew
+ *    from that very sequence via the `get_next_player_id()` RPC. Two generators,
+ *    no shared state — so the sequence sat frozen where it was while individual
+ *    registrations pushed the real maximum up, and every bulk import then walked
+ *    back up through numbers that were already handed out. That is exactly how
+ *    P100133 and P100134 each ended up with two owners in production.
+ * 2. Read-then-write is not atomic. Two registrations landing in the same
+ *    instant both read the same max and both claim max+1.
+ *
+ * Everything now goes through the sequence, which is atomic under concurrency and
+ * shared by every caller. The RPC skips any number already present in `users`, so
+ * a sequence that has drifted behind the data self-heals instead of colliding.
+ *
+ * Requires (see the accompanying SQL):
+ *   - `player_id_seq` resynced above the current maximum
+ *   - the collision-skipping `get_next_player_id()` definition
+ *   - `users_player_id_key` unique index as the last line of defence
  */
 export const getNextPlayerId = async () => {
-    try {
-        // Query users with a Player ID starting with 'P'
-        const { data: users, error } = await supabaseAdmin
-            .from("users")
-            .select("player_id")
-            .like("player_id", "P%")
-            .not("player_id", "is", null);
+    const { data, error } = await supabaseAdmin.rpc("get_next_player_id");
 
-        if (error) {
-            console.error("Failed to fetch player IDs for sequencing:", error);
-            throw new Error("Database error while generating Player ID");
-        }
-
-        if (users && users.length > 0) {
-            // Extract the numeric portion and find the maximum
-            const numericIds = users
-                .map(u => parseInt(u.player_id.substring(1)))
-                .filter(n => !isNaN(n));
-
-            if (numericIds.length > 0) {
-                const maxId = Math.max(...numericIds);
-                return `P${maxId + 1}`;
-            }
-        }
-
-        // Default starting ID if table is empty or has no valid P-IDs
-        return "P1001";
-    } catch (err) {
-        console.error("getNextPlayerId Error:", err);
-        throw err;
+    if (error) {
+        console.error("get_next_player_id RPC failed:", error);
+        throw new Error("Database error while generating Player ID");
     }
+
+    // A null/empty return means the function is missing or was redefined badly.
+    // Failing loudly beats inserting a user with no Player ID.
+    if (!data || typeof data !== "string") {
+        console.error("get_next_player_id returned an unusable value:", data);
+        throw new Error("Database error while generating Player ID");
+    }
+
+    return data;
 };
