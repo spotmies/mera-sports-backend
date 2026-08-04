@@ -1648,6 +1648,31 @@ export const updateBracketMatch = async (req, res) => {
             const safeP1 = (player1 && !isFakeByePlayer(player1)) ? player1 : null;
             const safeP2 = (player2 && !isFakeByePlayer(player2)) ? player2 : null;
 
+            // Validate: a player cannot occupy BOTH slots of THIS match.
+            //
+            // The cross-match checks below deliberately skip `foundMatchIndex` so a
+            // player can be re-seated within their own match. That exemption also
+            // meant nothing stopped the same player being written into both slots,
+            // which is how a draw ended up showing "Team X vs Team X" where it
+            // should have shown "Team X vs BYE" — the top seed was auto-advancing
+            // against itself.
+            const bracketPlayerId = (p) => {
+                if (!p) return "";
+                return String(typeof p === "object" ? (p.id ?? p.player_id ?? p) : p).trim();
+            };
+
+            // Compare what the match will look like AFTER this update: a slot the
+            // request does not mention keeps its current occupant.
+            const resultingP1Id = player1 !== undefined ? bracketPlayerId(safeP1) : bracketPlayerId(match.player1);
+            const resultingP2Id = player2 !== undefined ? bracketPlayerId(safeP2) : bracketPlayerId(match.player2);
+
+            if (resultingP1Id && resultingP1Id === resultingP2Id) {
+                return res.status(400).json({
+                    message: "A player cannot be placed on both sides of the same match",
+                    code: "DUPLICATE_PLAYER_IN_MATCH"
+                });
+            }
+
             // Validate: Player cannot appear twice in same round
             if (safeP1) {
                 const player1Id = typeof player1 === 'object' ? player1.id : player1;
@@ -3193,6 +3218,26 @@ export const assignByeToPlayer = async (req, res) => {
 
         if (!isBye) {
             return res.status(400).json({ message: "Match is not a BYE (both slots occupied or both empty)" });
+        }
+
+        // This endpoint fills the empty side of a BYE, so the chosen player must
+        // not already be somewhere in Round 1. Without this check, picking the
+        // team that already occupies the BYE dropped it into the empty slot too,
+        // producing "Team X vs Team X" with X pre-declared the winner.
+        const bracketPlayerId = (p) => {
+            if (!p) return "";
+            return String(typeof p === "object" ? (p.id ?? p.player_id ?? p) : p).trim();
+        };
+        const assignedId = bracketPlayerId(playerToAssign);
+        const alreadyPlaced = matches.some(
+            (m) => bracketPlayerId(m?.player1) === assignedId || bracketPlayerId(m?.player2) === assignedId
+        );
+
+        if (alreadyPlaced) {
+            return res.status(400).json({
+                message: "That player is already placed in Round 1. Choose a player who is not yet in the draw.",
+                code: "DUPLICATE_PLAYER"
+            });
         }
 
         const slotToFill = p1 ? "player2" : "player1";
