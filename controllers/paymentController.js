@@ -13,9 +13,7 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 // The fee shown in the player app is derived from events.categories (jsonb).
 // It is recomputed here from the same data so the charged amount can never be
 // tampered with from the browser. Mirrors EventRegistration.tsx fee logic.
-const TEAM_MATCH_TYPES = ["doubles", "mixed doubles", "team"];
 const DEFAULT_CATEGORY_FEE = 500; // player-app fallback when a category has no fee
-const MAX_TEAM_MEMBERS = 100;
 
 /**
  * Parses a configured entry fee. Returns null when no fee is recorded, so a
@@ -52,15 +50,20 @@ const findEventCategory = (normalizedCategories, catId) =>
         (c) => c.id === catId || `${c.name}-${c.gender}` === catId || c.name === catId
     ) || null;
 
+// The category's entry fee is the price of ONE entry into that category, whatever
+// an "entry" means for its match type: one player for Singles, one pair for
+// Doubles, one squad for Team. It is never multiplied by the number of people on
+// the entry — a ₹1400 Doubles category costs ₹1400 for the pair, not ₹2800, and a
+// ₹1400 9-a-side Team category costs ₹1400 for the squad, not ₹12,600.
+//
 // Returns { fee, categoryObjects }. Throws (statusCode 400) on unknown category ids.
-const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) => {
+const computeRegistrationFee = (event, requestedCategoryIds) => {
     const normalized = normalizeEventCategories(event);
     // `??` not `||` — a first category priced at 0 must not fall through to the
     // default fee.
     const baseFee = normalized[0]?.entryFee ?? DEFAULT_CATEGORY_FEE;
 
     let feeSum = 0;
-    let hasTeamMatchType = false;
     const categoryObjects = [];
 
     for (const rawId of requestedCategoryIds) {
@@ -73,20 +76,11 @@ const computeRegistrationFee = (event, requestedCategoryIds, teamMemberCount) =>
         }
         const fee = cat.entryFee ?? baseFee;
         feeSum += fee;
-        if (TEAM_MATCH_TYPES.some((t) => cat.matchType.toLowerCase().includes(t))) {
-            hasTeamMatchType = true;
-        }
         categoryObjects.push({ id: cat.id, name: cat.name, gender: cat.gender, fee, matchType: cat.matchType });
     }
 
-    // Team pricing: fee × (captain + members) — members only count for team match types
-    let multiplier = 1;
-    const memberCount = Number.parseInt(teamMemberCount, 10);
-    if (hasTeamMatchType && Number.isInteger(memberCount) && memberCount > 0) {
-        multiplier = 1 + Math.min(memberCount, MAX_TEAM_MEMBERS);
-    }
-
-    return { fee: feeSum * multiplier, categoryObjects };
+    // One entry fee per selected category. Team size is deliberately not a factor.
+    return { fee: feeSum, categoryObjects };
 };
 
 // ── Category eligibility (server-side mirror of the player app's check) ──────
@@ -186,7 +180,7 @@ const rebuildCategoriesFromNotes = async (notes) => {
                 .eq("id", notes.eventId)
                 .maybeSingle();
             if (event) {
-                return computeRegistrationFee(event, String(notes.catIds).split(","), notes.teamMemberCount).categoryObjects;
+                return computeRegistrationFee(event, String(notes.catIds).split(",")).categoryObjects;
             }
         } else if (notes?.categories) {
             return JSON.parse(notes.categories);
@@ -379,7 +373,7 @@ export const createRazorpayOrder = async (req, res) => {
 
         // The server-computed fee is authoritative. The client-sent amount is only
         // compared so a stale or tampered UI fails loudly instead of mischarging.
-        const { fee, categoryObjects } = computeRegistrationFee(event, categories, teamMemberCount);
+        const { fee, categoryObjects } = computeRegistrationFee(event, categories);
 
         // Eligibility is enforced here as well as in the UI — the UI check alone
         // is bypassable. Runs before the order is created so an ineligible player
@@ -415,6 +409,8 @@ export const createRazorpayOrder = async (req, res) => {
                 userId,
                 eventId: String(event.id),
                 catIds: catIds.length <= 250 ? catIds : "",
+                // Informational only — squad size at order time, for support
+                // lookups. It does not affect the price (see computeRegistrationFee).
                 teamMemberCount: String(Number.parseInt(teamMemberCount, 10) || 0),
                 teamId: teamId || "",
             },
@@ -785,7 +781,7 @@ export const submitManualPayment = async (req, res) => {
         // Same eligibility gate as the Razorpay path — manual payments must not
         // be a way around it.
         try {
-            const { categoryObjects } = computeRegistrationFee(eventForEligibility, categories, 0);
+            const { categoryObjects } = computeRegistrationFee(eventForEligibility, categories);
             const { data: payingUser } = await supabaseAdmin
                 .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
             assertPlayerEligible(payingUser, categoryObjects);

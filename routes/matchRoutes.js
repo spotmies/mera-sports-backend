@@ -12,8 +12,19 @@ import {
     updateMatchScore,
     updateRoundSelectedSets
 } from "../controllers/matchController.js";
+import { verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
+
+// Every route here is mounted under /api/admin and every one of them reads or
+// writes match data for an event, so all of them require an admin token.
+//
+// They previously had NO auth middleware at all — unlike bracketRoutes, where
+// every route is gated — which left match creation, score updates, round
+// finalisation and both delete endpoints callable by anyone who could reach the
+// API. The public app never uses these; it reads matches through
+// GET /api/events/:id/matches (getPublicMatches), which stays unauthenticated.
+router.use(verifyAdmin);
 
 // Generate matches from existing bracket (Idempotent)
 // POST /api/admin/matches/generate/:eventId/:categoryId

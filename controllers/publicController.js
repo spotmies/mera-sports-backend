@@ -1,14 +1,8 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
-
-// Simple UUID v4 validator
-const isUuid = (value) => {
-    if (!value || typeof value !== "string") return false;
-    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(
-        value.trim()
-    );
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
 
 /**
  * Sanitize a string for safe use in Supabase ilike / eq filters.
@@ -91,16 +85,59 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
     return results.some(({ data }) => Array.isArray(data) && data.length > 0);
 };
 
+/**
+ * Columns the public events list actually serves.
+ *
+ * Replaces `select("*")`, which shipped all 31 event columns — including
+ * qr_code, payment_qr_image and upi_id, i.e. payment credentials, on an
+ * unauthenticated endpoint. Everything listed here is read by a consumer;
+ * anything not listed had no reader. Add a column here if a client needs it.
+ */
+const PUBLIC_EVENT_LIST_COLUMNS = [
+    "id",
+    "public_id",
+    "name",
+    "sport",
+    "location",
+    "venue",
+    "start_date",
+    "end_date",
+    "start_time",
+    "banner_url",
+    "categories",
+    "created_at",
+].join(", ");
+
+/** Public events list cache lifetime, seconds. Override with EVENTS_LIST_CACHE_TTL_SECONDS. */
+const EVENTS_LIST_CACHE_TTL = Number(process.env.EVENTS_LIST_CACHE_TTL_SECONDS || 300);
+
+/**
+ * Cache key. The endpoint takes no page/filter/search/sort parameters — the
+ * client fetches the list once and filters, sorts and paginates in memory — so
+ * there is exactly one response variant and the key is a constant. Parameter
+ * segments would be dead weight here; add them only if the endpoint ever grows
+ * real query parameters.
+ */
+const EVENTS_LIST_CACHE_KEY = "public:events:list";
+
 // GET /api/public/events/list
 export const listPublicEvents = async (_req, res) => {
     try {
         // Cache-aside: serve the public events list from Redis when warm.
-        const cached = await cacheGet("public:events:list");
-        if (cached) return res.json({ success: true, events: cached });
+        const cached = await cacheGet(EVENTS_LIST_CACHE_KEY);
+        if (cached) {
+            console.log(`[events:list] cache HIT  ${EVENTS_LIST_CACHE_KEY}`);
+            return res.json({ success: true, events: cached });
+        }
+        console.log(`[events:list] cache MISS ${EVENTS_LIST_CACHE_KEY}`);
 
+        // The dropped `event_registrations(count)` embed made PostgREST run a
+        // correlated count per event — 17 sequential scans of an event_registrations
+        // table that has no index on event_id (1088 shared buffers vs ~30 without).
+        // No consumer read the result.
         const { data, error } = await supabaseAdmin
             .from("events")
-            .select("*, event_registrations(count)")
+            .select(PUBLIC_EVENT_LIST_COLUMNS)
             .order("start_date", { ascending: true });
 
         if (error) throw error;
@@ -115,7 +152,7 @@ export const listPublicEvents = async (_req, res) => {
             };
         });
 
-        await cacheSet("public:events:list", events, 60); // 60s TTL
+        await cacheSet(EVENTS_LIST_CACHE_KEY, events, EVENTS_LIST_CACHE_TTL);
         return res.json({ success: true, events });
     } catch (err) {
         console.error("PUBLIC EVENTS LIST ERROR:", err);
@@ -400,58 +437,23 @@ export const getPublicCategoryDraw = async (req, res) => {
 
         const categoryIsUuid = categoryId && isUuid(categoryId);
 
-        let query = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId);
-
-        if (categoryIsUuid) {
-            // STRICT: UUID-based lookup only — never fall back to label for UUID categories.
-            // This prevents a bracket stored under the SAME display name but a DIFFERENT
-            // category UUID from bleeding into this category's draw view.
-            query = query.eq("category_id", categoryId);
-        } else if (categoryLabel) {
-            query = query.eq("category", categoryLabel);
-        } else {
+        if (!categoryId && !categoryLabel) {
             return res.status(400).json({ message: "Category ID or label required" });
         }
 
-        let { data, error } = await query.order("created_at", { ascending: true });
-
-        // Partial matching fallback — ONLY for label-based lookups (no UUID).
-        // When a UUID categoryId is provided, never attempt a label fallback.
-        if ((!data || data.length === 0) && categoryLabel && !categoryIsUuid) {
-            const labelParts = categoryLabel.split(" - ").filter(p => p.trim()).map(p => sanitizeFilterInput(p));
-            if (labelParts.length > 0) {
-                const baseCategory = sanitizeFilterInput(labelParts[0]);
-                const { data: partialData, error: partialError } = await supabaseAdmin
-                    .from("event_brackets")
-                    .select("*")
-                    .eq("event_id", eventId)
-                    .ilike("category", `${baseCategory}%`)
-                    .order("created_at", { ascending: true });
-
-                if (!partialError && partialData && partialData.length > 0) {
-                    if (partialData.length === 1) {
-                        data = partialData;
-                        error = null;
-                    } else {
-                        const exactishMatch = partialData.filter(row => {
-                            const storedLabel = (row.category || "").toLowerCase();
-                            return labelParts.every(part => storedLabel.includes(part.toLowerCase()));
-                        });
-                        if (exactishMatch.length > 0) {
-                            data = exactishMatch;
-                            error = null;
-                        }
-                    }
-                }
-            }
-        }
+        // A non-UUID category id had NO branch here at all: the UUID test failed, the
+        // public app deliberately sends no categoryLabel (a name-based lookup can
+        // match a same-named sibling category), and the fall-through returned 400.
+        // Every category the event form creates has a numeric-string id, so the
+        // public draw endpoint answered 400 for all of them.
+        //
+        // The shared resolver keeps the strict UUID behaviour intact and adds the
+        // id-in-`category` case that brackets are actually stored under.
+        let data = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel);
 
         // Additional safety: if we got results via label lookup but one of the rows has a
         // different UUID category_id, filter those out to prevent cross-category leaking.
-        if (data && data.length > 0 && !categoryIsUuid && categoryId) {
+        if (data.length > 0 && !categoryIsUuid && categoryId) {
             const exactIdMatches = data.filter(row =>
                 !row.category_id || !isUuid(row.category_id) || row.category_id === categoryId
             );
@@ -459,8 +461,6 @@ export const getPublicCategoryDraw = async (req, res) => {
                 data = exactIdMatches;
             }
         }
-
-        if (error) throw error;
 
         // If no rows found at all, return empty draw
         if (!data || data.length === 0) {
@@ -551,14 +551,20 @@ export const getPublicEventDraws = async (req, res) => {
 
         if (error) throw error;
 
-        // Group by category_id or category label
+        // Group by category_id or category label.
+        // `category` holds the category ID itself for every non-UUID category (the
+        // id-keyed form), so reporting it as `categoryLabel` with a null
+        // `categoryId` hands callers a "label" of "1785400000042" and no id to
+        // match on. Detect that shape and report it as the id it is.
         const categoryMap = {};
         for (const row of (data || [])) {
             const key = row.category_id || row.category || row.id;
             if (!categoryMap[key]) {
+                const catStr = row.category || "";
+                const isIdKeyed = Boolean(catStr) && /^\d/.test(catStr) && !catStr.includes(" ");
                 categoryMap[key] = {
-                    categoryId: row.category_id,
-                    categoryLabel: row.category,
+                    categoryId: row.category_id || (isIdKeyed ? catStr : null),
+                    categoryLabel: isIdKeyed ? null : row.category,
                     media: null,
                     bracket: null
                 };

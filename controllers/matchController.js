@@ -1,12 +1,16 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { validateBracketIntegrity } from "../middleware/bracketValidation.js";
 import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import {
+    MATCHES_CACHE_TTL,
+    invalidateMatchesCache,
+    matchesCacheKey,
+    matchesResolveKey,
+} from "../utils/matchesCache.js";
 
-// Helper function to check if string is UUID
-const isUuid = (str) => {
-    if (!str || typeof str !== 'string') return false;
-    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
-};
+// The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
+import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
 
 /** Normalize round name for consistent matching. ALWAYS use for any round_name comparison. */
 const normalizeRoundName = (s) => String(s ?? "").trim().toLowerCase();
@@ -95,6 +99,27 @@ const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categor
     return anyPublished;
 };
 
+/**
+ * The brackets of an event that are published, i.e. visible to the public.
+ *
+ * Every row in `matches` carries a `bracket_id` (812/812 in QA), so the bracket
+ * row's own `published` flag is an exact gate for its matches — no category-key
+ * guessing required, which matters because that key is not written consistently.
+ *
+ * Returns null when the event has nothing published, so callers can short-circuit
+ * to an empty list rather than build an `in.()` filter on an empty array.
+ */
+const getPublishedBracketIds = async (eventId) => {
+    const { data, error } = await supabaseAdmin
+        .from('event_brackets')
+        .select('id')
+        .eq('event_id', eventId)
+        .eq('published', true);
+    if (error) throw error;
+    const ids = (data || []).map((row) => row.id).filter(Boolean);
+    return ids.length > 0 ? ids : null;
+};
+
 const parseSetsPerMatch = (rawValue, fallback = 1) => {
     // Clamp the fallback itself so callers can't accidentally pass an out-of-range default.
     const safeFallback = Number.isInteger(fallback) && fallback >= 1 && fallback <= MAX_SETS_PER_MATCH
@@ -137,35 +162,22 @@ export const generateMatchesFromBracket = async (req, res) => {
     const winnerMode = req.body?.winnerMode || 'set_based'; // Winner mode: 'set_based', 'score_based', or 'match_based'
 
     try {
-        // 1. Fetch Bracket Data with UUID-safe query
-        let bracketQuery = supabaseAdmin
-            .from('event_brackets')
-            .select('*')
-            .eq('event_id', eventId)
-            .eq('mode', 'BRACKET');
+        // 1. Fetch Bracket Data. The label used to be preferred over a non-UUID id,
+        // which looked past the row a league-to-bracket conversion had just written
+        // under that id — see utils/categoryKeys.js.
+        const bracketRows = await fetchCategoryBracketRows(
+            eventId,
+            categoryId && categoryId !== 'label' ? categoryId : null,
+            categoryLabel,
+            { mode: 'BRACKET' }
+        );
+        const bracketData = bracketRows[0] || null;
 
-        // Only filter by category_id if it's a valid UUID
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq('category_id', categoryId);
-        } else if (categoryLabel) {
-            // If not UUID, use categoryLabel from query/body
-            bracketQuery = bracketQuery.eq('category', categoryLabel);
-        } else if (categoryId && categoryId !== 'label') {
-            // Fallback: try to match by categoryId as category name (for backward compatibility)
-            bracketQuery = bracketQuery.eq('category', categoryId);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: `Bracket not found or not in BRACKET mode. Category: ${categoryLabel || categoryId}`,
-                debug: {
-                    categoryId,
-                    categoryLabel,
-                    error: bracketError?.message
-                }
+                debug: { categoryId, categoryLabel }
             });
         }
 
@@ -246,7 +258,18 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const isBye = (hasPlayer1 && !hasPlayer2) || (!hasPlayer1 && hasPlayer2);
                 const isEmpty = !hasPlayer1 && !hasPlayer2;
 
-                const matchCategoryId = bracketCategoryId || categoryId;
+                // Must agree with createFullBracketStructure (bracketController "START
+                // ROUNDS") — one category with two keys means every read that filters
+                // on one loses the other's rounds. Both now write the caller's
+                // category id, because that is what every reader of
+                // `matches.category_id` filters with (the column is text, so a
+                // numeric-string id is a legitimate value). The bracket row's own key
+                // is the fallback for callers that pass no id at all.
+                const matchCategoryId =
+                    (categoryId ? String(categoryId) : null) ||
+                    bracketCategoryId ||
+                    bracketData.category ||
+                    categoryLabel;
 
                 // Check if this match already exists and is COMPLETED
                 const existingMatch = existingMatchesMap.get(bracketMatchId);
@@ -296,7 +319,7 @@ export const generateMatchesFromBracket = async (req, res) => {
                 const bracketDataObj = bracketData.bracket_data || bracketData.bracketData || {};
                 const rounds = bracketDataObj.rounds || [];
                 const roundIndex = rounds.findIndex((r) => r && r.name === roundName);
-                
+
                 if (roundIndex !== -1) {
                     // Update the round's setsConfig with the selected sets
                     if (!rounds[roundIndex].setsConfig) {
@@ -306,13 +329,13 @@ export const generateMatchesFromBracket = async (req, res) => {
                     rounds[roundIndex].setsConfig.selectedSets = setsPerMatch;
                     // Store the winner mode (set_based or score_based)
                     rounds[roundIndex].setsConfig.winnerMode = winnerMode;
-                    
+
                     // Update bracket_data in database
                     const updatedBracketData = {
                         ...bracketDataObj,
                         rounds: rounds
                     };
-                    
+
                     await supabaseAdmin
                         .from('event_brackets')
                         .update({
@@ -327,6 +350,7 @@ export const generateMatchesFromBracket = async (req, res) => {
             }
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Processed matches. Created/Updated: ${createdCount}, Skipped (no ID): ${skippedCount}, Updated (player changes): ${updatedCount}`,
@@ -361,22 +385,12 @@ export const updateRoundSelectedSets = async (req, res) => {
             });
         }
 
-        // Fetch bracket for this event/category
-        let bracketQuery = supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
+        // Fetch bracket for this event/category — id first, label only as fallback
+        // (see utils/categoryKeys.js).
+        const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: "BRACKET" });
+        const bracketData = bracketRows[0] || null;
 
-        if (categoryId && isUuid(categoryId)) {
-            bracketQuery = bracketQuery.eq("category_id", categoryId);
-        } else if (categoryName) {
-            bracketQuery = bracketQuery.eq("category", categoryName);
-        }
-
-        const { data: bracketData, error: bracketError } = await bracketQuery.maybeSingle();
-
-        if (bracketError || !bracketData) {
+        if (!bracketData) {
             return res.status(404).json({
                 success: false,
                 message: "Bracket not found for this event/category"
@@ -453,6 +467,7 @@ export const updateRoundSelectedSets = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: "Selected sets updated for round",
@@ -867,6 +882,7 @@ export const generateLeagueMatches = async (req, res) => {
         }
 
         if (toInsert.length === 0) {
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "League matches already generated for all participant pairs",
@@ -1089,6 +1105,7 @@ export const createMatch = async (req, res) => {
             throw error;
         }
 
+        await invalidateMatchesCache(data?.event_id);
         return res.status(201).json({ success: true, match: data });
 
     } catch (error) {
@@ -1236,6 +1253,11 @@ export const createMatchesBulk = async (req, res) => {
             throw error;
         }
 
+        // A bulk payload can in principle span events; purge every one it touched.
+        for (const insertedEventId of new Set((data || []).map(m => m?.event_id).filter(Boolean))) {
+            await invalidateMatchesCache(insertedEventId);
+        }
+
         return res.status(201).json({
             success: true,
             createdCount: Array.isArray(data) ? data.length : 0,
@@ -1263,18 +1285,18 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
         }
         return false;
     };
-    
+
     // If match row already has valid players, use them
     if (hasValidPlayer(matchRow.player_a) && hasValidPlayer(matchRow.player_b)) {
         return { playerA: matchRow.player_a, playerB: matchRow.player_b };
     }
-    
+
     // Try to get from bracket if bracket_match_id exists
     if (bracketDataObj && matchRow.bracket_match_id) {
         const rounds = bracketDataObj.rounds || [];
         const bid = String(matchRow.bracket_match_id).trim();
         let foundMatch = null;
-        
+
         for (const round of rounds) {
             const ms = round.matches || [];
             for (const m of ms) {
@@ -1288,7 +1310,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
             }
             if (foundMatch) break;
         }
-        
+
         if (foundMatch) {
             // Helper: resolve the winner feeding into a specific side ("player1"/"player2")
             // for this bracket match, by looking at feeder matches with winnerTo === this id
@@ -1394,7 +1416,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
                     p2 = feederWinnerForP2;
                 }
             }
-            
+
             // Debug logging
             if (!p1 || !p2) {
                 console.warn(`[getMatchPlayers] Found bracket match ${bid} but players are missing:`, {
@@ -1404,7 +1426,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
                     dbPlayerB: matchRow.player_b
                 });
             }
-            
+
             return { playerA: p1, playerB: p2 };
         } else {
             // Debug: log what we're looking for vs what's available
@@ -1420,7 +1442,7 @@ const getMatchPlayers = (matchRow, bracketDataObj, allMatchesByBracketId = null)
             console.warn(`[getMatchPlayers] Could not find bracket match with id "${bid}". Available match IDs:`, allMatchIds.slice(0, 10));
         }
     }
-    
+
     // Fallback: return from match row if valid, otherwise null
     return {
         playerA: hasValidPlayer(matchRow.player_a) ? matchRow.player_a : null,
@@ -1480,7 +1502,7 @@ export const updateMatchScore = async (req, res) => {
         // Resolve effective players for winner calculation (use updatePayload if we just set them)
         const effectivePlayerA = updatePayload.player_a ?? currentMatch.player_a;
         const effectivePlayerB = updatePayload.player_b ?? currentMatch.player_b;
-        
+
         // Helper to extract valid player id (never return empty object)
         const getPlayerId = (player) => {
             if (!player) return null;
@@ -1499,15 +1521,15 @@ export const updateMatchScore = async (req, res) => {
         // CRITICAL: When status is COMPLETED, always compute winner from score if missing or invalid.
         // This ensures scores from scoreboard result in proper winner storage (never {}).
         // Check if winner is missing or invalid (empty object, null, undefined)
-        const hasValidWinner = updatePayload.winner && 
+        const hasValidWinner = updatePayload.winner &&
             (typeof updatePayload.winner === 'string' || typeof updatePayload.winner === 'number' ||
-             (typeof updatePayload.winner === 'object' && Object.keys(updatePayload.winner).length > 0 && (updatePayload.winner.id || updatePayload.winner.player_id)));
-        
+                (typeof updatePayload.winner === 'object' && Object.keys(updatePayload.winner).length > 0 && (updatePayload.winner.id || updatePayload.winner.player_id)));
+
         if (status === 'COMPLETED' && !hasValidWinner) {
             const finalScore = score || currentMatch.score;
             // Determine winnerMode: prefer explicit request body, then score payload, then bracket config
             const requestWinnerMode = req.body?.winnerMode || finalScore?.winnerMode || null;
-            
+
             if (finalScore) {
                 // Check if score uses sets format
                 if (Array.isArray(finalScore.sets) && finalScore.sets.length > 0) {
@@ -1570,7 +1592,7 @@ export const updateMatchScore = async (req, res) => {
                     const winnerIdA = getPlayerId(effectivePlayerA);
                     const winnerIdB = getPlayerId(effectivePlayerB);
                     const isLeagueMatch = String(currentMatch.round_name || '').trim().toUpperCase() === 'LEAGUE';
-                    
+
                     if (!winnerIdA || !winnerIdB) {
                         console.warn(`Cannot compute winner for match ${matchId}: missing valid player_a or player_b. player_a:`, effectivePlayerA, 'player_b:', effectivePlayerB);
                         // Don't set winner if we can't determine it - let admin fix player_a/player_b first
@@ -1621,7 +1643,7 @@ export const updateMatchScore = async (req, res) => {
                     const p2Score = parseInt(finalScore.player2 || finalScore.player_b || 0);
                     const winnerIdA = getPlayerId(effectivePlayerA);
                     const winnerIdB = getPlayerId(effectivePlayerB);
-                    
+
                     if (!winnerIdA || !winnerIdB) {
                         console.warn(`Cannot compute winner for match ${matchId}: missing valid player_a or player_b. player_a:`, effectivePlayerA, 'player_b:', effectivePlayerB);
                         // Don't set winner if we can't determine it
@@ -1648,6 +1670,7 @@ export const updateMatchScore = async (req, res) => {
 
         if (error) throw error;
 
+        await invalidateMatchesCache(data?.event_id);
         return res.status(200).json({ success: true, match: data });
 
     } catch (error) {
@@ -1723,25 +1746,14 @@ export const finalizeRoundMatches = async (req, res) => {
         let bracketDataObjForFinalize = null;
         try {
             // Always try to fetch bracket data if we have eventId and category info
-            let bracketQuery = supabaseAdmin
-                .from('event_brackets')
-                .select('id, bracket_data, draw_data')
-                .eq('event_id', eventId)
-                .eq('mode', 'BRACKET');
-            if (categoryId && isUuid(categoryId)) {
-                bracketQuery = bracketQuery.eq('category_id', categoryId);
-            } else if (categoryName) {
-                bracketQuery = bracketQuery.eq('category', categoryName);
-            }
-            const { data: bracketData, error: bracketFetchError } = await bracketQuery.maybeSingle();
-            if (bracketFetchError) {
-                console.error("[Finalize] Error fetching bracket:", bracketFetchError);
-            } else if (bracketData) {
+            const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: 'BRACKET' });
+            const bracketData = bracketRows[0] || null;
+            if (bracketData) {
                 // Try bracket_data first, then draw_data
                 bracketDataObjForFinalize = bracketData.bracket_data || bracketData.draw_data || {};
                 const rounds = bracketDataObjForFinalize.rounds || [];
                 console.log(`[Finalize] Fetched bracket with ${rounds.length} rounds:`, rounds.map(r => r.name));
-                
+
                 // If roundName provided, try to get setsPerMatch and winnerMode from that specific round
                 if (roundName) {
                     // Normalize round name comparison (case-insensitive, trim whitespace)
@@ -1831,11 +1843,11 @@ export const finalizeRoundMatches = async (req, res) => {
             let effectivePlayerA = existingMatch.player_a;
             let effectivePlayerB = existingMatch.player_b;
             let bracketDataForMatch = bracketDataObjForFinalize;
-            
+
             // Check if players are missing or empty
             const hasValidA = effectivePlayerA && typeof effectivePlayerA === 'object' && Object.keys(effectivePlayerA).length > 0 && (effectivePlayerA.id || effectivePlayerA.player_id);
             const hasValidB = effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id);
-            
+
             // If players are missing, try to get from bracket
             if ((!hasValidA || !hasValidB) && existingMatch.bracket_id && existingMatch.bracket_match_id) {
                 // Only fetch bracket if we don't have it cached yet (avoid redundant per-match fetches)
@@ -1858,7 +1870,7 @@ export const finalizeRoundMatches = async (req, res) => {
                         console.error(`[Finalize] Exception fetching bracket for match ${matchData.matchId}:`, err);
                     }
                 }
-                
+
                 // Try bracket lookup with current bracket data
                 if (bracketDataForMatch) {
                     const enriched = getMatchPlayers(existingMatch, bracketDataForMatch, allMatchesByBracketId);
@@ -1869,7 +1881,7 @@ export const finalizeRoundMatches = async (req, res) => {
                         effectivePlayerB = enriched.playerB;
                     }
                 }
-                
+
                 // Debug logging if players still missing
                 if (!effectivePlayerA || !effectivePlayerB) {
                     const bracketRounds = bracketDataForMatch?.rounds || [];
@@ -1892,10 +1904,10 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                 }
             }
-            
+
             // Check if we need to persist players (when they were enriched from bracket)
             const needPersistPlayers = (!hasValidA && effectivePlayerA && typeof effectivePlayerA === 'object' && Object.keys(effectivePlayerA).length > 0 && (effectivePlayerA.id || effectivePlayerA.player_id)) ||
-                                      (!hasValidB && effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id));
+                (!hasValidB && effectivePlayerB && typeof effectivePlayerB === 'object' && Object.keys(effectivePlayerB).length > 0 && (effectivePlayerB.id || effectivePlayerB.player_id));
 
             const score = matchData.score;
             let finalScore;
@@ -1937,7 +1949,7 @@ export const finalizeRoundMatches = async (req, res) => {
                 // Extract valid player ids (never use empty objects)
                 const winnerIdA = getPlayerId(effectivePlayerA);
                 const winnerIdB = getPlayerId(effectivePlayerB);
-                
+
                 if (!winnerIdA || !winnerIdB) {
                     // Skip this match instead of failing the entire batch
                     const matchInfo = `Match ${matchData.matchId} (${existingMatch.round_name}, bracket_match_id: ${existingMatch.bracket_match_id || 'none'})`;
@@ -1952,7 +1964,7 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                     continue;
                 }
-                
+
                 if (categoryWinnerMode === 'score_based') {
                     // Score-based: winner decided by total points across ALL sets
                     // Tiebreak: player who won more sets
@@ -2029,7 +2041,7 @@ export const finalizeRoundMatches = async (req, res) => {
                 // Extract valid player ids (never use empty objects)
                 const winnerIdA = getPlayerId(effectivePlayerA);
                 const winnerIdB = getPlayerId(effectivePlayerB);
-                
+
                 if (!winnerIdA || !winnerIdB) {
                     // Skip this match instead of failing the entire batch
                     const matchInfo = `Match ${matchData.matchId} (${existingMatch.round_name}, bracket_match_id: ${existingMatch.bracket_match_id || 'none'})`;
@@ -2044,7 +2056,7 @@ export const finalizeRoundMatches = async (req, res) => {
                     });
                     continue;
                 }
-                
+
                 if (p1Score > p2Score) {
                     winner = winnerIdA;
                 } else if (p2Score > p1Score) {
@@ -2081,375 +2093,362 @@ export const finalizeRoundMatches = async (req, res) => {
         // Update all matches in DB (include player_a/player_b when enriched)
         let results = [];
         if (updates.length > 0) {
-        const updatePromises = updates.map(update => {
-            const payload = {
-                score: update.score,
-                winner: update.winner,
-                status: update.status,
-                updated_at: update.updated_at
-            };
-            if (update.player_a !== undefined) payload.player_a = update.player_a;
-            if (update.player_b !== undefined) payload.player_b = update.player_b;
-            return supabaseAdmin
-                .from('matches')
-                .update(payload)
-                .eq('id', update.id)
-                .select()
-                .single();
-        });
-
-        results = await Promise.all(updatePromises);
-        const errors = results.filter(r => r.error);
-
-        if (errors.length > 0) {
-            console.error("Finalize matches errors:", errors);
-            return res.status(500).json({
-                success: false,
-                message: "Failed to finalize some matches",
-                errors: errors.map(e => e.error?.message)
+            const updatePromises = updates.map(update => {
+                const payload = {
+                    score: update.score,
+                    winner: update.winner,
+                    status: update.status,
+                    updated_at: update.updated_at
+                };
+                if (update.player_a !== undefined) payload.player_a = update.player_a;
+                if (update.player_b !== undefined) payload.player_b = update.player_b;
+                return supabaseAdmin
+                    .from('matches')
+                    .update(payload)
+                    .eq('id', update.id)
+                    .select()
+                    .single();
             });
-        }
+
+            results = await Promise.all(updatePromises);
+            const errors = results.filter(r => r.error);
+
+            if (errors.length > 0) {
+                console.error("Finalize matches errors:", errors);
+                return res.status(500).json({
+                    success: false,
+                    message: "Failed to finalize some matches",
+                    errors: errors.map(e => e.error?.message)
+                });
+            }
         } // end if (updates.length > 0)
 
         // ---- Winner propagation through bracket_data using bracket_match_id ----
         if (updates.length > 0) {
-        try {
-            // Bracket lookup must be robust:
-            // - Some deployments store non-UUID category IDs (numeric/string) in category_id
-            // - Some UIs pass categoryName with extra suffixes; exact equality can fail
-            // Strategy: try category_id first (any string), then exact category name, then partial match.
-            let bracketRows = null;
-            let bracketErr = null;
+            try {
+                // Bracket lookup must be robust:
+                // - Some deployments store non-UUID category IDs (numeric/string) in category_id
+                // - Some UIs pass categoryName with extra suffixes; exact equality can fail
+                // Strategy: try category_id first (any string), then exact category name, then partial match.
+                let bracketRows = null;
+                let bracketErr = null;
 
-            if (categoryId) {
-                const r1 = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('*')
-                    .eq('event_id', eventId)
-                    .eq('mode', 'BRACKET')
-                    .eq('category_id', categoryId);
-                bracketRows = r1.data;
-                bracketErr = r1.error;
-            }
-
-            if ((!bracketRows || bracketRows.length === 0) && categoryName) {
-                const r2 = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('*')
-                    .eq('event_id', eventId)
-                    .eq('mode', 'BRACKET')
-                    .eq('category', categoryName);
-                bracketRows = r2.data;
-                bracketErr = r2.error;
-
-                // Partial match fallback (matches getCategoryDraw behavior)
-                if ((!bracketRows || bracketRows.length === 0) && categoryName) {
-                    const baseCategory = String(categoryName).split(" - ").filter(p => String(p).trim())[0] || String(categoryName);
-                    const r3 = await supabaseAdmin
+                if (categoryId) {
+                    const r1 = await supabaseAdmin
                         .from('event_brackets')
                         .select('*')
                         .eq('event_id', eventId)
                         .eq('mode', 'BRACKET')
-                        .ilike('category', `%${baseCategory}%`)
-                        .order('created_at', { ascending: true });
-                    bracketRows = r3.data;
-                    bracketErr = r3.error;
+                        .eq('category_id', categoryId);
+                    bracketRows = r1.data;
+                    bracketErr = r1.error;
                 }
-            }
 
-            if (!bracketErr && bracketRows && bracketRows.length > 0) {
-                const bracket = bracketRows[0];
-                const bracketDataObj = bracket.bracket_data || bracket.bracketData || { rounds: [], players: [] };
-                const rounds = Array.isArray(bracketDataObj.rounds) ? bracketDataObj.rounds : [];
+                if ((!bracketRows || bracketRows.length === 0) && categoryName) {
+                    const r2 = await supabaseAdmin
+                        .from('event_brackets')
+                        .select('*')
+                        .eq('event_id', eventId)
+                        .eq('mode', 'BRACKET')
+                        .eq('category', categoryName);
+                    bracketRows = r2.data;
+                    bracketErr = r2.error;
 
-                const integrity = validateBracketIntegrity(bracketDataObj);
-                if (!integrity.valid) {
-                    // AUTO-REPAIR: Reconstruct missing winnerTo/winnerToSlot linkage.
-                    // Old brackets (created before linkage was added) may lack these fields.
-                    // Without them, winner propagation to the next round is impossible.
-                    let repaired = false;
-                    const roundCount = rounds.length;
-                    for (let rIdx = 0; rIdx < roundCount - 1; rIdx++) {
-                        const round = rounds[rIdx];
-                        const matches = Array.isArray(round?.matches) ? round.matches : [];
-                        for (let mIdx = 0; mIdx < matches.length; mIdx++) {
-                            const m = matches[mIdx];
-                            if (!m) continue;
-                            if (m.winnerTo == null || m.winnerToSlot == null) {
-                                // matchNumber is 1-based (mIdx is 0-based)
-                                const matchNum = mIdx + 1;
-                                const nextRoundIndex = rIdx + 1;
-                                const nextMatchNumber = Math.ceil(matchNum / 2);
-                                m.winnerTo = `R${nextRoundIndex + 1}-M${nextMatchNumber}`;
-                                m.winnerToSlot = matchNum % 2 === 1 ? "player1" : "player2";
-                                repaired = true;
+                }
+
+                if (!bracketErr && bracketRows && bracketRows.length > 0) {
+                    const bracket = bracketRows[0];
+                    const bracketDataObj = bracket.bracket_data || bracket.bracketData || { rounds: [], players: [] };
+                    const rounds = Array.isArray(bracketDataObj.rounds) ? bracketDataObj.rounds : [];
+
+                    const integrity = validateBracketIntegrity(bracketDataObj);
+                    if (!integrity.valid) {
+                        // AUTO-REPAIR: Reconstruct missing winnerTo/winnerToSlot linkage.
+                        // Old brackets (created before linkage was added) may lack these fields.
+                        // Without them, winner propagation to the next round is impossible.
+                        let repaired = false;
+                        const roundCount = rounds.length;
+                        for (let rIdx = 0; rIdx < roundCount - 1; rIdx++) {
+                            const round = rounds[rIdx];
+                            const matches = Array.isArray(round?.matches) ? round.matches : [];
+                            for (let mIdx = 0; mIdx < matches.length; mIdx++) {
+                                const m = matches[mIdx];
+                                if (!m) continue;
+                                if (m.winnerTo == null || m.winnerToSlot == null) {
+                                    // matchNumber is 1-based (mIdx is 0-based)
+                                    const matchNum = mIdx + 1;
+                                    const nextRoundIndex = rIdx + 1;
+                                    const nextMatchNumber = Math.ceil(matchNum / 2);
+                                    m.winnerTo = `R${nextRoundIndex + 1}-M${nextMatchNumber}`;
+                                    m.winnerToSlot = matchNum % 2 === 1 ? "player1" : "player2";
+                                    repaired = true;
+                                }
                             }
                         }
-                    }
-                    if (repaired) {
-                        console.log("[Finalize] Auto-repaired missing winnerTo/winnerToSlot in bracket_data");
-                        // Re-validate after repair
-                        const recheck = validateBracketIntegrity(bracketDataObj);
-                        if (!recheck.valid) {
-                            console.warn("Bracket integrity still invalid after repair:", recheck.errors);
-                            // Skip propagation to avoid wrong mapping; scores are still saved
+                        if (repaired) {
+                            console.log("[Finalize] Auto-repaired missing winnerTo/winnerToSlot in bracket_data");
+                            // Re-validate after repair
+                            const recheck = validateBracketIntegrity(bracketDataObj);
+                            if (!recheck.valid) {
+                                console.warn("Bracket integrity still invalid after repair:", recheck.errors);
+                                // Skip propagation to avoid wrong mapping; scores are still saved
+                            }
+                        }
+                        if (!repaired) {
+                            console.warn("Bracket integrity check failed before propagation:", integrity.errors);
+                            // Skip propagation to avoid Semifinal wrong mapping; scores are still saved
                         }
                     }
-                    if (!repaired) {
-                        console.warn("Bracket integrity check failed before propagation:", integrity.errors);
-                        // Skip propagation to avoid Semifinal wrong mapping; scores are still saved
-                    }
-                }
-                // Proceed with propagation if integrity is valid (either originally or after repair)
-                if (validateBracketIntegrity(bracketDataObj).valid) {
+                    // Proceed with propagation if integrity is valid (either originally or after repair)
+                    if (validateBracketIntegrity(bracketDataObj).valid) {
 
-                const matchIndexById = new Map();
-                const roundIndexByName = new Map();
-                rounds.forEach((round, rIdx) => {
-                    if (round && typeof round.name === "string") {
-                        roundIndexByName.set(normalizeRoundName(round.name), rIdx);
-                    }
-                    const ms = Array.isArray(round.matches) ? round.matches : [];
-                    ms.forEach((m, mIdx) => {
-                        if (m && m.id) {
-                            matchIndexById.set(String(m.id).trim(), { roundIndex: rIdx, matchIndex: mIdx });
+                        const matchIndexById = new Map();
+                        const roundIndexByName = new Map();
+                        rounds.forEach((round, rIdx) => {
+                            if (round && typeof round.name === "string") {
+                                roundIndexByName.set(normalizeRoundName(round.name), rIdx);
+                            }
+                            const ms = Array.isArray(round.matches) ? round.matches : [];
+                            ms.forEach((m, mIdx) => {
+                                if (m && m.id) {
+                                    matchIndexById.set(String(m.id).trim(), { roundIndex: rIdx, matchIndex: mIdx });
+                                }
+                            });
+                        });
+
+                        const downstreamUpdates = new Map();
+                        for (const update of updates) {
+                            if (!update.winner) continue;
+                            const existingMatch = existingMatches.find(m => m.id === update.id);
+                            if (!existingMatch) continue;
+
+                            let loc = null;
+                            const key = existingMatch.bracket_match_id ? String(existingMatch.bracket_match_id).trim() : null;
+                            if (key) {
+                                loc = matchIndexById.get(key) || null;
+                            }
+                            if (!loc) {
+                                const rn = normalizeRoundName(existingMatch.round_name);
+                                const rIdx = roundIndexByName.has(rn) ? roundIndexByName.get(rn) : rounds.findIndex((r) => r && normalizeRoundName(r.name) === rn);
+                                const mIdx = typeof existingMatch.match_index === "number" ? existingMatch.match_index : -1;
+                                if (rIdx >= 0 && mIdx >= 0 && rounds[rIdx]?.matches?.[mIdx]) {
+                                    loc = { roundIndex: rIdx, matchIndex: mIdx };
+                                    try {
+                                        await supabaseAdmin
+                                            .from("matches")
+                                            .update({ bracket_match_id: String(rounds[rIdx].matches[mIdx].id) })
+                                            .eq("id", existingMatch.id);
+                                    } catch (e) { /* ignore */ }
+                                }
+                            }
+                            if (!loc) continue;
+
+                            const currentRound = rounds[loc.roundIndex];
+                            const bracketMatch = currentRound?.matches?.[loc.matchIndex] || null;
+                            if (!bracketMatch) continue;
+
+                            // Bracket player ids (used for winner resolution and for setting bracketMatch.winner)
+                            const bP1Id = bracketMatch.player1 && (bracketMatch.player1.id || bracketMatch.player1);
+                            const bP2Id = bracketMatch.player2 && (bracketMatch.player2.id || bracketMatch.player2);
+
+                            // Determine winner player object – prefer authoritative matches table players,
+                            // then fall back to bracket_data players if needed. This avoids cases where
+                            // bracket_data player1/player2 order doesn't match player_a/player_b.
+                            const winnerId = String(update.winner);
+                            let winnerPlayer = null;
+
+                            // 1) Prefer matches table player_a / player_b (authoritative for A/B sides)
+                            const mP1 = existingMatch.player_a;
+                            const mP2 = existingMatch.player_b;
+                            const mP1Id = mP1 && (mP1.id || mP1.player_id || mP1);
+                            const mP2Id = mP2 && (mP2.id || mP2.player_id || mP2);
+
+                            if (mP1Id && String(mP1Id) === winnerId) {
+                                winnerPlayer = mP1;
+                            } else if (mP2Id && String(mP2Id) === winnerId) {
+                                winnerPlayer = mP2;
+                            }
+
+                            // 2) Fallback: use bracket_data player1 / player2 if they match the winner id
+                            if (!winnerPlayer) {
+                                if (bP1Id && String(bP1Id) === winnerId) {
+                                    winnerPlayer = bracketMatch.player1;
+                                } else if (bP2Id && String(bP2Id) === winnerId) {
+                                    winnerPlayer = bracketMatch.player2;
+                                }
+                            }
+
+                            if (!winnerPlayer) continue;
+
+                            // Store winner reference on this bracket node (for visualization)
+                            if (!bracketMatch.winner) {
+                                if (bP1Id && String(bP1Id) === winnerId) {
+                                    bracketMatch.winner = "player1";
+                                } else if (bP2Id && String(bP2Id) === winnerId) {
+                                    bracketMatch.winner = "player2";
+                                }
+                            }
+
+                            // HARDENED: Use ONLY winnerTo/winnerToSlot from bracket. Never derive slot from index.
+                            let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
+                            let targetSlot = bracketMatch.winnerToSlot || null;
+
+                            // Legacy: only if bracket has no linkage (old data), infer from index once
+                            if ((!targetId || !targetSlot) && (loc.roundIndex < rounds.length - 1)) {
+                                const fallbackRoundIndex = loc.roundIndex + 1;
+                                const nextMatchIndex = Math.floor(loc.matchIndex / 2);
+                                const nextSlot = (loc.matchIndex % 2 === 0) ? "player1" : "player2";
+                                const downstreamRound = rounds[fallbackRoundIndex];
+                                if (downstreamRound?.matches?.[nextMatchIndex]?.id) {
+                                    targetId = String(downstreamRound.matches[nextMatchIndex].id);
+                                    targetSlot = nextSlot;
+                                }
+                            }
+
+                            if (!targetId || !targetSlot) continue;
+
+                            const downstreamLoc = matchIndexById.get(String(targetId));
+                            if (!downstreamLoc) continue;
+
+                            const downstreamRound = rounds[downstreamLoc.roundIndex];
+                            if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
+
+                            const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
+                            if (!downstreamMatch) continue;
+
+                            // Assign winner to the correct slot; this supports partial completion
+                            downstreamMatch[targetSlot] = winnerPlayer;
+
+                            // Collect downstream match update for bulk execution
+                            const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
+                            const targetKey = String(targetId);
+
+                            if (!downstreamUpdates.has(targetKey)) {
+                                downstreamUpdates.set(targetKey, {
+                                    bracket_id: bracket.id,
+                                    bracket_match_id: targetKey,
+                                    updated_at: new Date().toISOString()
+                                });
+                            }
+                            downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
                         }
-                    });
-                });
 
-                const downstreamUpdates = new Map();
-                for (const update of updates) {
-                    if (!update.winner) continue;
-                    const existingMatch = existingMatches.find(m => m.id === update.id);
-                    if (!existingMatch) continue;
+                        // ── BYE winner propagation ──
+                        // The frontend skips BYE matches when finalizing (no scores to enter),
+                        // so their winners are never in the `updates` array above. We must
+                        // propagate them here for the current round so that downstream matches
+                        // (e.g., Quarterfinal) get BOTH feeder players.
+                        const normalizedFinalizingRound = normalizeRoundName(roundName);
+                        const finalizingRoundIdx = roundIndexByName.has(normalizedFinalizingRound)
+                            ? roundIndexByName.get(normalizedFinalizingRound)
+                            : rounds.findIndex(r => r && normalizeRoundName(r.name) === normalizedFinalizingRound);
 
-                    let loc = null;
-                    const key = existingMatch.bracket_match_id ? String(existingMatch.bracket_match_id).trim() : null;
-                    if (key) {
-                        loc = matchIndexById.get(key) || null;
-                    }
-                    if (!loc) {
-                        const rn = normalizeRoundName(existingMatch.round_name);
-                        const rIdx = roundIndexByName.has(rn) ? roundIndexByName.get(rn) : rounds.findIndex((r) => r && normalizeRoundName(r.name) === rn);
-                        const mIdx = typeof existingMatch.match_index === "number" ? existingMatch.match_index : -1;
-                        if (rIdx >= 0 && mIdx >= 0 && rounds[rIdx]?.matches?.[mIdx]) {
-                            loc = { roundIndex: rIdx, matchIndex: mIdx };
+                        if (finalizingRoundIdx >= 0 && finalizingRoundIdx < rounds.length) {
+                            const currentRoundObj = rounds[finalizingRoundIdx];
+                            const currentRoundMatches = Array.isArray(currentRoundObj.matches) ? currentRoundObj.matches : [];
+
+                            // Set of bracket_match_ids already processed in the normal propagation loop above
+                            const alreadyPropagatedIds = new Set();
+                            for (const update of updates) {
+                                const em = existingMatches.find(m => m.id === update.id);
+                                if (em && em.bracket_match_id) alreadyPropagatedIds.add(String(em.bracket_match_id).trim());
+                            }
+
+                            for (let mIdx = 0; mIdx < currentRoundMatches.length; mIdx++) {
+                                const bracketMatch = currentRoundMatches[mIdx];
+                                if (!bracketMatch) continue;
+                                const bmId = String(bracketMatch.id || "").trim();
+                                if (alreadyPropagatedIds.has(bmId)) continue; // already handled
+
+                                // Detect BYE: one real player, one empty
+                                const hasP1 = bracketMatch.player1 && typeof bracketMatch.player1 === 'object' && (bracketMatch.player1.id || bracketMatch.player1.player_id);
+                                const hasP2 = bracketMatch.player2 && typeof bracketMatch.player2 === 'object' && (bracketMatch.player2.id || bracketMatch.player2.player_id);
+                                const isBye = (hasP1 && !hasP2) || (!hasP1 && hasP2);
+                                if (!isBye) continue;
+
+                                const winnerPlayer = hasP1 ? bracketMatch.player1 : bracketMatch.player2;
+                                const winnerSide = hasP1 ? "player1" : "player2";
+
+                                // Mark winner on the bracket node if not already set
+                                if (!bracketMatch.winner) {
+                                    bracketMatch.winner = winnerSide;
+                                }
+
+                                // Find downstream target
+                                let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
+                                let targetSlot = bracketMatch.winnerToSlot || null;
+
+                                // Legacy fallback: derive from index
+                                if ((!targetId || !targetSlot) && (finalizingRoundIdx < rounds.length - 1)) {
+                                    const nextRoundIndex = finalizingRoundIdx + 1;
+                                    const nextMatchIndex = Math.floor(mIdx / 2);
+                                    const slot = (mIdx % 2 === 0) ? "player1" : "player2";
+                                    const downRound = rounds[nextRoundIndex];
+                                    if (downRound?.matches?.[nextMatchIndex]?.id) {
+                                        targetId = String(downRound.matches[nextMatchIndex].id);
+                                        targetSlot = slot;
+                                    }
+                                }
+
+                                if (!targetId || !targetSlot) continue;
+
+                                const downstreamLoc = matchIndexById.get(String(targetId));
+                                if (!downstreamLoc) continue;
+
+                                const downstreamRound = rounds[downstreamLoc.roundIndex];
+                                if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
+                                const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
+                                if (!downstreamMatch) continue;
+
+                                downstreamMatch[targetSlot] = winnerPlayer;
+                                console.log(`[Finalize] BYE winner propagated: ${bmId} → ${targetId}.${targetSlot}`);
+
+                                const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
+                                const targetKey = String(targetId);
+                                if (!downstreamUpdates.has(targetKey)) {
+                                    downstreamUpdates.set(targetKey, {
+                                        bracket_id: bracket.id,
+                                        bracket_match_id: targetKey,
+                                        updated_at: new Date().toISOString()
+                                    });
+                                }
+                                downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
+                            }
+                        }
+
+                        // Perform bulk update for downstream matches
+                        if (downstreamUpdates.size > 0) {
                             try {
                                 await supabaseAdmin
-                                    .from("matches")
-                                    .update({ bracket_match_id: String(rounds[rIdx].matches[mIdx].id) })
-                                    .eq("id", existingMatch.id);
-                            } catch (e) { /* ignore */ }
-                        }
-                    }
-                    if (!loc) continue;
-
-                    const currentRound = rounds[loc.roundIndex];
-                    const bracketMatch = currentRound?.matches?.[loc.matchIndex] || null;
-                    if (!bracketMatch) continue;
-
-                    // Bracket player ids (used for winner resolution and for setting bracketMatch.winner)
-                    const bP1Id = bracketMatch.player1 && (bracketMatch.player1.id || bracketMatch.player1);
-                    const bP2Id = bracketMatch.player2 && (bracketMatch.player2.id || bracketMatch.player2);
-
-                    // Determine winner player object – prefer authoritative matches table players,
-                    // then fall back to bracket_data players if needed. This avoids cases where
-                    // bracket_data player1/player2 order doesn't match player_a/player_b.
-                    const winnerId = String(update.winner);
-                    let winnerPlayer = null;
-
-                    // 1) Prefer matches table player_a / player_b (authoritative for A/B sides)
-                    const mP1 = existingMatch.player_a;
-                    const mP2 = existingMatch.player_b;
-                    const mP1Id = mP1 && (mP1.id || mP1.player_id || mP1);
-                    const mP2Id = mP2 && (mP2.id || mP2.player_id || mP2);
-
-                    if (mP1Id && String(mP1Id) === winnerId) {
-                        winnerPlayer = mP1;
-                    } else if (mP2Id && String(mP2Id) === winnerId) {
-                        winnerPlayer = mP2;
-                    }
-
-                    // 2) Fallback: use bracket_data player1 / player2 if they match the winner id
-                    if (!winnerPlayer) {
-                        if (bP1Id && String(bP1Id) === winnerId) {
-                            winnerPlayer = bracketMatch.player1;
-                        } else if (bP2Id && String(bP2Id) === winnerId) {
-                            winnerPlayer = bracketMatch.player2;
-                        }
-                    }
-
-                    if (!winnerPlayer) continue;
-
-                    // Store winner reference on this bracket node (for visualization)
-                    if (!bracketMatch.winner) {
-                        if (bP1Id && String(bP1Id) === winnerId) {
-                            bracketMatch.winner = "player1";
-                        } else if (bP2Id && String(bP2Id) === winnerId) {
-                            bracketMatch.winner = "player2";
-                        }
-                    }
-
-                    // HARDENED: Use ONLY winnerTo/winnerToSlot from bracket. Never derive slot from index.
-                    let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
-                    let targetSlot = bracketMatch.winnerToSlot || null;
-
-                    // Legacy: only if bracket has no linkage (old data), infer from index once
-                    if ((!targetId || !targetSlot) && (loc.roundIndex < rounds.length - 1)) {
-                        const fallbackRoundIndex = loc.roundIndex + 1;
-                        const nextMatchIndex = Math.floor(loc.matchIndex / 2);
-                        const nextSlot = (loc.matchIndex % 2 === 0) ? "player1" : "player2";
-                        const downstreamRound = rounds[fallbackRoundIndex];
-                        if (downstreamRound?.matches?.[nextMatchIndex]?.id) {
-                            targetId = String(downstreamRound.matches[nextMatchIndex].id);
-                            targetSlot = nextSlot;
-                        }
-                    }
-
-                    if (!targetId || !targetSlot) continue;
-
-                    const downstreamLoc = matchIndexById.get(String(targetId));
-                    if (!downstreamLoc) continue;
-
-                    const downstreamRound = rounds[downstreamLoc.roundIndex];
-                    if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
-
-                    const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
-                    if (!downstreamMatch) continue;
-
-                    // Assign winner to the correct slot; this supports partial completion
-                    downstreamMatch[targetSlot] = winnerPlayer;
-
-                    // Collect downstream match update for bulk execution
-                    const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
-                    const targetKey = String(targetId);
-                    
-                    if (!downstreamUpdates.has(targetKey)) {
-                        downstreamUpdates.set(targetKey, {
-                            bracket_id: bracket.id,
-                            bracket_match_id: targetKey,
-                            updated_at: new Date().toISOString()
-                        });
-                    }
-                    downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
-                }
-
-                // ── BYE winner propagation ──
-                // The frontend skips BYE matches when finalizing (no scores to enter),
-                // so their winners are never in the `updates` array above. We must
-                // propagate them here for the current round so that downstream matches
-                // (e.g., Quarterfinal) get BOTH feeder players.
-                const normalizedFinalizingRound = normalizeRoundName(roundName);
-                const finalizingRoundIdx = roundIndexByName.has(normalizedFinalizingRound)
-                    ? roundIndexByName.get(normalizedFinalizingRound)
-                    : rounds.findIndex(r => r && normalizeRoundName(r.name) === normalizedFinalizingRound);
-
-                if (finalizingRoundIdx >= 0 && finalizingRoundIdx < rounds.length) {
-                    const currentRoundObj = rounds[finalizingRoundIdx];
-                    const currentRoundMatches = Array.isArray(currentRoundObj.matches) ? currentRoundObj.matches : [];
-
-                    // Set of bracket_match_ids already processed in the normal propagation loop above
-                    const alreadyPropagatedIds = new Set();
-                    for (const update of updates) {
-                        const em = existingMatches.find(m => m.id === update.id);
-                        if (em && em.bracket_match_id) alreadyPropagatedIds.add(String(em.bracket_match_id).trim());
-                    }
-
-                    for (let mIdx = 0; mIdx < currentRoundMatches.length; mIdx++) {
-                        const bracketMatch = currentRoundMatches[mIdx];
-                        if (!bracketMatch) continue;
-                        const bmId = String(bracketMatch.id || "").trim();
-                        if (alreadyPropagatedIds.has(bmId)) continue; // already handled
-
-                        // Detect BYE: one real player, one empty
-                        const hasP1 = bracketMatch.player1 && typeof bracketMatch.player1 === 'object' && (bracketMatch.player1.id || bracketMatch.player1.player_id);
-                        const hasP2 = bracketMatch.player2 && typeof bracketMatch.player2 === 'object' && (bracketMatch.player2.id || bracketMatch.player2.player_id);
-                        const isBye = (hasP1 && !hasP2) || (!hasP1 && hasP2);
-                        if (!isBye) continue;
-
-                        const winnerPlayer = hasP1 ? bracketMatch.player1 : bracketMatch.player2;
-                        const winnerSide = hasP1 ? "player1" : "player2";
-
-                        // Mark winner on the bracket node if not already set
-                        if (!bracketMatch.winner) {
-                            bracketMatch.winner = winnerSide;
-                        }
-
-                        // Find downstream target
-                        let targetId = bracketMatch.winnerTo != null ? String(bracketMatch.winnerTo).trim() : null;
-                        let targetSlot = bracketMatch.winnerToSlot || null;
-
-                        // Legacy fallback: derive from index
-                        if ((!targetId || !targetSlot) && (finalizingRoundIdx < rounds.length - 1)) {
-                            const nextRoundIndex = finalizingRoundIdx + 1;
-                            const nextMatchIndex = Math.floor(mIdx / 2);
-                            const slot = (mIdx % 2 === 0) ? "player1" : "player2";
-                            const downRound = rounds[nextRoundIndex];
-                            if (downRound?.matches?.[nextMatchIndex]?.id) {
-                                targetId = String(downRound.matches[nextMatchIndex].id);
-                                targetSlot = slot;
+                                    .from('matches')
+                                    .upsert(Array.from(downstreamUpdates.values()), {
+                                        onConflict: 'bracket_id,bracket_match_id'
+                                    });
+                            } catch (dbUpdateErr) {
+                                console.error("Failed to bulk update downstream matches in DB:", dbUpdateErr);
                             }
                         }
 
-                        if (!targetId || !targetSlot) continue;
+                    } // end integrity.valid
 
-                        const downstreamLoc = matchIndexById.get(String(targetId));
-                        if (!downstreamLoc) continue;
+                    // Persist updated bracket_data if any changes were made
+                    const { error: updErr } = await supabaseAdmin
+                        .from('event_brackets')
+                        .update({
+                            bracket_data: { ...bracketDataObj, rounds },
+                            draw_data: { ...bracketDataObj, rounds },
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq('id', bracket.id);
 
-                        const downstreamRound = rounds[downstreamLoc.roundIndex];
-                        if (!downstreamRound || !Array.isArray(downstreamRound.matches)) continue;
-                        const downstreamMatch = downstreamRound.matches[downstreamLoc.matchIndex];
-                        if (!downstreamMatch) continue;
-
-                        downstreamMatch[targetSlot] = winnerPlayer;
-                        console.log(`[Finalize] BYE winner propagated: ${bmId} → ${targetId}.${targetSlot}`);
-
-                        const dbTargetSlot = (targetSlot === 'player1') ? 'player_a' : 'player_b';
-                        const targetKey = String(targetId);
-                        if (!downstreamUpdates.has(targetKey)) {
-                            downstreamUpdates.set(targetKey, {
-                                bracket_id: bracket.id,
-                                bracket_match_id: targetKey,
-                                updated_at: new Date().toISOString()
-                            });
-                        }
-                        downstreamUpdates.get(targetKey)[dbTargetSlot] = winnerPlayer;
+                    if (updErr) {
+                        console.error("Bracket winner propagation update error:", updErr);
                     }
                 }
-
-                // Perform bulk update for downstream matches
-                if (downstreamUpdates.size > 0) {
-                    try {
-                        await supabaseAdmin
-                            .from('matches')
-                            .upsert(Array.from(downstreamUpdates.values()), { 
-                                onConflict: 'bracket_id,bracket_match_id' 
-                            });
-                    } catch (dbUpdateErr) {
-                        console.error("Failed to bulk update downstream matches in DB:", dbUpdateErr);
-                    }
-                }
-
-                } // end integrity.valid
-
-                // Persist updated bracket_data if any changes were made
-                const { error: updErr } = await supabaseAdmin
-                    .from('event_brackets')
-                    .update({
-                        bracket_data: { ...bracketDataObj, rounds },
-                        draw_data: { ...bracketDataObj, rounds },
-                        updated_at: new Date().toISOString()
-                    })
-                    .eq('id', bracket.id);
-
-                if (updErr) {
-                    console.error("Bracket winner propagation update error:", updErr);
-                }
+            } catch (propErr) {
+                console.error("Winner propagation through bracket_data failed:", propErr);
+                // Non-fatal: scores are still saved, bracket view just won't update for this call.
             }
-        } catch (propErr) {
-            console.error("Winner propagation through bracket_data failed:", propErr);
-            // Non-fatal: scores are still saved, bracket view just won't update for this call.
-        }
         } // end if (updates.length > 0) for winner propagation
 
         // If all matches were skipped (none could be finalized), report as error
@@ -2461,6 +2460,7 @@ export const finalizeRoundMatches = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: skippedMatches.length > 0
@@ -2525,6 +2525,7 @@ export const deleteMatch = async (req, res) => {
             });
         }
 
+        await invalidateMatchesCache(data[0]?.event_id);
         return res.status(200).json({
             success: true,
             message: "Match deleted successfully",
@@ -2565,6 +2566,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2631,6 +2633,7 @@ export const deleteCategoryMatches = async (req, res) => {
         }
 
         if (matchesToDelete.length === 0) {
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found matching the specified category",
@@ -2657,6 +2660,7 @@ export const deleteCategoryMatches = async (req, res) => {
             deletedCount += deletedData?.length || 0;
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Deleted ${deletedCount} match(es) for this category`,
@@ -2698,6 +2702,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!allMatches || allMatches.length === 0) {
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found for this category",
@@ -2753,6 +2758,7 @@ export const clearCategoryScores = async (req, res) => {
         }
 
         if (!matchesToUpdate || matchesToUpdate.length === 0) {
+            await invalidateMatchesCache(eventId);
             return res.status(200).json({
                 success: true,
                 message: "No matches found to clear scores for this category/round",
@@ -2783,6 +2789,7 @@ export const clearCategoryScores = async (req, res) => {
             updatedCount += Array.isArray(updated) ? updated.length : 0;
         }
 
+        await invalidateMatchesCache(eventId);
         return res.status(200).json({
             success: true,
             message: `Cleared scores for ${updatedCount} match(es)`,
@@ -2800,7 +2807,11 @@ export const clearCategoryScores = async (req, res) => {
 // Get Matches (Scoreboard) - Public version (no auth required)
 export const getPublicMatches = async (req, res) => {
     const eventIdentifier = req.params.id || req.params.eventId; // Support both :id and :eventId routes
-    const { categoryId, categoryName, roundName, round_name } = req.query;
+    // `bracketId` was read further down but never destructured here, and this
+    // module is ESM (always strict), so the bare reference threw ReferenceError
+    // inside the try — turning EVERY call to this public endpoint into a 500,
+    // league and knockout alike.
+    const { categoryId, categoryName, roundName, round_name, bracketId } = req.query;
 
     if (!eventIdentifier) {
         return res.status(400).json({
@@ -2810,7 +2821,16 @@ export const getPublicMatches = async (req, res) => {
         });
     }
 
-    const eventId = await resolveEventIdByIdentifier(eventIdentifier);
+    // Identifier -> internal id. Cached because the mapping is immutable and
+    // resolving a public identifier costs up to two sequential `events` lookups
+    // that would otherwise be paid even on a cache hit.
+    let eventId = await cacheGet(matchesResolveKey(eventIdentifier));
+    if (!eventId) {
+        eventId = await resolveEventIdByIdentifier(eventIdentifier);
+        if (eventId) {
+            void cacheSet(matchesResolveKey(eventIdentifier), eventId, MATCHES_CACHE_TTL);
+        }
+    }
     if (!eventId) {
         return res.status(404).json({ success: false, message: "Event not found" });
     }
@@ -2819,7 +2839,45 @@ export const getPublicMatches = async (req, res) => {
     // No bracket lookup. No label guessing. No partial matching.
     const isLeagueRequest = roundName === 'LEAGUE' || round_name === 'LEAGUE';
 
+    // A bracket-scoped request, normalised once. Only a UUID is honoured:
+    // `matches.bracket_id` is a uuid column, so filtering it by arbitrary text
+    // is a database error rather than an empty result. Anything else falls
+    // through to the category paths below.
+    const bracketFilter = bracketId && isUuid(bracketId) ? bracketId : null;
+
+    // Cache scope must name every input that changes the result set, so two
+    // different queries can never collide on one key.
+    const cacheScope = isLeagueRequest
+        ? `league:${categoryId || ''}`
+        : bracketFilter
+            // The bracket branch also narrows by category and round, so both
+            // belong in the key. Without the bracket named here every
+            // bracket-only request shared the 'all' scope — and so served the
+            // first one's rows to all the others.
+            ? `bracket:${bracketFilter}|${categoryId || ''}|${roundName || ''}`
+            : categoryId
+                ? `cat:${categoryId}|${categoryName || ''}`
+                : categoryName
+                    ? `name:${categoryName}`
+                    : 'all';
+    const cacheKey = matchesCacheKey(eventId, cacheScope);
+
+    const cachedPayload = await cacheGet(cacheKey);
+    if (cachedPayload) {
+        console.log(`[matches] cache HIT  ${cacheKey}`);
+        return res.status(200).json(cachedPayload);
+    }
+    console.log(`[matches] cache MISS ${cacheKey}`);
+
     try {
+        // A bracket-scoped fast path used to sit here, running the same query as
+        // the `bracketFilter` branch below but WITHOUT the publication check —
+        // and reached first, so it decided every bracketId request. It never
+        // actually ran (the ReferenceError above killed the request before it),
+        // so restoring the identifier would have opened a hole rather than
+        // preserved behaviour: unpublished draws would leave a public endpoint.
+        // The gated branch below is a strict superset of it, so it is gone.
+
         // 🔒 LEAGUE MODE: HARD-ISOLATE AT QUERY LEVEL (CRITICAL)
         // Query Supabase directly with exact filters - DO NOT fetch all matches first
         // This eliminates all contamination from matches with wrong/null category_id
@@ -2853,123 +2911,144 @@ export const getPublicMatches = async (req, res) => {
                 .eq('event_id', eventId)
                 .eq('round_name', 'LEAGUE')
                 .order('match_index', { ascending: true });
-                
+
             // Apply category filter to matches (category_id in matches table is a text/varchar so it accepts string IDs)
             matchQuery = matchQuery.eq('category_id', categoryId);
-            
+
             const { data: leagueMatches, error: leagueError } = await matchQuery;
 
             if (leagueError) {
                 throw leagueError;
             }
 
-            return res.status(200).json({
-                success: true,
-                matches: leagueMatches || []
-            });
+            const leaguePayload = { success: true, matches: leagueMatches || [] };
+            void cacheSet(cacheKey, leaguePayload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+            return res.status(200).json(leaguePayload);
         }
 
-        // For non-LEAGUE requests, fetch all matches (existing logic for knockout brackets)
-        let query = supabaseAdmin
-            .from('matches')
-            .select('id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id')
-            .eq('event_id', eventId)
-            .order('round_name', { ascending: true })
-            .order('match_index', { ascending: true });
+        // ---------------------------------------------------------------
+        // NON-LEAGUE (knockout / bracket) PATH
+        //
+        // Previously this fetched EVERY match in the event and filtered them
+        // in JS. Two things were wrong with that:
+        //
+        //   1. It transferred the whole event. On the largest QA event that is
+        //      269 rows / 122KB to return 148 rows / 70KB, and it forced a
+        //      Seq Scan (521 rows discarded) where an index exists.
+        //   2. When categoryId was supplied it first ran up to three
+        //      event_brackets lookups plus one events lookup to widen the set
+        //      of accepted category keys -- and then rebuilt that set to hold
+        //      nothing but categoryId (and categoryName when given). Those
+        //      round trips could not affect the response.
+        //
+        // So: work out the accepted keys FIRST, then let Postgres do the
+        // filtering on idx_matches_event_category. Same rows, same order,
+        // same response shape.
+        // ---------------------------------------------------------------
+        const matchSelect = 'id, round_name, match_index, bracket_match_id, player_a, player_b, score, status, winner, updated_at, category_id, event_id';
 
-        const { data: allMatches, error: queryError } = await query;
-
-        if (queryError) {
-            throw queryError;
+        // THIS IS A PUBLIC ENDPOINT — nothing unpublished may leave it.
+        //
+        // The LEAGUE path above has always checked publication; these knockout
+        // paths never did, so an anonymous caller could read draws the admin had
+        // not released yet (497 of 812 match rows in QA belong to unpublished
+        // brackets). Resolve the published set once and gate every branch below
+        // on it.
+        const publishedBracketIds = await getPublishedBracketIds(eventId);
+        if (!publishedBracketIds) {
+            const emptyPayload = { success: true, matches: [] };
+            void cacheSet(cacheKey, emptyPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(emptyPayload);
         }
 
-        // If no category filter, return all matches
+        // Bracket-scoped request. `bracket_id` is a foreign key to the bracket row
+        // that owns these matches, so it is exact on its own — no category widening
+        // and no label guessing. It is checked BEFORE the whole-event branch below,
+        // which is the branch a bracketId-only request used to land in.
+        if (bracketFilter) {
+            // An unpublished bracket is simply not visible here.
+            if (!publishedBracketIds.includes(bracketFilter)) {
+                const hiddenPayload = { success: true, matches: [] };
+                void cacheSet(cacheKey, hiddenPayload, MATCHES_CACHE_TTL);
+                return res.status(200).json(hiddenPayload);
+            }
+
+            let bracketQuery = supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .eq('bracket_id', bracketFilter);
+
+            // A category, when supplied alongside, only narrows further.
+            if (categoryId) bracketQuery = bracketQuery.eq('category_id', categoryId);
+            if (roundName) bracketQuery = bracketQuery.eq('round_name', roundName);
+
+            const { data: bracketMatches, error: bracketMatchError } = await bracketQuery
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (bracketMatchError) {
+                throw bracketMatchError;
+            }
+
+            const bracketPayload = { success: true, matches: bracketMatches || [] };
+            void cacheSet(cacheKey, bracketPayload, MATCHES_CACHE_TTL);
+            return res.status(200).json(bracketPayload);
+        }
+
+        // No category filter: the caller genuinely wants the whole event —
+        // restricted to what has actually been published.
         if (!categoryId && !categoryName) {
-            return res.status(200).json({ success: true, matches: allMatches || [] });
+            const { data: allMatches, error: allError } = await supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (allError) {
+                throw allError;
+            }
+
+            const allPayload = { success: true, matches: allMatches || [] };
+            void cacheSet(cacheKey, allPayload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+            return res.status(200).json(allPayload);
         }
 
-        // Try to find matching category IDs from event_brackets
-        // This handles cases where category_id in matches might differ from what frontend sends
-        let matchingCategoryIds = new Set();
+        const matchingCategoryIds = new Set();
 
         if (categoryId) {
+            // Exact keys only. This is what the old code narrowed down to after
+            // its lookups, so the lookups are skipped rather than reproduced.
             matchingCategoryIds.add(categoryId);
-        }
+            if (categoryName) matchingCategoryIds.add(categoryName);
+        } else {
+            // categoryName-only fallback: matches.category_id is not written
+            // consistently (sometimes the category's id, sometimes its display
+            // label), so here the widening lookups DO change the result and are
+            // kept exactly as they were.
+            matchingCategoryIds.add(categoryName);
 
-        // Also check event_brackets to find what category_id was used when creating matches
-        if (categoryName || categoryId) {
-            // Try to match by category name/label
-            if (categoryName) {
-                // Try exact match
-                const { data: exactBrackets } = await supabaseAdmin
+            const [{ data: exactBrackets }, { data: eventData }] = await Promise.all([
+                supabaseAdmin
                     .from('event_brackets')
                     .select('category_id, category')
                     .eq('event_id', eventId)
-                    .eq('category', categoryName);
+                    .eq('category', categoryName),
+                supabaseAdmin
+                    .from('events')
+                    .select('categories')
+                    .eq('id', eventId)
+                    .single(),
+            ]);
 
-                if (exactBrackets && exactBrackets.length > 0) {
-                    exactBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
-
-                // Try partial match (in case categoryName is a full label like "U-11 - Male - Singles")
-                const baseCategoryName = categoryName.split(' - ')[0]; // Get "U-11" from "U-11 - Male - Singles"
-                const { data: partialBrackets } = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('category_id, category')
-                    .eq('event_id', eventId)
-                    .ilike('category', `%${baseCategoryName}%`);
-
-                if (partialBrackets && partialBrackets.length > 0) {
-                    partialBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
+            if (exactBrackets && exactBrackets.length > 0) {
+                exactBrackets.forEach(b => {
+                    if (b.category_id) matchingCategoryIds.add(b.category_id);
+                    if (b.category) matchingCategoryIds.add(b.category);
+                });
             }
-
-            // If categoryId provided, check brackets by category_id
-            if (categoryId) {
-                const { data: idBrackets } = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('category_id, category')
-                    .eq('event_id', eventId)
-                    .eq('category_id', categoryId);
-
-                if (idBrackets && idBrackets.length > 0) {
-                    idBrackets.forEach(b => {
-                        if (b.category_id) matchingCategoryIds.add(b.category_id);
-                        if (b.category) matchingCategoryIds.add(b.category);
-                    });
-                }
-
-                // If categoryId is not a UUID, also try matching as category name
-                if (!isUuid(categoryId)) {
-                    const { data: nameBrackets } = await supabaseAdmin
-                        .from('event_brackets')
-                        .select('category_id, category')
-                        .eq('event_id', eventId)
-                        .eq('category', categoryId);
-
-                    if (nameBrackets && nameBrackets.length > 0) {
-                        nameBrackets.forEach(b => {
-                            if (b.category_id) matchingCategoryIds.add(b.category_id);
-                            if (b.category) matchingCategoryIds.add(b.category);
-                        });
-                    }
-                }
-            }
-        }
-
-        // Also check event categories to find matching IDs
-        if (categoryId || categoryName) {
-            const { data: eventData } = await supabaseAdmin
-                .from('events')
-                .select('categories')
-                .eq('id', eventId)
-                .single();
 
             if (eventData && eventData.categories) {
                 const categories = Array.isArray(eventData.categories)
@@ -2980,24 +3059,13 @@ export const getPublicMatches = async (req, res) => {
                     if (typeof cat === 'object' && cat !== null) {
                         const catId = cat.id || cat.category_id;
                         const catName = cat.category || cat.name || cat.rawName;
-
-                        // If categoryId matches
-                        if (categoryId && (catId === categoryId || catName === categoryId)) {
-                            if (catId) matchingCategoryIds.add(catId);
-                            if (catName) matchingCategoryIds.add(catName);
-                        }
-
-                        // If categoryName matches - use EXACT match only to avoid cross-category issues
-                        if (categoryName) {
-                            const fullLabel = catName + (cat.gender ? ` - ${cat.gender}` : '') + (cat.match_type ? ` - ${cat.match_type}` : '');
-                            // Only exact match - don't use includes() as it causes U-15 Male to match U-15 Female
-                            if (fullLabel === categoryName || categoryName === fullLabel) {
-                                if (catId) matchingCategoryIds.add(catId);
-                            }
+                        // Exact match only - includes() would make U-15 Male match U-15 Female.
+                        const fullLabel = catName + (cat.gender ? ` - ${cat.gender}` : '') + (cat.match_type ? ` - ${cat.match_type}` : '');
+                        if (fullLabel === categoryName && catId) {
+                            matchingCategoryIds.add(catId);
                         }
                     } else if (typeof cat === 'string') {
-                        // Exact match only for string categories
-                        if (categoryId === cat || categoryName === cat) {
+                        if (categoryName === cat) {
                             matchingCategoryIds.add(cat);
                         }
                     }
@@ -3005,66 +3073,60 @@ export const getPublicMatches = async (req, res) => {
             }
         }
 
-        // CRITICAL: Only use exact categoryId match to prevent cross-category matches
-        // The problem: Adding base names like "U-15" causes all U-15 variants to match
-        // Solution: Only match the exact categoryId that was selected
-        if (categoryId) {
-            // Always prioritize exact categoryId - this is the most reliable
-            matchingCategoryIds.add(categoryId);
+        // Postgres does the filtering now (idx_matches_event_category). Rows with
+        // a NULL category_id never match, which is the same exclusion the old JS
+        // filter applied.
+        //
+        // One caveat: postgrest-js quotes values containing commas/spaces inside
+        // an in.(...) list but does NOT escape an embedded double quote, which
+        // would build a malformed filter. Category labels are admin-entered, so
+        // rather than risk a silently wrong query we detect that case and fall
+        // back to the original fetch-all-and-filter-in-JS behaviour.
+        const categoryKeys = Array.from(matchingCategoryIds);
+        const inListIsSafe = categoryKeys.every(key => !/["\\]/.test(String(key)));
+
+        let filteredMatches;
+
+        if (categoryKeys.length === 1 || inListIsSafe) {
+            let filterQuery = supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds);
+
+            // eq() carries the value in its own parameter, so it is safe for any label.
+            filterQuery = categoryKeys.length === 1
+                ? filterQuery.eq('category_id', categoryKeys[0])
+                : filterQuery.in('category_id', categoryKeys);
+
+            const { data, error: filteredError } = await filterQuery
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (filteredError) {
+                throw filteredError;
+            }
+            filteredMatches = data || [];
+        } else {
+            const { data: allMatches, error: allError } = await supabaseAdmin
+                .from('matches')
+                .select(matchSelect)
+                .eq('event_id', eventId)
+                .in('bracket_id', publishedBracketIds)
+                .order('round_name', { ascending: true })
+                .order('match_index', { ascending: true });
+
+            if (allError) {
+                throw allError;
+            }
+            filteredMatches = (allMatches || []).filter(
+                match => match.category_id && matchingCategoryIds.has(match.category_id)
+            );
         }
 
-        // Add exact categoryName as well (in case category_id stores the name)
-        if (categoryName) {
-            matchingCategoryIds.add(categoryName);
-        }
-
-        // Filter out any matches that don't match the exact categoryId
-        // This prevents showing matches from other categories (e.g., U-15 Female when selecting U-15 Male)
-        if (categoryId) {
-            const filteredSet = new Set();
-
-            // Keep exact categoryId
-            if (matchingCategoryIds.has(categoryId)) {
-                filteredSet.add(categoryId);
-            }
-
-            // Keep exact categoryName
-            if (categoryName && matchingCategoryIds.has(categoryName)) {
-                filteredSet.add(categoryName);
-            }
-
-            // Keep bracket category_ids that match exactly
-            matchingCategoryIds.forEach(id => {
-                // Only keep if it's the exact categoryId or exact categoryName
-                if (id === categoryId || id === categoryName) {
-                    filteredSet.add(id);
-                }
-            });
-
-            // Only replace if we have matches (don't empty the set if we found some)
-            if (filteredSet.size > 0) {
-                matchingCategoryIds = filteredSet;
-            }
-        }
-
-        // Filter matches by any of the matching category IDs
-        // CRITICAL: Only show matches that exactly match the selected categoryId
-        const filteredMatches = (allMatches || []).filter(match => {
-            if (!match.category_id) {
-                return false;
-            }
-
-            // Primary check: exact categoryId match
-            const exactMatch = match.category_id === categoryId;
-
-            // Secondary check: check if it's in our matching set (from brackets/events)
-            const inMatchingSet = matchingCategoryIds.has(match.category_id);
-
-            // Only include if it's an exact match OR it's in our validated matching set
-            return exactMatch || inMatchingSet;
-        });
-
-        return res.status(200).json({ success: true, matches: filteredMatches });
+        const payload = { success: true, matches: filteredMatches || [] };
+        void cacheSet(cacheKey, payload, MATCHES_CACHE_TTL); // fire-and-forget: a cache write must not delay the response
+        return res.status(200).json(payload);
 
     } catch (error) {
         console.error("Get Public Matches Error:", error);
@@ -3089,21 +3151,29 @@ export const getMatches = async (req, res) => {
             .eq('event_id', eventId)
             .order('created_at', { ascending: true });
 
-        // Try to filter by category_id, but if it fails (UUID type mismatch), we'll filter in memory
+        // matches.category_id is not written consistently: depending on which screen
+        // created a round, the SAME category's rows can be keyed by its id
+        // ("1785388592194") or by its display label ("U-17 (Male) - Male - Doubles").
+        // Real example in QA — event 42, U-17 (Male) Doubles: Round of 16 keyed by id,
+        // Quarterfinal/Semifinal/Final keyed by label. Filtering on one key returned a
+        // SUBSET of the category's matches, so later rounds looked ungenerated and the
+        // "N match(es) still syncing to scoreboard" warning could never clear.
+        //
+        // Accept every key the caller knows for this one category. Both values always
+        // identify the same category (the client derives them from one category
+        // object), so this widens nothing — it only stops rows from going missing.
+        const categoryKeys = [categoryId, categoryName]
+            .map((v) => (v == null ? "" : String(v).trim()))
+            .filter((v) => v.length > 0);
+        const uniqueCategoryKeys = Array.from(new Set(categoryKeys));
+
         let categoryFilterApplied = false;
-        if (categoryId) {
-            try {
-                if (isUuid(categoryId)) {
-                    query = query.eq('category_id', categoryId);
-                    categoryFilterApplied = true;
-                } else {
-                    // Non-UUID - try to filter (might fail if column is UUID type)
-                    query = query.eq('category_id', categoryId);
-                    categoryFilterApplied = true;
-                }
-            } catch (e) {
-                // Filter will be applied in memory if query fails
-            }
+        if (uniqueCategoryKeys.length === 1) {
+            query = query.eq('category_id', uniqueCategoryKeys[0]);
+            categoryFilterApplied = true;
+        } else if (uniqueCategoryKeys.length > 1) {
+            query = query.in('category_id', uniqueCategoryKeys);
+            categoryFilterApplied = true;
         }
 
         // Filter by roundName if provided (do this first as it's most specific)
@@ -3113,16 +3183,6 @@ export const getMatches = async (req, res) => {
 
         if (bracketId) {
             query = query.eq('bracket_id', bracketId);
-        }
-
-        // Also try categoryName if provided (treat as category_id)
-        if (categoryName && !categoryFilterApplied) {
-            try {
-                query = query.eq('category_id', categoryName);
-                categoryFilterApplied = true;
-            } catch (e) {
-                // Filter will be applied in memory if query fails
-            }
         }
 
         const { data, error } = await query;
@@ -3144,21 +3204,14 @@ export const getMatches = async (req, res) => {
             // Filter in memory (handles all cases including UUID/string mismatches)
             let filteredMatches = retryData || [];
 
-            // Filter by categoryId first (exact match), fall back to categoryName ONLY if categoryId not provided
-            if (categoryId) {
+            // Match on ANY supplied key — see the note above the query build.
+            if (uniqueCategoryKeys.length > 0) {
                 filteredMatches = filteredMatches.filter(m => {
                     const matchCategoryId = m.category_id;
                     if (!matchCategoryId) return false;
-                    // Use == for type coercion (handles number vs string)
-                    return matchCategoryId == categoryId || String(matchCategoryId) === String(categoryId);
-                });
-            } else if (categoryName) {
-                // Only use categoryName when categoryId is not provided
-                filteredMatches = filteredMatches.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Exact match with type coercion
-                    return matchCategoryId == categoryName || String(matchCategoryId) === String(categoryName);
+                    return uniqueCategoryKeys.some(
+                        (key) => matchCategoryId == key || String(matchCategoryId) === key
+                    );
                 });
             }
 
@@ -3188,34 +3241,18 @@ export const getMatches = async (req, res) => {
         // This handles cases where categoryId is stored as number vs string, or UUID vs label
         let finalMatches = data || [];
 
-        if (finalMatches.length > 0 && (categoryId || categoryName)) {
-            let filtered = finalMatches;
-            const originalCount = finalMatches.length;
-
-            // Try categoryId first (exact match with type coercion)
-            if (categoryId) {
-                filtered = filtered.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Use == for type coercion (handles number vs string)
-                    return matchCategoryId == categoryId || String(matchCategoryId) === String(categoryId);
-                });
-            }
-
-            // If categoryId filter returned 0 matches, try categoryName as fallback
-            if (categoryName && filtered.length === 0 && originalCount > 0) {
-                // Reset to original matches for categoryName filtering
-                filtered = finalMatches;
-
-                filtered = filtered.filter(m => {
-                    const matchCategoryId = m.category_id;
-                    if (!matchCategoryId) return false;
-                    // Exact match with type coercion
-                    return matchCategoryId == categoryName || String(matchCategoryId) === String(categoryName);
-                });
-            }
-
-            finalMatches = filtered;
+        if (finalMatches.length > 0 && uniqueCategoryKeys.length > 0) {
+            // Keep a row when its category_id equals ANY key the caller supplied.
+            // The old version filtered by categoryId and only tried categoryName if
+            // that left ZERO rows — so a category with rows under both keys silently
+            // lost the label-keyed ones (its later rounds) instead of returning all.
+            finalMatches = finalMatches.filter(m => {
+                const matchCategoryId = m.category_id;
+                if (!matchCategoryId) return false;
+                return uniqueCategoryKeys.some(
+                    (key) => matchCategoryId == key || String(matchCategoryId) === key
+                );
+            });
         }
 
         if (bracketId) {
