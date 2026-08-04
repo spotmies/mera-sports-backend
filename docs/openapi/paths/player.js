@@ -271,7 +271,7 @@ export const playerPaths = {
                             description: "The categories being entered.",
                             items: { type: "object", additionalProperties: true },
                         },
-                        teamMemberCount: { type: "integer", example: 5, description: "For per-head team pricing." },
+                        teamMemberCount: { type: "integer", example: 5, description: "Squad size at order time. Recorded on the order notes for support lookups only — it does not affect the amount charged (a category's entry fee covers the whole pair/team)." },
                         teamId: { type: "string", format: "uuid", nullable: true },
                     },
                     ["eventId", "categories"]
