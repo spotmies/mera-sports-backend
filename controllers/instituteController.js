@@ -273,6 +273,27 @@ export const requestBulkApproval = async (req, res) => {
 
         const resolvedInstituteName = institute.institute_name || institute.name || "Unknown Institute";
 
+        // A new request SUPERSEDES anything outstanding for this institute.
+        //
+        // This used to be a bare insert, and nothing anywhere deleted the older
+        // rows, so tickets accumulated indefinitely — one QA institute had ten,
+        // seven of them approved, going back months. Because getApprovalStatus
+        // reads the most recent row, a leftover `is_approved = true` from an
+        // abandoned batch meant the NEXT upload was auto-approved: the institute
+        // staged a fresh sheet, the screen jumped straight to "Approval Granted",
+        // and no admin ever saw the new count. Combined with an unchecked row
+        // count that let an approval for 1 student import an arbitrary number.
+        //
+        // Clearing first also means the admin's pending list never shows two
+        // competing rows for one institute, which is what allowed them to approve
+        // a stale request while the institute waited on a newer one.
+        const { error: clearError } = await supabaseAdmin
+            .from("institute_approvals")
+            .delete()
+            .eq("institute_id", institute_id);
+
+        if (clearError) throw clearError;
+
         // Create approval request
         const { error: insertError } = await supabaseAdmin
             .from("institute_approvals")
@@ -297,13 +318,19 @@ export const cancelBulkApproval = async (req, res) => {
     try {
         const { id: institute_id } = req.user;
 
-        // Only delete rows that are still pending — once approved the institute
-        // must finalize (or the admin must reject it from their side).
+        // Withdraw EVERY ticket for this institute, approved ones included.
+        //
+        // This previously spared approved rows, on the reasoning that consuming
+        // an approval was the institute's call. In practice the institute is
+        // cancelling precisely because the batch is being discarded — and the
+        // spared row then sat there granting silent approval to whatever sheet
+        // was uploaded next, since getApprovalStatus reads the newest row and
+        // does not care which batch it was granted for. An approval is only
+        // meaningful for the specific list of students the admin saw a count of.
         const { error } = await supabaseAdmin
             .from("institute_approvals")
             .delete()
-            .eq("institute_id", institute_id)
-            .eq("is_approved", false);
+            .eq("institute_id", institute_id);
 
         if (error) throw error;
 
@@ -634,8 +661,11 @@ export const finalizeBulkImport = async (req, res) => {
             }
         }
 
-        // DELETE the approval record so it cannot be reused
-        await supabaseAdmin.from("institute_approvals").delete().eq("id", approval.id);
+        // Clear EVERY ticket for this institute, not just the one consumed here.
+        // Deleting only `approval.id` left any older row in place, and since
+        // getApprovalStatus reads the newest row, a stale approved leftover
+        // silently pre-approved the institute's next upload.
+        await supabaseAdmin.from("institute_approvals").delete().eq("institute_id", institute_id);
 
         console.log(`[BULK-IMPORT] Done. Successful: ${successful.length}, Failed: ${failed.length}`);
 
