@@ -132,10 +132,24 @@ router.post('/sync', async (req, res) => {
                 last_login: new Date().toISOString(),
 
                 // ROBUST DUMMY DATA STRATEGY
+                //
+                // These placeholders must be UNIQUE, not merely unusual: `users`
+                // now carries unique indexes on player_id and aadhaar. The old
+                // scheme derived them from `Date.now().toString().slice(-6)` —
+                // the low 6 digits of a millisecond clock, which wrap every
+                // 1,000,000 ms (~16.7 minutes). Two admins signing in around the
+                // same point in any such window collide, and with the indexes in
+                // place that is no longer a silent duplicate but a hard insert
+                // failure that blocks admin onboarding.
+                //
+                // crypto.randomUUID() is collision-free by construction, so the
+                // value no longer depends on when the row happens to be written.
+                // The `ADM-` prefix is kept: it is what distinguishes these rows
+                // from real player IDs (`^P[0-9]+$`) in every query that cares.
                 mobile: `9${Date.now().toString().slice(-9)}`,
                 dob: '2000-01-01',
                 age: 25,
-                aadhaar: `ADM-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`,
+                aadhaar: `ADM-${crypto.randomUUID()}`,
                 apartment: 'Admin HQ',
                 street: 'Admin St',
                 city: 'Cloud City',
@@ -143,7 +157,7 @@ router.post('/sync', async (req, res) => {
                 pincode: '000000',
                 country: 'India',
                 password: hashedOAuthSentinel,
-                player_id: `ADM-${Date.now().toString().slice(-6)}`
+                player_id: `ADM-${crypto.randomUUID()}`
             };
 
             const { data: savedUser, error: dbError } = await supabaseAdmin
