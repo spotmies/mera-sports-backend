@@ -26,8 +26,10 @@ const normalizeText = (value) => String(value || "").trim().toLowerCase();
 const isLeagueCategoryPublishedForPublic = async ({ eventId, categoryId, categoryLabel }) => {
     const targetId = String(categoryId || "").trim();
 
-    // For sub-round IDs like `uuid_R2`, also check the BASE UUID
-    const subRoundMatch = targetId.match(/^(.+)_R\d+$/i);
+    // For sub-round IDs like `uuid_R2` (league/pool) or `uuid_HR2` (heat),
+    // also check the BASE UUID — publishing the base is meant to cover every
+    // round, but that only works if this fallback recognizes both suffixes.
+    const subRoundMatch = targetId.match(/^(.+)_(?:HR|R)\d+$/i);
     const baseUUID = subRoundMatch ? subRoundMatch[1].trim() : null;
 
     // Build targeted queries instead of fetching ALL published rows
