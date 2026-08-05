@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 import express from "express";
 import adminRoutes from "./routes/adminRoutes.js"; // Added Admin Routes
 import advertisementRoutes from "./routes/advertisementRoutes.js";
+import analyticsRoutes, { adminAnalyticsRoutes } from "./routes/analyticsRoutes.js";
 import apartmentRoutes from "./routes/apartmentRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import bracketRoutes from "./routes/bracketRoutes.js";
@@ -54,6 +55,10 @@ app.use("/api/auth", authRoutes);
 app.use("/api/auth", googleSyncRoutes);
 app.use("/api/events", eventRoutes);
 app.use("/api/payment", paymentRoutes); // Mounted Payment Routes
+app.use("/api/analytics", analyticsRoutes); // Public, unauthenticated ingest from the player site
+// Mounted ahead of the generic /api/admin routers so the more specific prefix
+// always wins, regardless of what path patterns those routers grow later.
+app.use("/api/admin/analytics", adminAnalyticsRoutes);
 app.use("/api/admin/matches", matchRoutes); // Scoreboard Matches Routes (Prioritized)
 app.use("/api/admin", leagueRoutes); // League routes (must be before bracket/admin to match /events/.../league)
 app.use("/api/admin", bracketRoutes); // Bracket Management Routes
