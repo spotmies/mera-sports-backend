@@ -1132,6 +1132,19 @@ export const createMatchesBulk = async (req, res) => {
 
             let bracketData = null;
 
+            const findByCategoryColumn = async (value) => {
+                if (!value) return null;
+                const { data, error } = await supabaseAdmin
+                    .from('event_brackets')
+                    .select('id, mode')
+                    .eq('event_id', event_id)
+                    .eq('category', value)
+                    .order('created_at', { ascending: false });
+
+                if (error || !data || data.length === 0) return null;
+                return data.find(b => b.mode === 'BRACKET') || data[0];
+            };
+
             if (isUuid(category_id)) {
                 const { data, error } = await supabaseAdmin
                     .from('event_brackets')
@@ -1143,17 +1156,14 @@ export const createMatchesBulk = async (req, res) => {
                 if (!error && data && data.length > 0) {
                     bracketData = data.find(b => b.mode === 'BRACKET') || data[0];
                 }
-            } else if (category_name) {
-                const { data, error } = await supabaseAdmin
-                    .from('event_brackets')
-                    .select('id, mode')
-                    .eq('event_id', event_id)
-                    .eq('category', category_name)
-                    .order('created_at', { ascending: false });
-
-                if (!error && data && data.length > 0) {
-                    bracketData = data.find(b => b.mode === 'BRACKET') || data[0];
-                }
+            } else {
+                // event_brackets.category holds EITHER the category's own id or its display
+                // label, depending on which screen created the bracket. Try the id first: a
+                // league-converted category stores its bracket under the id, while a
+                // different bracket can sit under the same display label — matching the
+                // label first attached rows to the wrong bracket.
+                bracketData = await findByCategoryColumn(category_id)
+                    || await findByCategoryColumn(category_name);
             }
 
             if (bracketData?.id) return bracketData.id;
