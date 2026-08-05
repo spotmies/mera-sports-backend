@@ -1873,6 +1873,63 @@ export const replaceRoundMatches = async (req, res) => {
 
         if (error) throw error;
 
+        // Keep the matches table in step with the round we just rewrote. Rewriting only
+        // bracket_data left already-written rows on the OLD pairing while they kept this
+        // round's bracket_match_ids, so the UI linked them back and read a result belonging
+        // to a different pairing: a round announced itself complete off a match nobody
+        // played, and that stale winner propagated into the next round.
+        // Only rows whose participants genuinely changed are touched — a re-save of the
+        // same pairing (or a mere swap of sides) must never discard a recorded result.
+        try {
+            const trackedIds = newMatches.map((m) => String(m.id).trim()).filter(Boolean);
+            if (trackedIds.length > 0) {
+                const { data: existingRows } = await supabaseAdmin
+                    .from("matches")
+                    .select("id, bracket_match_id, player_a, player_b")
+                    .eq("event_id", eventId)
+                    .eq("bracket_id", bracket.id)
+                    .in("bracket_match_id", trackedIds);
+
+                const participantKey = (p) => {
+                    if (!p) return "";
+                    if (typeof p === "string" || typeof p === "number") return String(p).trim();
+                    const id = p.id ?? p.player_id ?? p.playerId;
+                    if (id != null && String(id).trim() !== "") return String(id).trim();
+                    return String(p.name || "").trim().toLowerCase();
+                };
+                const samePairing = (row, bm) => {
+                    const before = [participantKey(row.player_a), participantKey(row.player_b)].filter(Boolean).sort();
+                    const after = [participantKey(bm.player1), participantKey(bm.player2)].filter(Boolean).sort();
+                    return before.length === after.length && before.every((v, i) => v === after[i]);
+                };
+
+                for (const row of existingRows || []) {
+                    const bm = newMatches.find((m) => String(m.id).trim() === String(row.bracket_match_id || "").trim());
+                    if (!bm || samePairing(row, bm)) continue;
+
+                    const { error: syncError } = await supabaseAdmin
+                        .from("matches")
+                        .update({
+                            player_a: bm.player1 || null,
+                            player_b: bm.player2 || null,
+                            score: null,
+                            winner: null,
+                            status: "SCHEDULED",
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq("id", row.id);
+
+                    if (syncError) {
+                        console.warn(`[replaceRoundMatches] Failed to re-sync match row ${row.bracket_match_id}:`, syncError.message);
+                    }
+                }
+            }
+        } catch (syncErr) {
+            console.warn("[replaceRoundMatches] Match row re-sync failed (non-fatal):", syncErr.message);
+        }
+
+        await invalidateMatchesCache(eventId);
+
         res.json({
             success: true,
             bracket: data,
