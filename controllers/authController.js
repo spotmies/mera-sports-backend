@@ -17,6 +17,62 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 
 /* ================= FORGOT PASSWORD ================= */
 
+/**
+ * Player forgot-password: step 1 of 3.
+ *
+ * Unlike /auth/send-otp and /auth/send-mobile-otp (registration OTP senders,
+ * which must accept ANY address/number since the person isn't registered
+ * yet), this checks the identifier belongs to an existing account BEFORE
+ * sending anything. The forgot-password screen used to call those
+ * registration endpoints directly, so entering an unregistered mobile number
+ * still fired a real WhatsApp OTP — wasted API spend, and no other step in
+ * the flow would have refused it either (verify is keyed by session id, and
+ * resetPassword's own "user not found" check only runs after OTP verify).
+ *
+ * Mirrors sendInstituteForgotPasswordOtp below, which solved the same
+ * problem for institute accounts; this covers both player OTP channels.
+ */
+export const sendForgotPasswordOtp = async (req, res) => {
+    try {
+        const { method, value } = req.body;
+        if (!method || !value) {
+            return res.status(400).json({ success: false, message: "Method and value are required" });
+        }
+
+        if (method === 'mobile') {
+            // Same normalization resetPassword uses: registration stores mobile as
+            // a bare 10-digit string, but a "+91" prefix or leading 0 is a normal
+            // thing to type here.
+            const normalized = normalizeWhatsAppNumber(value);
+            const bareMobile = normalized ? normalized.slice(2) : String(value).trim();
+
+            const { data: user } = await supabaseAdmin.from("users").select("id").eq("mobile", bareMobile).maybeSingle();
+            if (!user) {
+                return res.status(404).json({ success: false, message: "No account is registered with this mobile number." });
+            }
+
+            const result = await sendMobileOtp(value);
+            return res.json({ success: true, sessionId: result.sessionId, message: "OTP sent to your registered WhatsApp number" });
+        }
+
+        if (method === 'email') {
+            const email = String(value).trim();
+            const { data: user } = await supabaseAdmin.from("users").select("id").eq("email", email).maybeSingle();
+            if (!user) {
+                return res.status(404).json({ success: false, message: "No account is registered with this email." });
+            }
+
+            await sendEmailOtp(email);
+            return res.json({ success: true, message: "OTP sent to your registered email" });
+        }
+
+        return res.status(400).json({ success: false, message: "Invalid method" });
+    } catch (err) {
+        console.error("SEND FORGOT PASSWORD OTP ERROR:", err.message);
+        res.status(500).json({ success: false, message: "Failed to send OTP. Please try again." });
+    }
+};
+
 // Verifies a forgot-password OTP and issues a short-lived reset token.
 // This is what binds the reset to a proven OTP — resetPassword below refuses
 // to run without a valid token, so the reset can never be called directly.
