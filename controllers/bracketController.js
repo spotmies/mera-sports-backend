@@ -3458,12 +3458,40 @@ export const recordResult = async (req, res) => {
 
                 if (targetId && targetSlot) {
                     // Find and update the downstream match
+                    let propagated = false;
                     for (const r of rounds) {
                         for (const m of (r.matches || [])) {
                             if (m && String(m.id).trim() === targetId) {
                                 m[targetSlot] = winnerPlayer;
+                                propagated = true;
                                 console.log(`[recordResult] Propagated winner to ${targetId} slot ${targetSlot}:`, typeof winnerPlayer === 'object' ? winnerPlayer.name || winnerPlayer.id : winnerPlayer);
                             }
+                        }
+                    }
+
+                    // Mirror the promotion into the downstream row of the matches table.
+                    // bracket_data alone is not enough: the Scoreboard reads matches.player_a /
+                    // player_b, and updateMatchScore needs both sides populated to compute a
+                    // winner. Leaving them null is why a played Final could end up stored with
+                    // an empty player_a.
+                    if (propagated) {
+                        const downstreamSlot = targetSlot === "player1" ? "player_a" : "player_b";
+                        let downstreamQuery = supabaseAdmin
+                            .from("matches")
+                            .update({
+                                [downstreamSlot]: winnerPlayer,
+                                updated_at: new Date().toISOString()
+                            })
+                            .eq("bracket_match_id", targetId)
+                            .eq("event_id", eventId);
+
+                        downstreamQuery = matchCategoryKeys.length === 1
+                            ? downstreamQuery.eq("category_id", matchCategoryKeys[0])
+                            : downstreamQuery.in("category_id", matchCategoryKeys);
+
+                        const { error: downstreamError } = await downstreamQuery;
+                        if (downstreamError) {
+                            console.warn(`[recordResult] Failed to mirror promotion into matches row ${targetId}:`, downstreamError.message);
                         }
                     }
                 }
