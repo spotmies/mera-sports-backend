@@ -279,7 +279,7 @@ export const changePassword = async (req, res) => {
         }
         const { error } = await supabaseAdmin.from("users").update({ password: hashedNewPassword }).eq("id", req.user.id);
         if (error) throw error;
-        await invalidateDashboardCache(userId);
+        await invalidateDashboardCache(req.user.id);
         res.json({ success: true, message: "Password updated" });
     } catch (err) { res.status(500).json({ message: "Failed to change password" }); }
 };
@@ -420,7 +420,7 @@ export const addFamilyMember = async (req, res) => {
             throw relError;
         }
 
-        await invalidateDashboardCache(userId);
+        await invalidateDashboardCache(headUserId);
         res.json({
             success: true,
             familyMember: {
@@ -514,7 +514,7 @@ export const updateFamilyMember = async (req, res) => {
                 .eq("id", relRecord.id);
         }
 
-        await invalidateDashboardCache(userId);
+        await invalidateDashboardCache(headUserId);
         res.json({
             success: true,
             familyMember: {
@@ -565,12 +565,12 @@ export const deleteFamilyMember = async (req, res) => {
         if (mode === 'full') {
             // Delete the user entirely
             await supabaseAdmin.from("users").delete().eq("id", familyMemberId);
-            await invalidateDashboardCache(userId);
+            await invalidateDashboardCache(headUserId);
             res.json({ success: true, message: "Family member removed and account deleted" });
         } else {
             // Unlink — clear mobile so they operate independently
             await supabaseAdmin.from("users").update({ mobile: null }).eq("id", familyMemberId);
-            await invalidateDashboardCache(userId);
+            await invalidateDashboardCache(headUserId);
             res.json({ success: true, message: "Family member unlinked. They can now operate independently." });
         }
     } catch (err) {

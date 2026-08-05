@@ -11,7 +11,7 @@ import {
     verifyMobileOtp
 } from "../services/otpService.js";
 import { sendRegistrationSuccessEmail } from "../utils/mailer.js";
-import { sendWelcomeWhatsApp } from "../utils/whatsapp.js";
+import { normalizeWhatsAppNumber, sendWelcomeWhatsApp } from "../utils/whatsapp.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -152,7 +152,17 @@ export const resetPassword = async (req, res) => {
         let user = null;
 
         if (method === 'mobile') {
-            const { data: mobileUsers } = await supabaseAdmin.from("users").select("id").eq('mobile', value);
+            // Registration stores mobile as a bare 10-digit string (Register.tsx
+            // strips it to exactly that), but nothing stops someone from typing
+            // "+91..." or a leading 0 into the forgot-password box — OTP send and
+            // verify both tolerate that (WhatsApp delivery normalizes it, and
+            // verification is keyed by sessionId, not the number), so the user
+            // sails through the whole flow only to hit "User not found" here on a
+            // raw string mismatch. Normalize the same way before the lookup.
+            const normalized = normalizeWhatsAppNumber(value);
+            const bareMobile = normalized ? normalized.slice(2) : value;
+
+            const { data: mobileUsers } = await supabaseAdmin.from("users").select("id").eq('mobile', bareMobile);
             if (!mobileUsers || mobileUsers.length === 0) return res.status(404).json({ message: "User not found" });
 
             const { data: familyRels } = await supabaseAdmin
