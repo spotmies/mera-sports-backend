@@ -2,6 +2,7 @@ import QRCode from 'qrcode';
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet, cacheDel } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
 /**
@@ -424,7 +425,10 @@ export const updateEvent = async (req, res) => {
             }));
         }
 
-        ['start_date', 'end_date', 'registration_deadline'].forEach(f => { if (updates[f] === "") updates[f] = null; });
+        // Only real columns — `registration_deadline` was in this list but does
+        // not exist on `events`, so an empty value from a client would have set
+        // a key that fails the UPDATE with 42703.
+        ['start_date', 'end_date'].forEach(f => { if (updates[f] === "") updates[f] = null; });
         delete updates.id; delete updates.created_at; delete updates.created_by;
 
         if (updates.hasOwnProperty('assigned_admin_ids')) {
@@ -471,6 +475,90 @@ export const updateEvent = async (req, res) => {
     } catch (err) {
         console.error("Update Event Error:", err);
         res.status(500).json({ message: err.message });
+    }
+};
+
+// PATCH /api/events/:id/categories/:categoryId/registration
+/**
+ * Open or close ONE category's registration by hand.
+ *
+ * The admin card only offers this on the category's final day — the point is to
+ * stop entries at 2pm instead of at midnight. The server is deliberately more
+ * lenient than that: it refuses only once the deadline has actually passed.
+ *
+ * The reason is the day boundary. "Is the deadline today?" is a different
+ * question in IST than in UTC for five and a half hours every night, and the
+ * server has no business overruling the organiser's own clock on a call this
+ * small. What it must prevent is the one destructive case — re-opening a
+ * category whose deadline is behind us, which would let entries in after the
+ * cut-off with nothing to close them again.
+ *
+ * Writes the whole `categories` array back because it is a single jsonb column.
+ * Re-reading it inside the request keeps a concurrent edit to a *different*
+ * category from being clobbered by a stale copy held in some admin's browser.
+ */
+export const setCategoryRegistrationStatus = async (req, res) => {
+    try {
+        const { id, categoryId } = req.params;
+        const { closed } = req.body;
+
+        if (typeof closed !== "boolean") {
+            return res.status(400).json({ success: false, message: "`closed` must be true or false" });
+        }
+
+        // `events` has no registration_deadline column — the event-level date is
+        // `end_date`, and the authoritative deadline is per-category
+        // (`lastDateToRegister`). Selecting the non-existent column made Postgres
+        // reject the whole query with 42703.
+        const event = await resolveEventByIdentifier(id, "id, categories, end_date");
+        if (!event) return res.status(404).json({ success: false, message: "Event not found" });
+
+        const categories = Array.isArray(event.categories) ? event.categories : [];
+        const targetIndex = categories.findIndex(
+            (cat) => cat && typeof cat === "object" && String(cat.id ?? "") === String(categoryId)
+        );
+        if (targetIndex === -1) {
+            return res.status(404).json({ success: false, message: "Category not found on this event" });
+        }
+
+        const target = categories[targetIndex];
+        const fallbackDeadline = event.end_date;
+
+        // Re-opening a lapsed category is the one thing this endpoint must not do.
+        // Closing one is always allowed — it only ever tightens access.
+        if (!closed && isCategoryDeadlinePassed(target, fallbackDeadline)) {
+            return res.status(400).json({
+                success: false,
+                message: "Registration for this category has already ended. Extend its last date to re-open it.",
+            });
+        }
+
+        const updatedCategories = categories.map((cat, index) =>
+            index === targetIndex
+                ? {
+                    ...cat,
+                    registrationClosed: closed,
+                    // Kept for support questions of the "when did entries stop?"
+                    // kind — the flag alone cannot answer them.
+                    registrationClosedAt: closed ? new Date().toISOString() : null,
+                    registrationClosedBy: closed ? (req.user?.id || null) : null,
+                }
+                : cat
+        );
+
+        const { data, error } = await supabaseAdmin
+            .from("events")
+            .update({ categories: updatedCategories })
+            .eq("id", event.id)
+            .select("id, categories")
+            .single();
+        if (error) throw error;
+
+        await invalidateEventCaches();
+        res.json({ success: true, categories: data.categories });
+    } catch (err) {
+        console.error("Set Category Registration Status Error:", err);
+        res.status(500).json({ success: false, message: err.message });
     }
 };
 

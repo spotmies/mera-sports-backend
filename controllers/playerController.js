@@ -189,7 +189,7 @@ export const checkPassword = async (req, res) => {
 export const updateProfile = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { email, mobile, photos, apartment, street, city, state, pincode, country, gender } = req.body;
+        const { email, mobile, photos, apartment, street, city, state, pincode, country, gender, first_name, last_name } = req.body;
 
         const { data: currentUser, error: fetchError } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
         if (fetchError || !currentUser) return res.status(404).json({ message: "User not found" });
@@ -225,6 +225,8 @@ export const updateProfile = async (req, res) => {
         const updates = {
             email: email || currentUser.email,
             mobile: mobile || currentUser.mobile,
+            first_name: first_name !== undefined ? first_name.trim() : currentUser.first_name,
+            last_name: last_name !== undefined ? last_name.trim() : currentUser.last_name,
             apartment: apartment !== undefined ? apartment : currentUser.apartment,
             street: street !== undefined ? street : currentUser.street,
             city: city !== undefined ? city : currentUser.city,
