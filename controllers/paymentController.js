@@ -41,6 +41,10 @@ const normalizeEventCategories = (event) => {
             gender: (isObj && c.gender) || "Mixed",
             matchType: (isObj && c.matchType) || "Singles",
             entryFee: isObj ? parseEntryFee(c.entryFee ?? c.fee) : null,
+            // Carried through so assertCategoriesOpen can see the admin's
+            // manual close switch. Kept on the normalized object rather than
+            // re-read from the raw array so both live behind one lookup.
+            registrationClosed: isObj ? c.registrationClosed === true : false,
         };
     });
 };
@@ -77,11 +81,46 @@ const computeRegistrationFee = (event, requestedCategoryIds) => {
         }
         const fee = cat.entryFee ?? baseFee;
         feeSum += fee;
+        // Deliberately NOT spreading `cat` — these objects are persisted onto
+        // event_registrations.categories, so a transient flag like
+        // registrationClosed would be frozen into the row and read back years
+        // later as if it described the registration.
         categoryObjects.push({ id: cat.id, name: cat.name, gender: cat.gender, fee, matchType: cat.matchType });
     }
 
     // One entry fee per selected category. Team size is deliberately not a factor.
     return { fee: feeSum, categoryObjects };
+};
+
+// ── Registration window (server-side mirror of the player app's check) ───────
+/**
+ * Throws a 400 when a requested category has been closed by the organiser.
+ *
+ * The admin's close switch is what makes this necessary: it can flip while a
+ * player is mid-checkout, so the player app's own check — made when the page
+ * loaded — is already stale by the time the request lands here. A tab left open
+ * since the morning would otherwise pay into a category that shut at 2pm.
+ *
+ * Only the manual flag is enforced. The `lastDateToRegister` deadline has never
+ * been checked server-side on this path, and quietly starting to reject on it
+ * here would change behaviour for every event, not just the ones an organiser
+ * has closed by hand. That gap is worth closing on its own terms.
+ */
+const assertCategoriesOpen = (event, requestedCategoryIds) => {
+    const normalized = normalizeEventCategories(event);
+    for (const rawId of requestedCategoryIds) {
+        const catId = String(rawId && typeof rawId === "object" ? rawId.id : rawId);
+        const cat = findEventCategory(normalized, catId);
+        if (cat?.registrationClosed) {
+            const err = new Error(`Registration for "${cat.name}" has been closed by the organiser`);
+            err.statusCode = 400;
+            // Machine-readable so the player app can tell this apart from the
+            // other 400s and re-read the event, instead of leaving an open-
+            // looking tile behind a "category is closed" toast.
+            err.code = "CATEGORY_CLOSED";
+            throw err;
+        }
+    }
 };
 
 // ── Category eligibility (server-side mirror of the player app's check) ──────
@@ -377,6 +416,10 @@ export const createRazorpayOrder = async (req, res) => {
             return res.status(400).json({ message: "This event does not accept Razorpay payments" });
         }
 
+        // Before anything else: a category the organiser has closed cannot be
+        // entered, however the request got here.
+        assertCategoriesOpen(event, categories);
+
         // The server-computed fee is authoritative. The client-sent amount is only
         // compared so a stale or tampered UI fails loudly instead of mischarging.
         const { fee, categoryObjects } = computeRegistrationFee(event, categories);
@@ -431,7 +474,9 @@ export const createRazorpayOrder = async (req, res) => {
         });
     } catch (err) {
         console.error("Razorpay Order Error:", err);
-        if (err.statusCode === 400) return res.status(400).json({ message: err.message });
+        // `code` rides along when the thrower set one (CATEGORY_CLOSED), so the
+        // client can react to the specific cause rather than parse the message.
+        if (err.statusCode === 400) return res.status(400).json({ message: err.message, ...(err.code ? { code: err.code } : {}) });
         res.status(500).json({ message: "Failed to create payment order" });
     }
 };
@@ -785,14 +830,16 @@ export const submitManualPayment = async (req, res) => {
         const resolvedEventId = eventForEligibility.id;
 
         // Same eligibility gate as the Razorpay path — manual payments must not
-        // be a way around it.
+        // be a way around it. The closed-category gate rides along for the same
+        // reason.
         try {
+            assertCategoriesOpen(eventForEligibility, categories);
             const { categoryObjects } = computeRegistrationFee(eventForEligibility, categories);
             const { data: payingUser } = await supabaseAdmin
                 .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
             assertPlayerEligible(payingUser, categoryObjects);
         } catch (eligErr) {
-            if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message });
+            if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message, ...(eligErr.code ? { code: eligErr.code } : {}) });
             throw eligErr;
         }
 
