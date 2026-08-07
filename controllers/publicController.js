@@ -208,7 +208,11 @@ export const getPublicEventSharePreview = async (req, res) => {
 
             const { data: eventData, error } = await supabaseAdmin
                 .from("events")
-                .select("id, name, venue, city, start_date, end_date, registration_deadline, banner_url, categories")
+                // No registration_deadline column exists on `events` — asking for
+                // it made Postgres reject the whole select (42703), so this
+                // endpoint answered 404 for every event. The deadline shown below
+                // comes from end_date and the per-category lastDateToRegister.
+                .select("id, name, venue, city, start_date, end_date, banner_url, categories")
                 .eq("id", eventId)
                 .maybeSingle();
 
@@ -227,7 +231,7 @@ export const getPublicEventSharePreview = async (req, res) => {
             };
 
             const getRegistrationDeadline = () => {
-                const explicit = parseDateSafe(eventData.registration_deadline) || parseDateSafe(eventData.end_date);
+                const explicit = parseDateSafe(eventData.end_date);
                 if (explicit) return explicit;
 
                 if (Array.isArray(eventData.categories)) {

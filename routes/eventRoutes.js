@@ -6,6 +6,7 @@ import {
     getEventDetails,
     getEventSponsors,
     listEvents,
+    setCategoryRegistrationStatus,
     updateEvent
 } from "../controllers/eventController.js";
 import { getPublicMatches } from "../controllers/matchController.js";
@@ -19,6 +20,7 @@ router.get('/:id', getEventDetails);
 router.get('/:id/brackets', getEventBrackets);
 router.get('/:id/matches', getPublicMatches); // Public scoreboard endpoint
 router.get('/:id/sponsors', getEventSponsors);
+router.patch('/:id/categories/:categoryId/registration', verifyAdmin, setCategoryRegistrationStatus);
 router.put('/:id', verifyAdmin, updateEvent);
 router.delete('/:id', verifyAdmin, deleteEvent);
 
