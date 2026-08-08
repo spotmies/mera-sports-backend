@@ -3380,7 +3380,7 @@ export const recordResult = async (req, res) => {
     //console.log("[recordResult] Called with params:", { eventId: req.params.id, categoryId: req.params.categoryId }, "body:", { matchId: req.body?.matchId, winner: req.body?.winner, roundName: req.body?.roundName, categoryLabel: req.body?.categoryLabel });
     try {
         let { id: eventId, categoryId } = req.params;
-        const { matchId, winner, score, sets, roundName, categoryLabel } = req.body;
+        const { matchId, winner, score, sets, roundName, categoryLabel, propagation } = req.body;
 
         if (!eventId) {
             return res.status(400).json({ message: "Event ID required" });
@@ -3433,6 +3433,48 @@ export const recordResult = async (req, res) => {
         const match = round.matches?.find(m => m.id === matchId);
         if (!match) {
             return res.status(404).json({ message: `Match "${matchId}" not found` });
+        }
+
+        // ── BYE detection: allow scoreless winner only for BYE matches ──
+        //
+        // A BYE match has exactly one slot filled. The slot test must agree with
+        // the rest of this codebase or legitimate BYEs get rejected: `isFakeByePlayer`
+        // exists precisely because a slot can hold a marker object like
+        // { id: "bye", name: "BYE" } instead of null, and older rows can hold a bare
+        // player id rather than an object. A plain `typeof p === "object" && p.id`
+        // test reads both of those as a real player, decides the match is not a BYE,
+        // and 400s an auto-advance that every caller performs without a score.
+        const _slotFilled = (p) => {
+            if (!p || isFakeByePlayer(p)) return false;
+            if (typeof p === "string" || typeof p === "number") return String(p).trim() !== "";
+            return !!(p.id || p.player_id || p.playerId);
+        };
+        const _p1Filled = _slotFilled(match.player1);
+        const _p2Filled = _slotFilled(match.player2);
+        const isByeMatch = (_p1Filled && !_p2Filled) || (!_p1Filled && _p2Filled);
+
+        // An empty object or empty array is not a score. Without this, `score: {}`
+        // or `sets: []` satisfied a bare truthiness test and waved the call through.
+        const _hasResult = (v) => {
+            if (v === null || v === undefined) return false;
+            if (Array.isArray(v)) return v.length > 0;
+            if (typeof v === "object") return Object.keys(v).length > 0;
+            if (typeof v === "string") return v.trim() !== "";
+            return true;
+        };
+
+        // CRITICAL: Prevent setting a winner without a valid score for non-BYE matches.
+        // This stops players from being advanced to the next round without any scoring.
+        // Exceptions:
+        //   - BYE matches: auto-advance (one player slot empty)
+        //   - Propagation calls: sync-winners / team-league propagation where scores
+        //     already exist in the matches table and only bracket_data needs updating.
+        //     NOTE: `propagation` is asserted by the caller, so it is a trust boundary,
+        //     not a guarantee — the protection for that path is that the client only
+        //     ever derives a winner from a row belonging to this bracket. See
+        //     findDbRowForBracketMatch in BracketBuilderTab.syncWinnersFromMatches.
+        if (!isByeMatch && !_hasResult(score) && !_hasResult(sets) && !propagation) {
+            return res.status(400).json({ message: "Cannot record a winner without a score. Please enter match scores first." });
         }
 
         // Determine winner player object and extract actual player UUID.
