@@ -1,13 +1,30 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 
 /**
+ * Turns a user-supplied file name into something safe to embed in a storage key.
+ * Returns "" when nothing usable survives, so callers fall back to a random key.
+ */
+function slugifyFileName(name) {
+    if (!name || typeof name !== 'string') return '';
+    return name
+        .replace(/\.[^.]+$/, '')          // drop the extension — we derive it from the MIME type
+        .normalize('NFKD')
+        .replace(/[^a-zA-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase()
+        .slice(0, 60);
+}
+
+/**
  * Uploads a Base64 string to Supabase Storage.
  * @param {string} base64Data - The Base64 string (must include data URI scheme data:type;base64,...)
  * @param {string} bucket - The Supabase Storage bucket name (e.g., 'event-assets', 'player-photos')
  * @param {string} folder - The folder path within the bucket (default: 'misc')
+ * @param {string} [originalName] - Original file name; kept in the key so the UI can
+ *   show a meaningful label (PDF attachments are displayed by file name, not thumbnail).
  * @returns {Promise<string|null>} - The public URL of the uploaded file, or null if failed.
  */
-export async function uploadBase64(base64Data, bucket, folder = 'misc') {
+export async function uploadBase64(base64Data, bucket, folder = 'misc', originalName = '') {
     if (!base64Data || typeof base64Data !== 'string' || !base64Data.startsWith('data:')) {
         // If it's not base64, assume it's already a URL or return as is
         return base64Data;
@@ -35,7 +52,9 @@ export async function uploadBase64(base64Data, bucket, folder = 'misc') {
         else if (mimeType.startsWith('image/')) ext = mimeType.split('/')[1];
 
         const buffer = Buffer.from(rawData, 'base64');
-        const filename = `${folder}/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
+        const slug = slugifyFileName(originalName);
+        const unique = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        const filename = `${folder}/${slug ? `${unique}_${slug}` : unique}.${ext}`;
 
         const { data, error } = await supabaseAdmin.storage
             .from(bucket)
