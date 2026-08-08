@@ -712,13 +712,20 @@ export const getEventBrackets = async (req, res) => {
         // - Media draws require explicit publishing.
         // - Regular brackets: include if published is true or null (backward compat); exclude if explicitly false.
         const publishedBrackets = visibleBrackets.filter(bracket => {
-            // League/pool-converted BRACKET mode rows are always visible
-            const createdFrom = bracket.bracket_data?.createdFrom || bracket.draw_data?.createdFrom;
-            if (bracket.mode === 'BRACKET' && (createdFrom === 'league' || createdFrom === 'pool')) {
-                return true;
-            }
-            // Include if published is true, or if published field doesn't exist (backward compatibility)
-            // If explicitly false, exclude it.
+            // NOTE: league/pool-converted BRACKET rows used to be exempt from the
+            // published check here, on the reasoning that converting one is itself an
+            // act of publishing. But getPublicMatches grants no such exemption — it
+            // gates every row on getPublishedBracketIds — so the two endpoints
+            // disagreed about what "published" means for exactly those brackets.
+            //
+            // The visible result: unpublishing a converted draw hid its scores and
+            // left the draw itself on the public site. Admins pressed Unpublish and
+            // nothing appeared to happen. `published` is now authoritative in both
+            // places, so publish shows the draw AND its results, and unpublish hides
+            // both.
+            //
+            // Include if published is true, or if published field doesn't exist
+            // (backward compatibility). If explicitly false, exclude it.
             if (bracket.published === false) {
                 return false;
             }
