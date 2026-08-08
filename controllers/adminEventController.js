@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { cacheDel } from "../config/redisClient.js";
 import { createNotification } from "../services/notificationService.js";
 import { invalidateDashboardForRegistration } from "../utils/dashboardCache.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
@@ -294,34 +295,73 @@ export const getEventNews = async (req, res) => {
     }
 };
 
+/**
+ * News attachments arrive as data URIs and must land in object storage — a
+ * base64 string written straight into `image_url` bloats every row and every
+ * later read of it. `image_url` holds either an image or a PDF; the apps tell
+ * them apart by the file extension on the stored URL.
+ */
+const NEWS_ATTACHMENT_TYPES = /^data:(image\/[a-z0-9.+-]+|application\/pdf);base64,/i;
+
+const storeNewsAttachment = async (imageUrl, fileName) => {
+    if (!imageUrl || typeof imageUrl !== 'string') return { url: imageUrl || null };
+    if (!imageUrl.startsWith('data:')) return { url: imageUrl }; // already-uploaded URL, keep as is
+    if (!NEWS_ATTACHMENT_TYPES.test(imageUrl)) {
+        return { error: "Only image or PDF attachments are supported" };
+    }
+    const uploaded = await uploadBase64(imageUrl, 'event-assets', 'news', fileName);
+    if (!uploaded) return { error: "Attachment upload failed" };
+    return { url: uploaded };
+};
+
 export const createEventNews = async (req, res) => {
     try {
-        const { eventId, title, content, imageUrl, isHighlight } = req.body;
+        const { eventId, title, content, imageUrl, fileName, isHighlight } = req.body;
+
+        const attachment = await storeNewsAttachment(imageUrl, fileName);
+        if (attachment.error) return res.status(400).json({ success: false, message: attachment.error });
+
         const { data, error } = await supabaseAdmin.from("event_news")
-            .insert({ event_id: eventId, title, content, image_url: imageUrl, is_highlight: isHighlight })
+            .insert({ event_id: eventId, title, content, image_url: attachment.url, is_highlight: isHighlight })
             .select().maybeSingle();
         if (error) throw error;
+        await cacheDel("event:detail:*"); // player event page embeds news
         res.json({ success: true, news: data });
-    } catch (err) { res.status(500).json({ message: "Failed to create news" }); }
+    } catch (err) {
+        console.error("createEventNews error:", err.message);
+        res.status(500).json({ success: false, message: "Failed to create news" });
+    }
 };
 
 export const updateEventNews = async (req, res) => {
     try {
         const { id } = req.params;
-        const { title, content, imageUrl, isHighlight } = req.body;
+        const { title, content, imageUrl, fileName, isHighlight } = req.body;
+
+        const attachment = await storeNewsAttachment(imageUrl, fileName);
+        if (attachment.error) return res.status(400).json({ success: false, message: attachment.error });
+
         const { data, error } = await supabaseAdmin.from("event_news")
-            .update({ title, content, image_url: imageUrl, is_highlight: isHighlight }).eq("id", id).select().maybeSingle();
+            .update({ title, content, image_url: attachment.url, is_highlight: isHighlight }).eq("id", id).select().maybeSingle();
         if (error) throw error;
+        await cacheDel("event:detail:*");
         res.json({ success: true, news: data });
-    } catch (err) { res.status(500).json({ message: "Failed to update news" }); }
+    } catch (err) {
+        console.error("updateEventNews error:", err.message);
+        res.status(500).json({ success: false, message: "Failed to update news" });
+    }
 };
 
 export const deleteEventNews = async (req, res) => {
     try {
         const { error } = await supabaseAdmin.from("event_news").delete().eq("id", req.params.id);
         if (error) throw error;
+        await cacheDel("event:detail:*");
         res.json({ success: true, message: "News deleted" });
-    } catch (err) { res.status(500).json({ message: "Failed to delete news" }); }
+    } catch (err) {
+        console.error("deleteEventNews error:", err.message);
+        res.status(500).json({ success: false, message: "Failed to delete news" });
+    }
 };
 
 /* ================= BRACKETS ================= */
