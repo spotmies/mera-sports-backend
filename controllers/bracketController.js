@@ -1413,6 +1413,33 @@ export const updateBracketMatch = async (req, res) => {
         const bracket = brackets[0];
         const bracketData = bracket.bracket_data || { rounds: [], players: [] };
 
+        // Category scope for every `matches` write in this handler.
+        //
+        // CRITICAL: bracket_match_id is "R1-M1", "R2-M1", … and those strings repeat
+        // in EVERY category of an event. A matches update filtered only by
+        // bracket_match_id + event_id therefore rewrites the same-named match in all
+        // of them. That is how a category's Semifinal ended up holding players who
+        // were never registered in it: editing a different category's R1-M1 wrote its
+        // players straight over this one's row, and the bracket then rendered a match
+        // between two people who had never been drawn against each other.
+        //
+        // Both keys are accepted because matches.category_id holds either the category
+        // id or its label depending on which screen created the round; filtering on
+        // just one silently updated zero rows. Same construction as recordResult.
+        const matchCategoryKeysForSync = Array.from(new Set(
+            [categoryId, categoryLabel, bracket.category_id, bracket.category]
+                .map((v) => (v == null ? "" : String(v).trim()))
+                .filter((v) => v.length > 0)
+        ));
+
+        /** Applies the category scope to a matches query. No matches write may skip this. */
+        const scopeToCategory = (query) => {
+            if (matchCategoryKeysForSync.length === 0) return query;
+            return matchCategoryKeysForSync.length === 1
+                ? query.eq("category_id", matchCategoryKeysForSync[0])
+                : query.in("category_id", matchCategoryKeysForSync);
+        };
+
         // Handle player ranks update
         if (updatePlayerRanks === true) {
             // --- Per-round ranking (new structure) ---
@@ -1727,16 +1754,18 @@ export const updateBracketMatch = async (req, res) => {
                 const bracketMatchId = matchId || match.id;
                 if (bracketMatchId) {
                     try {
-                        await supabaseAdmin
-                            .from("matches")
-                            .update({
-                                winner: null,
-                                status: "SCHEDULED",
-                                score: null,
-                                updated_at: new Date().toISOString()
-                            })
-                            .eq("bracket_match_id", String(bracketMatchId).trim())
-                            .eq("event_id", eventId);
+                        await scopeToCategory(
+                            supabaseAdmin
+                                .from("matches")
+                                .update({
+                                    winner: null,
+                                    status: "SCHEDULED",
+                                    score: null,
+                                    updated_at: new Date().toISOString()
+                                })
+                                .eq("bracket_match_id", String(bracketMatchId).trim())
+                                .eq("event_id", eventId)
+                        );
                     } catch (clearErr) {
                         console.warn("[updateBracketMatch] Failed to clear stale winner in matches table:", clearErr.message);
                     }
@@ -1752,11 +1781,13 @@ export const updateBracketMatch = async (req, res) => {
                 const syncPayload = { updated_at: new Date().toISOString() };
                 if (player1 !== undefined) syncPayload.player_a = player1 && !isFakeByePlayer(player1) ? player1 : null;
                 if (player2 !== undefined) syncPayload.player_b = player2 && !isFakeByePlayer(player2) ? player2 : null;
-                await supabaseAdmin
-                    .from("matches")
-                    .update(syncPayload)
-                    .eq("bracket_match_id", String(bracketMatchIdForSync).trim())
-                    .eq("event_id", eventId);
+                await scopeToCategory(
+                    supabaseAdmin
+                        .from("matches")
+                        .update(syncPayload)
+                        .eq("bracket_match_id", String(bracketMatchIdForSync).trim())
+                        .eq("event_id", eventId)
+                );
             } catch (syncErr) {
                 console.warn("[updateBracketMatch] Failed to sync players in matches table:", syncErr.message);
             }
