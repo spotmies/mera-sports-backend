@@ -1526,6 +1526,33 @@ export const updateMatchScore = async (req, res) => {
             return null;
         };
 
+        // A match cannot be completed with an empty side.
+        //
+        // The block above back-fills player_a/player_b from bracket_data when the
+        // row is missing them; if a side is still empty after that, nobody is
+        // recorded as playing it. Completing anyway is what produced the QA
+        // wreckage on event 41: Quarterfinals stored with null players were
+        // scored from a UI that had inferred the names client-side, so the rows
+        // came out COMPLETED with a winner id matching neither recorded side —
+        // one of them (R2-M2) had both sides null. From there the Semifinal
+        // filled from those winners while the Quarterfinal, unable to reconcile
+        // its winner against nulls, still read "Awaiting matchup results".
+        //
+        // Refusing here keeps the contradiction from ever reaching the table.
+        // BYE rows are exempt: a single-sided BYE is legitimate and is advanced
+        // by the propagation path, not by scoring.
+        if (status === 'COMPLETED' && currentMatch.status !== 'BYE') {
+            const sideAMissing = !getPlayerId(effectivePlayerA);
+            const sideBMissing = !getPlayerId(effectivePlayerB);
+            if (sideAMissing || sideBMissing) {
+                return res.status(400).json({
+                    success: false,
+                    message: "This match has an empty side, so it cannot be completed. The previous round's winner has not reached this slot yet — finalize that round first.",
+                    code: "INCOMPLETE_MATCH_PLAYERS"
+                });
+            }
+        }
+
         // IMPORTANT: Do NOT auto-calculate winner or auto-set status on score update
         // Winners are calculated ONLY during finalization (finalizeRoundMatches endpoint)
         // This allows admin to freely edit scores without premature locking
