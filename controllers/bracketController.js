@@ -1995,6 +1995,67 @@ export const replaceRoundMatches = async (req, res) => {
 
         bracketData.rounds[roundIndex] = { ...round, matches: newMatches };
 
+        // ── Carry decided BYE winners into the next round ────────────────────
+        //
+        // This endpoint writes `winner` for every match it is handed, including
+        // the Round-1 BYEs that bulk seeding auto-advances — but it used to stop
+        // there, and a winner that is never carried forward is a winner that
+        // does not exist downstream. Worse, the follow-up call that *does*
+        // propagate (POST /bracket/result) is skipped by the client precisely
+        // because the winner flag is already set, so the BYE'd entrant was
+        // dropped for good.
+        //
+        // The damage is not subtle. On QA event 41 (All / Mixed / Doubles, 11
+        // pairs, 5 BYEs) every one of the 5 BYE feeders was missing from the
+        // Quarterfinal while the 3 played matches propagated normally: R2-M2 had
+        // both slots empty. The bracket still *looked* full because the client
+        // re-derives BYE winners for display, so an admin scored Quarterfinals
+        // whose stored player_a/player_b were null — leaving `matches` rows
+        // COMPLETED with a winner id belonging to neither recorded side, the
+        // Semifinal populated from those winners, and the Quarterfinal itself
+        // stuck on "Awaiting matchup results".
+        //
+        // Only *empty* downstream slots are filled, so this can never overwrite
+        // a real pairing or a recorded result, and re-running it is a no-op.
+        const byePropagations = [];
+        const nextRound = bracketData.rounds[roundIndex + 1];
+        if (nextRound && Array.isArray(nextRound.matches)) {
+            const realPlayer = (p) => (p && !isFakeByePlayer(p) && (p.id || p.player_id)) ? p : null;
+
+            newMatches.forEach((m, idx) => {
+                const p1 = realPlayer(m.player1);
+                const p2 = realPlayer(m.player2);
+
+                // A BYE is exactly one occupied side. Both-filled matches are
+                // decided by scores, and the finalize path owns those.
+                if (!!p1 === !!p2) return;
+
+                const winnerPlayer = p1 || p2;
+                const winnerSide = p1 ? "player1" : "player2";
+                if (m.winner && m.winner !== winnerSide) return; // disagrees — leave it alone
+                if (!m.winner) m.winner = winnerSide;
+
+                let targetId = m.winnerTo != null ? String(m.winnerTo).trim() : null;
+                let targetSlot = m.winnerToSlot || null;
+                if (!targetId || !targetSlot) {
+                    // Legacy rows without linkage: standard pairing by index.
+                    const nextMatch = nextRound.matches[Math.floor(idx / 2)];
+                    if (!nextMatch?.id) return;
+                    targetId = String(nextMatch.id).trim();
+                    targetSlot = idx % 2 === 0 ? "player1" : "player2";
+                }
+
+                const downstream = nextRound.matches.find(
+                    (nm) => nm && String(nm.id).trim() === targetId
+                );
+                if (!downstream) return;
+                if (realPlayer(downstream[targetSlot])) return; // already occupied
+
+                downstream[targetSlot] = winnerPlayer;
+                byePropagations.push({ targetId, targetSlot, winnerPlayer });
+            });
+        }
+
         const { data, error } = await supabaseAdmin
             .from("event_brackets")
             .update({
@@ -2063,6 +2124,47 @@ export const replaceRoundMatches = async (req, res) => {
             }
         } catch (syncErr) {
             console.warn("[replaceRoundMatches] Match row re-sync failed (non-fatal):", syncErr.message);
+        }
+
+        // Mirror the BYE propagation above into the next round's match rows.
+        // The Scoreboard scores off `matches.player_a/player_b`, so a slot that
+        // exists only in bracket_data is a slot the admin can score with nobody
+        // in it — which is how a COMPLETED match ended up with a winner that is
+        // neither of its recorded players. Empty sides only, same as above.
+        if (byePropagations.length > 0) {
+            try {
+                const targetIds = [...new Set(byePropagations.map((p) => p.targetId))];
+                const { data: downstreamRows } = await supabaseAdmin
+                    .from("matches")
+                    .select("id, bracket_match_id, player_a, player_b, status")
+                    .eq("event_id", eventId)
+                    .eq("bracket_id", bracket.id)
+                    .in("bracket_match_id", targetIds);
+
+                for (const row of downstreamRows || []) {
+                    const patch = {};
+                    for (const prop of byePropagations) {
+                        if (prop.targetId !== String(row.bracket_match_id || "").trim()) continue;
+                        const column = prop.targetSlot === "player1" ? "player_a" : "player_b";
+                        const occupant = row[column];
+                        if (occupant && (occupant.id || occupant.player_id)) continue;
+                        patch[column] = prop.winnerPlayer;
+                    }
+                    if (Object.keys(patch).length === 0) continue;
+
+                    patch.updated_at = new Date().toISOString();
+                    const { error: byeSyncError } = await supabaseAdmin
+                        .from("matches")
+                        .update(patch)
+                        .eq("id", row.id);
+
+                    if (byeSyncError) {
+                        console.warn(`[replaceRoundMatches] BYE downstream sync failed for ${row.bracket_match_id}:`, byeSyncError.message);
+                    }
+                }
+            } catch (byeSyncErr) {
+                console.warn("[replaceRoundMatches] BYE downstream sync failed (non-fatal):", byeSyncErr.message);
+            }
         }
 
         await invalidateMatchesCache(eventId);

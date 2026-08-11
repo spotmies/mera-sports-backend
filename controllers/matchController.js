@@ -758,7 +758,20 @@ export const generateLeagueMatches = async (req, res) => {
             }
         }
 
-        // Build a set of existing unordered pairs (playerA, playerB) per group
+        // Build a set of existing unordered pairs (playerA, playerB) per group.
+        //
+        // Two key shapes are registered because the two generation modes below ask
+        // different questions of this set:
+        //   - round-robin asks "have these two already been drawn in this group?"
+        //     -> `group__idA__idB`
+        //   - team league asks "is this the same individual match of the same team
+        //     matchup?" -> `group__idA__idB__teamMatchupId__matchNumber`, since one
+        //     pair legitimately appears once per matchup slot.
+        // Only the plain shape used to be registered, so the team-league lookup
+        // never matched an existing row and re-confirming an unchanged draw
+        // re-inserted every match. The rows survived `uniq_match_identity`
+        // (bracket_id, round_name, match_index) because new rows are appended at
+        // maxIndex+1, so the duplicates landed silently.
         const existingPairs = new Set();
         (existingMatches || []).forEach((m) => {
             const aId = m.player_a && (m.player_a.id || m.player_a.player_id || m.player_a);
@@ -766,8 +779,16 @@ export const generateLeagueMatches = async (req, res) => {
             const groupKey = (m.player_a && m.player_a.group) || (m.player_b && m.player_b.group) || "A";
             if (!aId || !bId) return;
             const [id1, id2] = [String(aId), String(bId)].sort();
-            const key = `${groupKey}__${id1}__${id2}`;
-            existingPairs.add(key);
+            existingPairs.add(`${groupKey}__${id1}__${id2}`);
+
+            // Team-league rows carry the matchup identity on both sides (written
+            // below); absent on round-robin rows, which simply never get this key.
+            const teamMatchupId =
+                (m.player_a && m.player_a.teamMatchupId) || (m.player_b && m.player_b.teamMatchupId) || "";
+            if (!teamMatchupId) return;
+            const matchNum =
+                (m.player_a && m.player_a.matchNumber) ?? (m.player_b && m.player_b.matchNumber) ?? 0;
+            existingPairs.add(`${groupKey}__${id1}__${id2}__${teamMatchupId}__${matchNum}`);
         });
 
         // 3. Generate all unique pairs i < j within each group
@@ -1525,6 +1546,33 @@ export const updateMatchScore = async (req, res) => {
             }
             return null;
         };
+
+        // A match cannot be completed with an empty side.
+        //
+        // The block above back-fills player_a/player_b from bracket_data when the
+        // row is missing them; if a side is still empty after that, nobody is
+        // recorded as playing it. Completing anyway is what produced the QA
+        // wreckage on event 41: Quarterfinals stored with null players were
+        // scored from a UI that had inferred the names client-side, so the rows
+        // came out COMPLETED with a winner id matching neither recorded side —
+        // one of them (R2-M2) had both sides null. From there the Semifinal
+        // filled from those winners while the Quarterfinal, unable to reconcile
+        // its winner against nulls, still read "Awaiting matchup results".
+        //
+        // Refusing here keeps the contradiction from ever reaching the table.
+        // BYE rows are exempt: a single-sided BYE is legitimate and is advanced
+        // by the propagation path, not by scoring.
+        if (status === 'COMPLETED' && currentMatch.status !== 'BYE') {
+            const sideAMissing = !getPlayerId(effectivePlayerA);
+            const sideBMissing = !getPlayerId(effectivePlayerB);
+            if (sideAMissing || sideBMissing) {
+                return res.status(400).json({
+                    success: false,
+                    message: "This match has an empty side, so it cannot be completed. The previous round's winner has not reached this slot yet — finalize that round first.",
+                    code: "INCOMPLETE_MATCH_PLAYERS"
+                });
+            }
+        }
 
         // IMPORTANT: Do NOT auto-calculate winner or auto-set status on score update
         // Winners are calculated ONLY during finalization (finalizeRoundMatches endpoint)
@@ -3156,12 +3204,24 @@ export const getMatches = async (req, res) => {
     const { categoryId, categoryName, roundName, bracketId } = req.query;
 
     try {
-        // Start with base query - fetch all matches for event first
+        // Start with base query - fetch all matches for event first.
+        //
+        // created_at alone is NOT a total order: a generated round writes every
+        // one of its rows in a single insert, so they all share one timestamp and
+        // Postgres was free to return them in whatever physical order the heap
+        // happened to be in — an order that shifts as scores are saved. The admin
+        // pool screen therefore listed a pool's matches differently from the
+        // player scoreboard (which reads getLeagueMatches, ordered by
+        // match_index) and differently from itself after an edit. match_index is
+        // the schedule's own numbering, so tie-breaking on it — then on id —
+        // makes both sides agree and keeps the list stable across reloads.
         let query = supabaseAdmin
             .from('matches')
             .select('*')
             .eq('event_id', eventId)
-            .order('created_at', { ascending: true });
+            .order('created_at', { ascending: true })
+            .order('match_index', { ascending: true })
+            .order('id', { ascending: true });
 
         // matches.category_id is not written consistently: depending on which screen
         // created a round, the SAME category's rows can be keyed by its id
@@ -3205,7 +3265,9 @@ export const getMatches = async (req, res) => {
                 .from('matches')
                 .select('*')
                 .eq('event_id', eventId)
-                .order('created_at', { ascending: true });
+                .order('created_at', { ascending: true })
+                .order('match_index', { ascending: true })
+                .order('id', { ascending: true });
 
             const { data: retryData, error: retryError } = await retryQuery;
 
