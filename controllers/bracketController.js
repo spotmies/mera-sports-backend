@@ -1212,61 +1212,24 @@ export const createFullBracketStructure = async (req, res) => {
 
         if (updateError) throw updateError;
         
-        // Generate matches table entries for ALL rounds (Option B)
-        // CRITICAL: Do NOT create DB match rows for Round 1 BYE matches (single player).
-        const allInserts = [];
-        //console.log(`[START ROUNDS] Building allInserts from ${newRounds.length} rounds:`);
-        for (const [rIndex, round] of newRounds.entries()) {
-            //console.log(`[START ROUNDS]   Round ${rIndex} (${round.name}): Processing ${round.matches?.length || 0} matches`);
-            for (const match of round.matches) {
-                const matchIndex = match.matchNumber - 1;
-                const hasValidPlayer = (p) => p && typeof p === "object" && Object.keys(p).length > 0 && (p.id || p.player_id);
-                const isByeRound1 = rIndex === 0 && ((hasValidPlayer(match.player1) && !hasValidPlayer(match.player2)) || (!hasValidPlayer(match.player1) && hasValidPlayer(match.player2)));
-                if (isByeRound1) continue; // BYE: no DB row
-
-                const payload = {
-                    event_id: eventId,
-                    category_id: resolveMatchCategoryKey(categoryId, categoryLabel, bracket),
-                    bracket_id: bracket.id,
-                    round_name: round.name,
-                    match_index: matchIndex,
-                    // Never store empty objects; store null when player missing.
-                    player_a: hasValidPlayer(match.player1) ? match.player1 : null,
-                    player_b: hasValidPlayer(match.player2) ? match.player2 : null,
-                    score: null,
-                    winner: null,
-                    status: "SCHEDULED",
-                    bracket_match_id: match.id
-                };
-                allInserts.push(payload);
-            }
-        }
-
-        if (allInserts.length > 0) {
-            // FOURTH: Insert matches into database (all old matches deleted above)
-            //console.log(`[START ROUNDS] Inserting ${allInserts.length} matches into database`);
-            // console.log(`[START ROUNDS]   Match breakdown by round:`, allInserts.reduce((acc, m) => {
-            //     acc[m.round_name] = (acc[m.round_name] || 0) + 1;
-            //     return acc;
-            // }, {}));
-
-            const { error: insertError } = await supabaseAdmin
-                .from("matches")
-                .insert(allInserts);
-
-            if (insertError) {
-                console.error("START ROUNDS - CRITICAL: Match insertion failed after delete:", insertError);
-                
-                // If we get a duplicate key error here, it means something re-created the matches after we deleted them
-                if (insertError.code === '23505') {  // Unique constraint violation
-                    throw new Error("DUPLICATE_MATCH_ERROR: Matches were recreated after deletion. Possible race condition or pool bracket interference.");
-                }
-                
-                // Re-throw other database errors
-                throw insertError;
-            }
-        }
-
+        // NOTE: Start Rounds deliberately creates NO rows in `matches`.
+        //
+        // It used to insert the whole schedule — every round, every match — right
+        // here, which made three things go wrong at once:
+        //   1. The Scoreboard reads `matches`, so every match went live the moment
+        //      the structure existed, before the admin had finished seeding.
+        //   2. `generateMatchesFromBracket` (the "Generate Matches" button in
+        //      ScoreboardTab) was left with nothing to do — permanently showing
+        //      "Matches Generated" — so the intended publish gate never fired.
+        //   3. The admin UI treats "a matches row with two real players exists" as
+        //      "the scoreboard schedule is out", and locks ranks and slot editing on
+        //      it (see hasGeneratedPlayableMatchesInList in BracketBuilderTab). That
+        //      lock therefore fired at Start Rounds, before any score existed,
+        //      stranding the bracket: no reseeding, no Undo Seeding, no slot edits.
+        //
+        // The schedule is now written only by generateMatchesFromBracket, which is
+        // idempotent per match_index and preserves COMPLETED rows. Bracket structure
+        // (event_brackets.bracket_data) and schedule (`matches`) are separate steps.
         await invalidateMatchesCache(eventId);
         return res.json({
             success: true,
@@ -1276,7 +1239,9 @@ export const createFullBracketStructure = async (req, res) => {
                 bracketSize,
                 playerCount,
                 roundCount,
-                totalMatches: allInserts.length
+                // Structure only — the schedule is written later by
+                // generateMatchesFromBracket, so no `matches` rows exist yet.
+                totalMatches: 0
             }
         });
     } catch (err) {
