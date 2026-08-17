@@ -343,10 +343,15 @@ export const verifyVerificationOtp = async (req, res) => {
 
 /* ================= OTP ROUTES (REGISTRATION) ================= */
 
+const EMAIL_FORMAT_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export const sendRegistrationOtp = async (req, res) => {
     try {
         const { email } = req.body;
         if (!email) return res.status(400).json({ message: "Email is required" });
+        if (typeof email !== "string" || !EMAIL_FORMAT_REGEX.test(email.trim())) {
+            return res.status(400).json({ message: "Invalid email address format" });
+        }
 
         await sendEmailOtp(email);
         res.json({ success: true, message: "OTP sent to email" });
