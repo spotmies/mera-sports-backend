@@ -56,6 +56,69 @@ export const getAllCategories = async (req, res) => {
     }
 };
 
+/**
+ * Attach each team member's public player code to the roster rows.
+ *
+ * `player_teams.members` stores {id, name, mobile}, where `id` is a `users`
+ * uuid and the readable code ("P1769") lives on the user row. A roster on its
+ * own therefore cannot tell two same-named members apart — which is exactly
+ * what the pool scoring screen needs to do, one goal input per member.
+ *
+ * The codes are looked up once for the whole response and merged in as
+ * `player_id`, leaving every existing member field untouched, so readers that
+ * know nothing about the new field are unaffected.
+ */
+const attachMemberPlayerCodes = async (registrations) => {
+    const rows = Array.isArray(registrations) ? registrations : [];
+    const teamsOf = (reg) => {
+        const t = reg?.player_teams;
+        if (Array.isArray(t)) return t;
+        return t ? [t] : [];
+    };
+
+    const memberIds = new Set();
+    for (const reg of rows) {
+        for (const team of teamsOf(reg)) {
+            if (!Array.isArray(team?.members)) continue;
+            for (const member of team.members) {
+                const id = member && typeof member === "object" ? member.id : null;
+                if (id) memberIds.add(String(id));
+            }
+        }
+    }
+    if (memberIds.size === 0) return;
+
+    // Chunked: a large event's rosters run to thousands of ids, and PostgREST
+    // takes `in` as a query string — one unbounded list would blow the URL limit.
+    const ids = Array.from(memberIds);
+    const codeById = new Map();
+    for (let i = 0; i < ids.length; i += 200) {
+        const { data, error } = await supabaseAdmin
+            .from("users")
+            .select("id, player_id")
+            .in("id", ids.slice(i, i + 200));
+        if (error) {
+            // Non-fatal by design: without codes the roster still renders, just
+            // without the disambiguator. A lookup failure must not take the
+            // whole registrations page down with it.
+            console.warn("[getRegistrations] member player_id lookup failed:", error.message);
+            return;
+        }
+        for (const user of data || []) codeById.set(String(user.id), user.player_id);
+    }
+
+    for (const reg of rows) {
+        for (const team of teamsOf(reg)) {
+            if (!Array.isArray(team?.members)) continue;
+            team.members = team.members.map((member) => {
+                if (!member || typeof member !== "object" || !member.id) return member;
+                const code = codeById.get(String(member.id));
+                return code ? { ...member, player_id: code } : member;
+            });
+        }
+    }
+};
+
 /* ================= REGISTRATIONS & TRANSACTIONS ================= */
 export const getRegistrations = async (req, res) => {
     try {
@@ -113,6 +176,7 @@ export const getRegistrations = async (req, res) => {
 
         const { data: registrations, count, error } = await query;
         if (error) throw error;
+        await attachMemberPlayerCodes(registrations);
         res.json({ success: true, registrations, total_count: count });
     } catch (err) {
         console.error("ADMIN REGISTRATIONS ERROR:", err);

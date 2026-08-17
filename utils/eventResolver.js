@@ -96,6 +96,16 @@ export const resolveEventByIdentifier = async (identifier, selectColumns = "*") 
     }
 
     const normalizedId = normalizeEventId(rawIdentifier);
+    // `events.id` is bigint — anything that didn't normalize to a plain integer
+    // (a UUID, a slug, garbage input) can never match a row, and handing it to
+    // PostgREST as a raw `id=eq.<value>` filter makes Postgres reject the query
+    // with "invalid input syntax for type bigint" instead of just finding no
+    // rows. That surfaced as a 500 on every /api/events/:id-family endpoint
+    // (and its /public equivalents) whenever the id looked nothing like a row.
+    if (typeof normalizedId !== "number" || !Number.isInteger(normalizedId)) {
+        return null;
+    }
+
     const { data: byInternalId, error: internalError } = await supabaseAdmin
         .from("events")
         .select(selectColumns)

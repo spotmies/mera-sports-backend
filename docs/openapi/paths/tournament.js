@@ -329,7 +329,12 @@ export const tournamentPaths = {
 
     ...pair("/bracket", "delete", {
         summary: "Delete a category's bracket",
-        description: "Unpublished draws only.",
+        description:
+            "Unpublished draws only.\n\nSend `categoryLabel` alongside the id whenever you have it. " +
+            "Brackets created before brackets became id-keyed are stored under the label alone, and an " +
+            "id-only delete answers 404 for a bracket the `GET /draw` (which sends both keys) renders fine. " +
+            "The `{categoryId}` variant accepts the same `categoryLabel` query parameter as the by-label variant " +
+            "below (`category` is an alias), and it is only ever a fallback: the id wins whenever it owns a bracket.",
         responses: { ...okEnvelope("Bracket deleted."), ...errors(400, 401, 403, 404, 500) },
     }),
 

@@ -69,23 +69,28 @@ const isStructuredKnockout = (bracketData) => {
 const inferRoundLabelFromMatchCount = (matchCount, fallbackIndex, roundIndex, totalRounds) => {
     // Calculate number of competitors in this round (each match = 2 competitors)
     const numCompetitors = matchCount * 2;
-    const roundsRemaining = totalRounds - roundIndex;  // Including current round
-    
-    // CRITICAL: Reserve standard tournament names ONLY for final rounds
-    // This ensures unique names and prevents confusing misnaming of early rounds
-    
-    // Last round (1 remaining) = Final
-    if (roundsRemaining === 1) return "Final";
-    
-    // Second-to-last (2 remaining) = Semifinal
-    if (roundsRemaining === 2) return "Semifinal";
-    
-    // Third-to-last (4 remaining) = Quarterfinal
-    if (roundsRemaining === 3) return "Quarterfinal";
-    
-    // For all other rounds, use "Round of X" format
-    // This applies to: all earlier rounds (Round of 64, Round of 32, Round of 16, etc.)
-    // Examples: "Round of 64", "Round of 32", "Round of 16"
+
+    // Position-based naming. `createFullBracketStructure` knows the whole shape up
+    // front, so it can reserve the standard names for the genuinely final rounds and
+    // guarantee every round in the bracket gets a distinct name.
+    if (Number.isFinite(roundIndex) && Number.isFinite(totalRounds)) {
+        const roundsRemaining = totalRounds - roundIndex;  // Including current round
+        if (roundsRemaining === 1) return "Final";
+        if (roundsRemaining === 2) return "Semifinal";
+        if (roundsRemaining === 3) return "Quarterfinal";
+        // All earlier rounds: "Round of 64", "Round of 32", "Round of 16", ...
+        return `Round of ${numCompetitors}`;
+    }
+
+    // Count-based naming, for callers that append one round at a time and therefore
+    // cannot know the total. Without this branch the two positional arguments arrived
+    // `undefined`, `roundsRemaining` was NaN, every comparison above was false, and
+    // `addBracketRound` could never produce Final/Semifinal/Quarterfinal — a
+    // four-round bracket built with "Add Round" ended as Round of 16 / of 8 / of 4 /
+    // of 2. For a halving bracket both branches agree on the named rounds.
+    if (matchCount === 1) return "Final";
+    if (matchCount === 2) return "Semifinal";
+    if (matchCount === 4) return "Quarterfinal";
     return `Round of ${numCompetitors}`;
 };
 
@@ -98,6 +103,59 @@ const makeEmptyMatch = (idOverride) => ({
     winner: null,
     score: null // Structure only - not authoritative
 });
+
+/** Identity of whoever occupies a bracket slot, in whichever shape it was stored. */
+const bracketPlayerKey = (p) => {
+    if (!p) return "";
+    return String(typeof p === "object" ? (p.id ?? p.player_id ?? p) : p).trim();
+};
+
+/**
+ * Undo an advancement: pull `advancedPlayer` back out of every later round this match
+ * had already pushed them into, following winnerTo/winnerToSlot.
+ *
+ * A Round-1 BYE winner is written straight into the next round when the bracket is
+ * built. Every handler that can end a BYE — filling its empty side, reshuffling the
+ * draw — has to undo that too, or the player stays parked in the next round with an
+ * unplayed match behind them and appears to advance without playing.
+ *
+ * A slot is only reclaimed while it still holds this exact player; anyone else got
+ * there on their own result and is left alone.
+ *
+ * @returns {Array<{id: string, slot: string}>} cleared slots, so callers can sync `matches`
+ */
+const revertAdvancement = (startMatch, advancedPlayer, rounds) => {
+    const advancedId = bracketPlayerKey(advancedPlayer);
+    const cleared = [];
+    if (!advancedId || !Array.isArray(rounds)) return cleared;
+
+    let cursor = startMatch;
+    let hops = 0;
+    while (cursor?.winnerTo && cursor?.winnerToSlot && hops++ < 32) {
+        const targetId = String(cursor.winnerTo).trim();
+        const targetSlot = cursor.winnerToSlot;
+
+        let target = null;
+        for (const r of rounds) {
+            const found = (r?.matches || []).find((m) => m && String(m.id).trim() === targetId);
+            if (found) { target = found; break; }
+        }
+        if (!target || bracketPlayerKey(target[targetSlot]) !== advancedId) break;
+
+        const targetWinnerId = target.winner ? bracketPlayerKey(target[target.winner]) : "";
+        target[targetSlot] = null;
+        cleared.push({ id: targetId, slot: targetSlot });
+
+        // Keep unwinding only if they also won the round they had been placed in.
+        if (targetWinnerId && targetWinnerId === advancedId) {
+            target.winner = null;
+            cursor = target;
+        } else {
+            break;
+        }
+    }
+    return cleared;
+};
 
 // Compute next power of two >= n (used for full bracket sizing)
 const nextPowerOfTwo = (n) => {
@@ -1154,61 +1212,24 @@ export const createFullBracketStructure = async (req, res) => {
 
         if (updateError) throw updateError;
         
-        // Generate matches table entries for ALL rounds (Option B)
-        // CRITICAL: Do NOT create DB match rows for Round 1 BYE matches (single player).
-        const allInserts = [];
-        //console.log(`[START ROUNDS] Building allInserts from ${newRounds.length} rounds:`);
-        for (const [rIndex, round] of newRounds.entries()) {
-            //console.log(`[START ROUNDS]   Round ${rIndex} (${round.name}): Processing ${round.matches?.length || 0} matches`);
-            for (const match of round.matches) {
-                const matchIndex = match.matchNumber - 1;
-                const hasValidPlayer = (p) => p && typeof p === "object" && Object.keys(p).length > 0 && (p.id || p.player_id);
-                const isByeRound1 = rIndex === 0 && ((hasValidPlayer(match.player1) && !hasValidPlayer(match.player2)) || (!hasValidPlayer(match.player1) && hasValidPlayer(match.player2)));
-                if (isByeRound1) continue; // BYE: no DB row
-
-                const payload = {
-                    event_id: eventId,
-                    category_id: resolveMatchCategoryKey(categoryId, categoryLabel, bracket),
-                    bracket_id: bracket.id,
-                    round_name: round.name,
-                    match_index: matchIndex,
-                    // Never store empty objects; store null when player missing.
-                    player_a: hasValidPlayer(match.player1) ? match.player1 : null,
-                    player_b: hasValidPlayer(match.player2) ? match.player2 : null,
-                    score: null,
-                    winner: null,
-                    status: "SCHEDULED",
-                    bracket_match_id: match.id
-                };
-                allInserts.push(payload);
-            }
-        }
-
-        if (allInserts.length > 0) {
-            // FOURTH: Insert matches into database (all old matches deleted above)
-            //console.log(`[START ROUNDS] Inserting ${allInserts.length} matches into database`);
-            // console.log(`[START ROUNDS]   Match breakdown by round:`, allInserts.reduce((acc, m) => {
-            //     acc[m.round_name] = (acc[m.round_name] || 0) + 1;
-            //     return acc;
-            // }, {}));
-
-            const { error: insertError } = await supabaseAdmin
-                .from("matches")
-                .insert(allInserts);
-
-            if (insertError) {
-                console.error("START ROUNDS - CRITICAL: Match insertion failed after delete:", insertError);
-                
-                // If we get a duplicate key error here, it means something re-created the matches after we deleted them
-                if (insertError.code === '23505') {  // Unique constraint violation
-                    throw new Error("DUPLICATE_MATCH_ERROR: Matches were recreated after deletion. Possible race condition or pool bracket interference.");
-                }
-                
-                // Re-throw other database errors
-                throw insertError;
-            }
-        }
-
+        // NOTE: Start Rounds deliberately creates NO rows in `matches`.
+        //
+        // It used to insert the whole schedule — every round, every match — right
+        // here, which made three things go wrong at once:
+        //   1. The Scoreboard reads `matches`, so every match went live the moment
+        //      the structure existed, before the admin had finished seeding.
+        //   2. `generateMatchesFromBracket` (the "Generate Matches" button in
+        //      ScoreboardTab) was left with nothing to do — permanently showing
+        //      "Matches Generated" — so the intended publish gate never fired.
+        //   3. The admin UI treats "a matches row with two real players exists" as
+        //      "the scoreboard schedule is out", and locks ranks and slot editing on
+        //      it (see hasGeneratedPlayableMatchesInList in BracketBuilderTab). That
+        //      lock therefore fired at Start Rounds, before any score existed,
+        //      stranding the bracket: no reseeding, no Undo Seeding, no slot edits.
+        //
+        // The schedule is now written only by generateMatchesFromBracket, which is
+        // idempotent per match_index and preserves COMPLETED rows. Bracket structure
+        // (event_brackets.bracket_data) and schedule (`matches`) are separate steps.
         await invalidateMatchesCache(eventId);
         return res.json({
             success: true,
@@ -1218,7 +1239,9 @@ export const createFullBracketStructure = async (req, res) => {
                 bracketSize,
                 playerCount,
                 roundCount,
-                totalMatches: allInserts.length
+                // Structure only — the schedule is written later by
+                // generateMatchesFromBracket, so no `matches` rows exist yet.
+                totalMatches: 0
             }
         });
     } catch (err) {
@@ -1733,6 +1756,12 @@ export const updateBracketMatch = async (req, res) => {
                 }
             }
 
+            // Who this match had already sent forward, captured BEFORE the slots are
+            // overwritten — undoing the advancement needs the old occupant, and one
+            // line below `match.player1/2` no longer holds it.
+            const priorWinnerSlot = match.winner;
+            const priorWinnerPlayer = priorWinnerSlot ? match[priorWinnerSlot] : null;
+
             if (player1 !== undefined) match.player1 = safeP1;
             if (player2 !== undefined) match.player2 = safeP2;
 
@@ -1769,6 +1798,48 @@ export const updateBracketMatch = async (req, res) => {
                     } catch (clearErr) {
                         console.warn("[updateBracketMatch] Failed to clear stale winner in matches table:", clearErr.message);
                     }
+                }
+
+                // Pull the player back out of the rounds this match had already
+                // advanced them into.
+                //
+                // STEP E of createFullBracketStructure writes a Round-1 BYE winner
+                // straight into the next round's slot, and recordResult does the same
+                // on a real result. Clearing `winner` here undid the result but left
+                // that downstream copy in place: filling the empty side of a BYE left
+                // the former BYE winner sitting in the Quarterfinal while their own
+                // Round-of-16 match showed two players and no winner. To the admin it
+                // looked like a ranked player advancing for free without a BYE.
+                const advancedId = bracketPlayerId(priorWinnerPlayer);
+                const clearedDownstream = revertAdvancement(match, priorWinnerPlayer, bracketData.rounds);
+
+                for (const cleared of clearedDownstream) {
+                    try {
+                        await scopeToCategory(
+                            supabaseAdmin
+                                .from("matches")
+                                .update({
+                                    [cleared.slot === "player1" ? "player_a" : "player_b"]: null,
+                                    winner: null,
+                                    status: "SCHEDULED",
+                                    score: null,
+                                    updated_at: new Date().toISOString()
+                                })
+                                .eq("bracket_match_id", cleared.id)
+                                .eq("event_id", eventId)
+                        );
+                    } catch (downstreamErr) {
+                        console.warn(
+                            `[updateBracketMatch] Failed to clear advanced player from ${cleared.id}:`,
+                            downstreamErr.message
+                        );
+                    }
+                }
+                if (clearedDownstream.length > 0) {
+                    console.log(
+                        `[updateBracketMatch] Reverted advancement of ${advancedId} from`,
+                        clearedDownstream.map((c) => `${c.id}.${c.slot}`).join(", ")
+                    );
                 }
             }
         }
@@ -1889,6 +1960,67 @@ export const replaceRoundMatches = async (req, res) => {
 
         bracketData.rounds[roundIndex] = { ...round, matches: newMatches };
 
+        // ── Carry decided BYE winners into the next round ────────────────────
+        //
+        // This endpoint writes `winner` for every match it is handed, including
+        // the Round-1 BYEs that bulk seeding auto-advances — but it used to stop
+        // there, and a winner that is never carried forward is a winner that
+        // does not exist downstream. Worse, the follow-up call that *does*
+        // propagate (POST /bracket/result) is skipped by the client precisely
+        // because the winner flag is already set, so the BYE'd entrant was
+        // dropped for good.
+        //
+        // The damage is not subtle. On QA event 41 (All / Mixed / Doubles, 11
+        // pairs, 5 BYEs) every one of the 5 BYE feeders was missing from the
+        // Quarterfinal while the 3 played matches propagated normally: R2-M2 had
+        // both slots empty. The bracket still *looked* full because the client
+        // re-derives BYE winners for display, so an admin scored Quarterfinals
+        // whose stored player_a/player_b were null — leaving `matches` rows
+        // COMPLETED with a winner id belonging to neither recorded side, the
+        // Semifinal populated from those winners, and the Quarterfinal itself
+        // stuck on "Awaiting matchup results".
+        //
+        // Only *empty* downstream slots are filled, so this can never overwrite
+        // a real pairing or a recorded result, and re-running it is a no-op.
+        const byePropagations = [];
+        const nextRound = bracketData.rounds[roundIndex + 1];
+        if (nextRound && Array.isArray(nextRound.matches)) {
+            const realPlayer = (p) => (p && !isFakeByePlayer(p) && (p.id || p.player_id)) ? p : null;
+
+            newMatches.forEach((m, idx) => {
+                const p1 = realPlayer(m.player1);
+                const p2 = realPlayer(m.player2);
+
+                // A BYE is exactly one occupied side. Both-filled matches are
+                // decided by scores, and the finalize path owns those.
+                if (!!p1 === !!p2) return;
+
+                const winnerPlayer = p1 || p2;
+                const winnerSide = p1 ? "player1" : "player2";
+                if (m.winner && m.winner !== winnerSide) return; // disagrees — leave it alone
+                if (!m.winner) m.winner = winnerSide;
+
+                let targetId = m.winnerTo != null ? String(m.winnerTo).trim() : null;
+                let targetSlot = m.winnerToSlot || null;
+                if (!targetId || !targetSlot) {
+                    // Legacy rows without linkage: standard pairing by index.
+                    const nextMatch = nextRound.matches[Math.floor(idx / 2)];
+                    if (!nextMatch?.id) return;
+                    targetId = String(nextMatch.id).trim();
+                    targetSlot = idx % 2 === 0 ? "player1" : "player2";
+                }
+
+                const downstream = nextRound.matches.find(
+                    (nm) => nm && String(nm.id).trim() === targetId
+                );
+                if (!downstream) return;
+                if (realPlayer(downstream[targetSlot])) return; // already occupied
+
+                downstream[targetSlot] = winnerPlayer;
+                byePropagations.push({ targetId, targetSlot, winnerPlayer });
+            });
+        }
+
         const { data, error } = await supabaseAdmin
             .from("event_brackets")
             .update({
@@ -1957,6 +2089,47 @@ export const replaceRoundMatches = async (req, res) => {
             }
         } catch (syncErr) {
             console.warn("[replaceRoundMatches] Match row re-sync failed (non-fatal):", syncErr.message);
+        }
+
+        // Mirror the BYE propagation above into the next round's match rows.
+        // The Scoreboard scores off `matches.player_a/player_b`, so a slot that
+        // exists only in bracket_data is a slot the admin can score with nobody
+        // in it — which is how a COMPLETED match ended up with a winner that is
+        // neither of its recorded players. Empty sides only, same as above.
+        if (byePropagations.length > 0) {
+            try {
+                const targetIds = [...new Set(byePropagations.map((p) => p.targetId))];
+                const { data: downstreamRows } = await supabaseAdmin
+                    .from("matches")
+                    .select("id, bracket_match_id, player_a, player_b, status")
+                    .eq("event_id", eventId)
+                    .eq("bracket_id", bracket.id)
+                    .in("bracket_match_id", targetIds);
+
+                for (const row of downstreamRows || []) {
+                    const patch = {};
+                    for (const prop of byePropagations) {
+                        if (prop.targetId !== String(row.bracket_match_id || "").trim()) continue;
+                        const column = prop.targetSlot === "player1" ? "player_a" : "player_b";
+                        const occupant = row[column];
+                        if (occupant && (occupant.id || occupant.player_id)) continue;
+                        patch[column] = prop.winnerPlayer;
+                    }
+                    if (Object.keys(patch).length === 0) continue;
+
+                    patch.updated_at = new Date().toISOString();
+                    const { error: byeSyncError } = await supabaseAdmin
+                        .from("matches")
+                        .update(patch)
+                        .eq("id", row.id);
+
+                    if (byeSyncError) {
+                        console.warn(`[replaceRoundMatches] BYE downstream sync failed for ${row.bracket_match_id}:`, byeSyncError.message);
+                    }
+                }
+            } catch (byeSyncErr) {
+                console.warn("[replaceRoundMatches] BYE downstream sync failed (non-fatal):", byeSyncErr.message);
+            }
         }
 
         await invalidateMatchesCache(eventId);
@@ -2113,9 +2286,25 @@ export const addBracketRound = async (req, res) => {
             return inferRoundLabelFromMatchCount(nextMatchCount, fallbackIndex);
         };
 
+        // Reject a name that is already taken before doing any work. `matches` is
+        // uniquely indexed on (bracket_id, round_name, match_index), so two rounds
+        // sharing a name survive here only to blow up later as an opaque 500 when the
+        // scoreboard generates their matches.
+        const existingRoundNames = new Set(
+            currentRounds.map((r) => String(r?.name || "").trim().toLowerCase()).filter(Boolean)
+        );
+        if (roundName && typeof roundName === "string" && existingRoundNames.has(roundName.trim().toLowerCase())) {
+            return res.status(400).json({
+                message: `This bracket already has a round named "${roundName.trim()}". Choose a different name.`,
+                code: "ROUND_NAME_EXISTS"
+            });
+        }
+
         // If no rounds exist, create first round with explicit/derived name
         if (currentRounds.length === 0) {
-            const initialName = getNextRoundName(0, 0) || "Round 1";
+            // An empty bracket has no matches to infer from — asking for a name at
+            // match count 0 yielded the literal round name "Round of 0".
+            const initialName = (roundName && typeof roundName === "string" && roundName.trim()) || "Round 1";
             const firstRound = {
                 name: initialName,
                 matches: [],
@@ -2358,6 +2547,19 @@ export const addBracketRound = async (req, res) => {
 
             const nextMatchCount = Math.max(1, Math.ceil(prevMatches.length / 2));
             const nextName = getNextRoundName(nextMatchCount, currentRounds.length);
+
+            // The derived name needs the same uniqueness check as an admin-typed one.
+            // The completeness guards above have a gap: when the previous round's
+            // winners exist only in the `matches` table, `winners` below is empty and
+            // CHAMPION_DECIDED does not fire — so an already-finished bracket can reach
+            // here, derive "Final" a second time, and collide on
+            // uniq_match_identity(bracket_id, round_name, match_index) later.
+            if (existingRoundNames.has(String(nextName).trim().toLowerCase())) {
+                return res.status(400).json({
+                    message: `This bracket already has a round named "${nextName}". The bracket looks complete — no further rounds can be added.`,
+                    code: "ROUND_NAME_EXISTS"
+                });
+            }
 
             // Round index for next round (1-based for match IDs: R2-M1, R2-M2, etc.)
             const nextRoundNum = currentRounds.length + 1;
@@ -2777,37 +2979,36 @@ export const deleteCategoryBracket = async (req, res) => {
             return res.status(400).json({ message: "Event ID and Category required" });
         }
 
-        const { data: allBrackets, error: fetchError } = await supabaseAdmin
-            .from("event_brackets")
-            .select("*")
-            .eq("event_id", eventId)
-            .eq("mode", "BRACKET");
+        // Resolve through the shared resolver, exactly like init/start/reset/round
+        // delete do. This used to hand-roll its own filter, and the hand-rolled
+        // version had no equivalent of the resolver's label tier: a bracket stored
+        // under the label (`category_id` null, `category` = "U-17 (Male) - Male -
+        // Doubles") was invisible to a delete addressed by the numeric category id,
+        // so the UI showed a bracket the DELETE answered 404 for.
+        let brackets = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
 
-        if (fetchError) throw fetchError;
-        const normalizedParamId = String(categoryId || "").trim();
-        const normalizedLabel = String(categoryLabel || "").trim().toLowerCase();
+        if ((!brackets || brackets.length === 0) && categoryId && !isUuid(categoryId)) {
+            // Last tier, which the resolver does not cover: `initBracket` stamps the
+            // requesting category id into `bracket_data.sourceCategoryId`, and that is
+            // the only key some league-to-bracket rows carry. Missing it left the old
+            // bracket in place and made init refuse the regeneration with BRACKET_EXISTS.
+            const normalizedParamId = String(categoryId).trim();
+            const { data: allBrackets, error: fetchError } = await supabaseAdmin
+                .from("event_brackets")
+                .select("*")
+                .eq("event_id", eventId)
+                .eq("mode", "BRACKET");
+            if (fetchError) throw fetchError;
 
-        const brackets = (allBrackets || []).filter((row) => {
-            if (categoryId && isUuid(categoryId)) {
-                return String(row.category_id || "").trim() === normalizedParamId;
-            }
-
-            const rowCategory = String(row.category || "").trim().toLowerCase();
-            const sourceCategoryId = String(
-                row?.bracket_data?.sourceCategoryId ||
-                row?.draw_data?.sourceCategoryId ||
-                ""
-            ).trim();
-
-            // The id first: since brackets became id-keyed, `category` holds the
-            // non-UUID category id itself. Without this the pre-delete step of a
-            // league-to-bracket regeneration left the previous bracket in place
-            // and init then refused with BRACKET_EXISTS.
-            if (normalizedParamId && rowCategory === normalizedParamId.toLowerCase()) return true;
-            if (normalizedParamId && sourceCategoryId === normalizedParamId) return true;
-            if (normalizedLabel && rowCategory === normalizedLabel) return true;
-            return false;
-        });
+            brackets = (allBrackets || []).filter((row) => {
+                const source = String(
+                    row?.bracket_data?.sourceCategoryId ||
+                    row?.draw_data?.sourceCategoryId ||
+                    ""
+                ).trim();
+                return source !== "" && source === normalizedParamId;
+            });
+        }
 
         if (!brackets || brackets.length === 0) {
             return res.status(404).json({ message: "Bracket not found" });
@@ -3224,6 +3425,34 @@ export const randomizeRound1Byes = async (req, res) => {
             else m.winner = null;
         }
 
+        // Re-derive the next round's Round-1-fed slots from the reshuffled draw.
+        //
+        // STEP E of createFullBracketStructure writes each Round-1 BYE winner straight
+        // into the next round. A reshuffle moves who holds a BYE, but used to leave
+        // those earlier placements untouched — so a player who had just lost their BYE
+        // stayed parked in the Quarterfinal with an unplayed Round-1 match, looking
+        // like they advanced for free. Every such slot is derived purely from Round 1,
+        // so rewriting them here (winner, or empty when the match is no longer a BYE)
+        // is what keeps the two rounds consistent.
+        for (const m of matches) {
+            if (!m?.winnerTo || !m?.winnerToSlot) continue;
+
+            const p1 = m.player1 && !isFakeByePlayer(m.player1) ? m.player1 : null;
+            const p2 = m.player2 && !isFakeByePlayer(m.player2) ? m.player2 : null;
+            const advanced = (p1 && !p2) ? p1 : ((!p1 && p2) ? p2 : null);
+
+            const targetId = String(m.winnerTo).trim();
+            const targetSlot = m.winnerToSlot;
+            for (const r of rounds) {
+                for (const t of (r.matches || [])) {
+                    if (!t || String(t.id).trim() !== targetId) continue;
+                    t[targetSlot] = advanced;
+                    // A winner recorded for a slot we just emptied is no longer real.
+                    if (!advanced && t.winner === targetSlot) t.winner = null;
+                }
+            }
+        }
+
         const { data, error } = await supabaseAdmin
             .from("event_brackets")
             .update({
@@ -3329,11 +3558,26 @@ export const assignByeToPlayer = async (req, res) => {
         }
 
         const slotToFill = p1 ? "player2" : "player1";
+
+        // Whoever was sitting alone here had already been advanced as the BYE winner.
+        const priorAdvanced = match.winner ? match[match.winner] : (p1 || p2);
+
         match[slotToFill] = playerToAssign;
-        match.winner = p1 ? "player1" : "player2";
+
+        // Filling the empty side ENDS the BYE: the match now holds two real players and
+        // has not been played, so it has no winner. This used to declare the sitting
+        // player the winner ("BYE winner auto-advanced") — an unplayed Round-1 pairing
+        // with one side already decided, which then showed up in the next round. The
+        // frontend has always sent `winner: null` for this action (see MatchCard's
+        // "Manual BYE assignment: do NOT set winner field here"); the server was the
+        // side that disagreed.
+        match.winner = null;
 
         // Mark as manual BYE
         match.isManualBye = true;
+
+        // ...and take them back out of the round the BYE had already carried them into.
+        const clearedDownstream = revertAdvancement(match, priorAdvanced, rounds);
 
         await supabaseAdmin
             .from("event_brackets")
@@ -3344,9 +3588,52 @@ export const assignByeToPlayer = async (req, res) => {
             })
             .eq("id", bracket.id);
 
+        // Keep the `matches` rows in step: this match is no longer decided, and any
+        // downstream row we just emptied must lose that player too. Scoped to this
+        // category because bracket_match_id ("R1-M1") repeats in every category.
+        const matchCategoryKeys = Array.from(new Set(
+            [categoryId, categoryLabel, bracket.category_id, bracket.category]
+                .map((v) => (v == null ? "" : String(v).trim()))
+                .filter((v) => v.length > 0)
+        ));
+        const scopeToCategory = (query) => {
+            if (matchCategoryKeys.length === 0) return query;
+            return matchCategoryKeys.length === 1
+                ? query.eq("category_id", matchCategoryKeys[0])
+                : query.in("category_id", matchCategoryKeys);
+        };
+
+        const rowResets = [
+            { id: String(matchId).trim(), slot: null },
+            ...clearedDownstream
+        ];
+        for (const reset of rowResets) {
+            try {
+                await scopeToCategory(
+                    supabaseAdmin
+                        .from("matches")
+                        .update({
+                            ...(reset.slot
+                                ? { [reset.slot === "player1" ? "player_a" : "player_b"]: null }
+                                : {}),
+                            winner: null,
+                            status: "SCHEDULED",
+                            score: null,
+                            updated_at: new Date().toISOString()
+                        })
+                        .eq("bracket_match_id", reset.id)
+                        .eq("event_id", eventId)
+                );
+            } catch (resetErr) {
+                console.warn(`[assignByeToPlayer] Failed to reset match row ${reset.id}:`, resetErr.message);
+            }
+        }
+
+        await invalidateMatchesCache(eventId);
+
         return res.status(200).json({
             success: true,
-            message: `Player assigned to match ${matchId}. BYE winner auto-advanced.`,
+            message: `Player assigned to match ${matchId}. The match is now a regular fixture awaiting a result.`,
             match
         });
 
