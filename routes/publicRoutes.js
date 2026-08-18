@@ -1,10 +1,11 @@
 import express from "express";
-import { getPublicCategoryDraw, getPublicEventDraws, getPublicEventSharePreview, getPublicLeagueConfig, getPublicSettings, listPublicEvents } from "../controllers/publicController.js";
+import { getPublicCategoryDraw, getPublicEventDraws, getPublicEventSharePreview, getPublicLeagueConfig, getPublicSettings, getSitemapXml, listPublicEvents } from "../controllers/publicController.js";
 
 const router = express.Router();
 
 router.get("/settings", getPublicSettings);
 router.get("/events/list", listPublicEvents);
+router.get("/sitemap.xml", getSitemapXml);
 
 // Public draw/bracket endpoints (no auth required, only returns published draws)
 router.get("/events/:id/categories/:categoryId/draw", getPublicCategoryDraw);

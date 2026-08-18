@@ -162,6 +162,79 @@ export const listPublicEvents = async (_req, res) => {
     }
 };
 
+/** Static, always-indexable marketing/content routes — kept in sync with App.tsx by hand. */
+const STATIC_SITEMAP_PATHS = [
+    { path: "/", priority: "1.0", changefreq: "daily" },
+    { path: "/events", priority: "0.9", changefreq: "daily" },
+    { path: "/register", priority: "0.6", changefreq: "monthly" },
+    { path: "/login", priority: "0.3", changefreq: "monthly" },
+    { path: "/contact", priority: "0.5", changefreq: "monthly" },
+    { path: "/institute", priority: "0.6", changefreq: "monthly" },
+    { path: "/institute/register", priority: "0.4", changefreq: "monthly" },
+    { path: "/institute/contact", priority: "0.4", changefreq: "monthly" },
+    { path: "/terms", priority: "0.2", changefreq: "yearly" },
+    { path: "/privacy", priority: "0.2", changefreq: "yearly" },
+    { path: "/refund", priority: "0.2", changefreq: "yearly" },
+];
+
+const SITEMAP_CACHE_KEY = "public:sitemap:xml";
+const SITEMAP_CACHE_TTL = Number(process.env.EVENTS_LIST_CACHE_TTL_SECONDS || 300);
+
+const xmlEscape = (value) => String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+// GET /api/public/sitemap.xml
+export const getSitemapXml = async (_req, res) => {
+    try {
+        const cached = await cacheGet(SITEMAP_CACHE_KEY);
+        if (cached) {
+            res.setHeader("Content-Type", "application/xml; charset=utf-8");
+            return res.status(200).send(cached);
+        }
+
+        const baseUrl = (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "https://sportsparamount.com").replace(/\/$/, "");
+
+        const { data, error } = await supabaseAdmin
+            .from("events")
+            .select("id, public_id, start_date, created_at")
+            .order("start_date", { ascending: true });
+
+        if (error) throw error;
+
+        const eventUrls = (data || []).map((event) => {
+            const publicId = getPublicEventId(event);
+            const lastmod = (event.start_date || event.created_at || "").slice(0, 10);
+            return { path: `/events/${publicId}`, priority: "0.7", changefreq: "weekly", lastmod };
+        });
+
+        const today = new Date().toISOString().slice(0, 10);
+        const urls = [...STATIC_SITEMAP_PATHS, ...eventUrls];
+
+        const body = urls
+            .map(({ path, priority, changefreq, lastmod }) => `  <url>
+    <loc>${xmlEscape(`${baseUrl}${path}`)}</loc>
+    <lastmod>${lastmod || today}</lastmod>
+    <changefreq>${changefreq}</changefreq>
+    <priority>${priority}</priority>
+  </url>`)
+            .join("\n");
+
+        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${body}
+</urlset>`;
+
+        await cacheSet(SITEMAP_CACHE_KEY, xml, SITEMAP_CACHE_TTL);
+        res.setHeader("Content-Type", "application/xml; charset=utf-8");
+        return res.status(200).send(xml);
+    } catch (err) {
+        console.error("PUBLIC SITEMAP ERROR:", err);
+        return res.status(500).send("Failed to build sitemap");
+    }
+};
+
 // GET /api/public/settings
 export const getPublicSettings = async (req, res) => {
     try {
