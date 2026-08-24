@@ -97,7 +97,7 @@ export const sendRegistrationSuccessEmail = async (toEmail, details) => {
     if (!toEmail) return false;
 
     const { name, playerId, password } = details;
-    const loginLink = 'https://sportsparamount.com/login';
+    const loginLink = 'https://www.sportsparamount.com/login';
 
     const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
