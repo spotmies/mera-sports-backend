@@ -194,7 +194,7 @@ export const getSitemapXml = async (_req, res) => {
             return res.status(200).send(cached);
         }
 
-        const baseUrl = (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "https://sportsparamount.com").replace(/\/$/, "");
+        const baseUrl = (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "https://www.sportsparamount.com").replace(/\/$/, "");
 
         const { data, error } = await supabaseAdmin
             .from("events")
