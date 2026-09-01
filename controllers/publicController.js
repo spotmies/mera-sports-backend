@@ -166,6 +166,7 @@ export const listPublicEvents = async (_req, res) => {
 const STATIC_SITEMAP_PATHS = [
     { path: "/", priority: "1.0", changefreq: "daily" },
     { path: "/events", priority: "0.9", changefreq: "daily" },
+    { path: "/indoor-turf-hyderabad", priority: "0.8", changefreq: "monthly" },
     { path: "/register", priority: "0.6", changefreq: "monthly" },
     { path: "/login", priority: "0.3", changefreq: "monthly" },
     { path: "/contact", priority: "0.5", changefreq: "monthly" },

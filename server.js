@@ -25,6 +25,7 @@ import paymentRoutes from "./routes/paymentRoutes.js"; // Added Payment Routes
 import instituteRoutes from "./routes/instituteRoutes.js"; // Added Institute Routes
 import playerDashboardRoutes from "./routes/playerDashboardroutes.js";
 import publicRoutes from "./routes/publicRoutes.js";
+import venueRoutes from "./routes/venueRoutes.js";
 import teamRoutes from "./routes/teamRoutes.js";
 import whatsappRoutes from "./routes/whatsappRoutes.js";
 import { mountSwagger } from "./docs/swagger.js";
@@ -69,6 +70,7 @@ app.use("/api/teams", teamRoutes);
 app.use("/api/notifications", notificationRoutes); // Mounted Notification Routes
 app.use("/api/institute", instituteRoutes); // Institute endpoints
 app.use("/api/public", publicRoutes);
+app.use("/api/venue", venueRoutes); // Admin-managed photos/videos for the venue page
 app.use("/api/whatsapp", whatsappRoutes); // Meta delivery-status callbacks for broadcasts
 app.use("/api/files", fileRoutes); // Signed-URL delivery for Railway bucket files
 app.use("/health", healthRoutes);      // bare /health/ for load-balancer probes
