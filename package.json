@@ -20,7 +20,8 @@
     "seed:heat-test-event": "node scripts/seed_heat_test_event.js",
     "migrate:passwords": "node scripts/migrate_passwords_bcrypt.js",
     "docs:check": "node scripts/check_openapi_coverage.mjs",
-    "db:local": "node scripts/start-local-postgrest.mjs"
+    "db:local": "node scripts/start-local-postgrest.mjs",
+    "migrate:family": "node scripts/run_family_migration.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1092.0",

@@ -2,10 +2,13 @@ import express from "express";
 import multer from "multer";
 import { deleteMedia, getMedia, uploadMedia } from "../controllers/mediaController.js";
 import {
+    addFamilyMember,
     changePassword,
     checkConflict, checkPassword,
     deleteAccount,
+    deleteFamilyMember,
     getPlayerDashboard,
+    updateFamilyMember,
     updateProfile
 } from "../controllers/playerController.js";
 import { verifyPlayer } from "../middleware/rbacMiddleware.js";
@@ -40,6 +43,11 @@ router.post("/check-password", verifyPlayer, checkPassword);
 router.put("/update-profile", verifyPlayer, updateProfile);
 router.put("/change-password", verifyPlayer, changePassword);
 router.delete("/delete-account", verifyPlayer, deleteAccount);
+
+/* ================= FAMILY MEMBERS ================= */
+router.post("/add-family-member", verifyPlayer, addFamilyMember);
+router.put("/update-family-member/:id", verifyPlayer, updateFamilyMember);
+router.delete("/delete-family-member/:id", verifyPlayer, deleteFamilyMember);
 
 /* ================= MEDIA UPLOADS ================= */
 // Multer error handler: return user-friendly JSON instead of raw stack trace
