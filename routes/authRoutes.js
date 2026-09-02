@@ -5,6 +5,7 @@ import {
     loginAdmin,
     loginPlayer,
     reapplyGoogleAdmin,
+    selectLoginProfile,
     registerAdmin,
     registerPlayer,
     sendMobileRegistrationOtp,
@@ -48,6 +49,8 @@ router.post("/institute/forgot-password/send-otp", sendInstituteForgotPasswordOt
 /* ================= PLAYER AUTH ================= */
 router.post("/register-player", registerPlayer);
 router.post("/login", loginPlayer);
+// Second leg of a shared-mobile login: exchange the selection token for a session.
+router.post("/login/select-profile", selectLoginProfile);
 
 /* ================= ADMIN AUTH ================= */
 router.post("/register-admin", registerAdmin);

@@ -57,10 +57,56 @@ const pickText = (normalizedRow, ...aliases) => {
     return val === null ? "" : String(val).trim();
 };
 
-/** Digits only — for mobile / aadhaar / pincode, which arrive as numbers or strings. */
-const pickDigits = (normalizedRow, ...aliases) => {
-    const val = pickField(normalizedRow, ...aliases);
-    return val === null ? "" : String(val).replace(/\D/g, "");
+/**
+ * Fixed-length numeric fields, and how they are allowed to be written.
+ * Mirrors STUDENT_FIELDS in the frontend's InstituteDashboard.
+ */
+const DIGIT_FIELDS = {
+    aadhaar: { label: "Aadhaar Number", length: 12, required: true },
+    mobile: { label: "Mobile", length: 10, allowCountryCode: true },
+    pincode: { label: "Pincode", length: 6 },
+};
+
+/**
+ * Validate a fixed-length numeric field.
+ *
+ * The import previously ran every one of these through a helper that simply
+ * DELETED non-digits rather than rejecting them — so "1234-abcd-5678-9012"
+ * became a perfectly valid-looking 12-digit Aadhaar, and a 5-digit one was
+ * written to the DB as-is because nothing checked the length at all. The
+ * frontend grew the same hole for the same reason. Both now reject.
+ *
+ * Spaces and hyphens are stripped first (pure formatting). A mobile may carry
+ * a +91 / 91 / 0 prefix, but it is only removed when what remains is exactly
+ * 10 digits, so a legitimate number starting "91" is never truncated.
+ *
+ * Returns { value, error } — `error` is null when the field is acceptable, and
+ * an empty optional field is acceptable.
+ */
+const validateDigitField = (raw, key) => {
+    const spec = DIGIT_FIELDS[key];
+    const text = String(raw ?? "").trim().replace(/[\s-]/g, "");
+
+    if (!text) {
+        return spec.required
+            ? { value: "", error: `${spec.label} is required.` }
+            : { value: "", error: null };
+    }
+
+    let value = text;
+    if (spec.allowCountryCode) {
+        const isExact = (v) => /^\d+$/.test(v) && v.length === spec.length;
+        const stripped = value.replace(/^(?:\+91|91|0)/, "");
+        if (!isExact(value) && isExact(stripped)) value = stripped;
+    }
+
+    if (!/^\d+$/.test(value)) {
+        return { value, error: `${spec.label} must contain only numbers.` };
+    }
+    if (value.length !== spec.length) {
+        return { value, error: `${spec.label} must be exactly ${spec.length} digits (found ${value.length}).` };
+    }
+    return { value, error: null };
 };
 
 const pad2 = (n) => String(n).padStart(2, "0");
@@ -473,11 +519,35 @@ export const finalizeBulkImport = async (req, res) => {
                 continue;
             }
 
+            // ── Aadhaar / mobile / pincode ───────────────────────────────────
+            // Checked HERE, before any hashing or inserting, for the same reason
+            // the DOB is: the frontend runs the identical rules, but the frontend
+            // is a courtesy — this endpoint is what actually writes to `users`,
+            // and it accepted a 5-digit Aadhaar or one with letters in it.
+            const digitFields = {
+                aadhaar: pickField(nrow, "aadhaar", "aadhar", "aadhaarnumber", "aadharnumber", "idnumber", "nationalid"),
+                mobile: pickField(nrow, "mobile", "mobilenumber", "phone", "phonenumber", "contact", "contactnumber"),
+                pincode: pickField(nrow, "pincode", "pin", "postalcode", "zipcode", "zip"),
+            };
+
+            let digitError = null;
+            const digits = {};
+            for (const [key, raw] of Object.entries(digitFields)) {
+                const { value, error } = validateDigitField(raw, key);
+                digits[key] = value;
+                if (error && !digitError) digitError = { errorField: key, reason: error };
+            }
+
+            if (digitError) {
+                failed.push({ row, ...digitError });
+                continue;
+            }
+
             // Plain-text DDMMYYYY password (same convention as manual registration)
             const [dobYear, dobMonth, dobDay] = parsedDob.split("-");
             const plainPassword = `${dobDay}${dobMonth}${dobYear}`;
 
-            parsedStudents.push({ row, nrow, fName, lName, parsedDob, plainPassword });
+            parsedStudents.push({ row, nrow, fName, lName, parsedDob, plainPassword, digits });
         }
 
         // ── PHASE 2: Throttled bcrypt hashing in batches of 2 ──────────────────
@@ -541,7 +611,7 @@ export const finalizeBulkImport = async (req, res) => {
         // separate — this on the sequence, registration on a JS MAX(player_id)+1 —
         // the sequence lagged behind the real data and reissued live IDs, which is
         // how two players ended up holding P100133 and two more P100134 in prod.
-        for (const { row, nrow, fName, lName, parsedDob, plainPassword, hashedPassword } of hashedStudents) {
+        for (const { row, nrow, fName, lName, parsedDob, plainPassword, hashedPassword, digits } of hashedStudents) {
             let newPlayerId;
             try {
                 newPlayerId = await getNextPlayerId();
@@ -551,9 +621,10 @@ export const finalizeBulkImport = async (req, res) => {
                 continue;
             }
 
-            const mobile = pickDigits(nrow, "mobile", "mobilenumber", "phone", "phonenumber", "contact", "contactnumber");
-            const aadhaar = pickDigits(nrow, "aadhaar", "aadhar", "aadhaarnumber", "aadharnumber", "idnumber", "nationalid");
-            const pincode = pickDigits(nrow, "pincode", "pin", "postalcode", "zipcode", "zip");
+            // Already validated and canonicalised in phase 1 (see validateDigitField).
+            // Re-deriving them with pickDigits() here would reintroduce exactly the
+            // strip-don't-reject behaviour that check exists to prevent.
+            const { aadhaar, mobile, pincode } = digits;
 
             const student = {
                 id: crypto.randomUUID(),

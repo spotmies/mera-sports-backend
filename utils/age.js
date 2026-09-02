@@ -13,6 +13,17 @@
  * derived at read time instead.
  */
 
+/**
+ * The minor/adult boundary. Anyone at or below this age may share an existing
+ * household mobile number and is linked under a head; anyone above it must
+ * bring their own number and their own email.
+ *
+ * This single constant governs registration, the login profile chooser and the
+ * dashboard family CRUD. It used to be the literal `15`/`16` scattered across
+ * three controllers, which is how the register and login paths drifted apart.
+ */
+export const MINOR_AGE_LIMIT = 15;
+
 /** Exact age in completed years, accounting for whether the birthday has passed. */
 export const calculateAge = (dob) => {
     if (!dob) return null;

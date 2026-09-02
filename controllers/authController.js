@@ -2,7 +2,7 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
-import { resolveAge } from "../utils/age.js";
+import { calculateAge, MINOR_AGE_LIMIT, resolveAge } from "../utils/age.js";
 import { createNotification } from "../services/notificationService.js";
 import {
     sendEmailOtp,
@@ -412,38 +412,27 @@ export const verifyMobileRegistrationOtp = async (req, res) => {
 export const checkUserConflict = async (req, res) => {
     try {
         const { mobile, email, aadhaar, dob } = req.body;
-        if (!mobile || !email) {
-            return res.status(400).json({ message: "Mobile and Email are required for check." });
+        if (!mobile) {
+            return res.status(400).json({ message: "Mobile is required for check." });
         }
-
-        const calculateAge = (birthDate) => {
-            if (!birthDate) return null;
-            const birth = new Date(birthDate);
-            if (Number.isNaN(birth.getTime())) return null;
-            const today = new Date();
-            let age = today.getFullYear() - birth.getFullYear();
-            const monthDiff = today.getMonth() - birth.getMonth();
-            if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birth.getDate())) age--;
-            return age;
-        };
 
         const requestedAge = calculateAge(dob);
-        const isMinorRequest = requestedAge !== null && requestedAge <= 15;
+        const isMinorRequest = requestedAge !== null && requestedAge <= MINOR_AGE_LIMIT;
 
-        let query;
-        if (aadhaar) {
-            query = supabaseAdmin
-                .from("users")
-                .select("id, mobile, email, aadhaar")
-                .or(`mobile.eq.${mobile},email.eq.${email},aadhaar.eq.${aadhaar}`);
-        } else {
-            query = supabaseAdmin
-                .from("users")
-                .select("id, mobile, email, aadhaar")
-                .or(`mobile.eq.${mobile},email.eq.${email}`);
-        }
+        // Email is optional for minors, so it only joins the lookup when given.
+        // Concatenating an empty value into the filter would produce
+        // `email.eq.` and PostgREST rejects the entire `or`, which silently
+        // turned every conflict check for an email-less minor into "no
+        // conflicts" — including a genuinely duplicate aadhaar.
+        const normalizedEmail = email ? email.trim() : null;
+        const filters = [`mobile.eq.${mobile}`];
+        if (normalizedEmail) filters.push(`email.eq.${normalizedEmail}`);
+        if (aadhaar) filters.push(`aadhaar.eq.${aadhaar}`);
 
-        const { data: existingUsers, error } = await query;
+        const { data: existingUsers, error } = await supabaseAdmin
+            .from("users")
+            .select("id, mobile, email, aadhaar")
+            .or(filters.join(','));
         if (error) throw error;
 
         if (existingUsers && existingUsers.length > 0) {
@@ -453,7 +442,7 @@ export const checkUserConflict = async (req, res) => {
             const conflicts = new Set();
             if (mobileConflict) conflicts.add("Mobile");
             existingUsers.forEach(user => {
-                if (user.email == email) conflicts.add("Email");
+                if (normalizedEmail && user.email == normalizedEmail) conflicts.add("Email");
                 if (aadhaar && user.aadhaar == aadhaar) conflicts.add("Aadhaar");
             });
 
@@ -491,7 +480,6 @@ export const registerPlayer = async (req, res) => {
         if (!lastName) missing.push("Last Name");
         if (!mobile) missing.push("Mobile");
         if (!dob) missing.push("Date of Birth");
-        if (!email) missing.push("Email");
 
         if (missing.length > 0) {
             return res.status(400).json({ message: `Missing required fields: ${missing.join(', ')}` });
@@ -508,6 +496,15 @@ export const registerPlayer = async (req, res) => {
         };
         const age = calculateAge(dob);
 
+        // Email is the adult's identity anchor and the only channel we can reach
+        // them on that isn't the shared family mobile, so it stays mandatory for
+        // them. A minor riding on a parent's number rarely has an inbox at all —
+        // requiring one would cap a household at a single child.
+        const normalizedEmail = email ? email.trim() : null;
+        if (!normalizedEmail && age > MINOR_AGE_LIMIT) {
+            return res.status(400).json({ message: "Missing required fields: Email" });
+        }
+
         // 2. Generate Password (DDMMYYYY) and hash with bcrypt
         const [year, month, day] = dob.split("-");
         const plainPassword = `${day}${month}${year}`;
@@ -519,26 +516,33 @@ export const registerPlayer = async (req, res) => {
             return res.status(500).json({ message: "Failed to secure password. Please try again." });
         }
 
-        // 3. Duplicate Check (email/aadhaar are unique; mobile can be shared only for age <= 15)
+        // 3. Duplicate Check (email/aadhaar are unique; mobile is shareable by minors)
+        //    Built as a list so an absent email doesn't emit `email.eq.` — an
+        //    empty operand makes PostgREST reject the whole filter, which would
+        //    skip duplicate detection entirely for every email-less minor.
+        const duplicateFilters = [`mobile.eq.${mobile}`];
+        if (normalizedEmail) duplicateFilters.push(`email.eq.${normalizedEmail}`);
+        if (aadhaar) duplicateFilters.push(`aadhaar.eq.${aadhaar}`);
+
         const { data: duplicates } = await supabaseAdmin
             .from("users")
             .select("id, mobile, email, aadhaar, age, created_at")
-            .or(`email.eq.${email}${aadhaar ? `,aadhaar.eq.${aadhaar}` : ''},mobile.eq.${mobile}`);
+            .or(duplicateFilters.join(','));
 
         let selectedHeadPlayerId = null;
 
         if (duplicates && duplicates.length > 0) {
             // Email and aadhaar are always unique
-            const emailDup = duplicates.find(u => u.email === email);
+            const emailDup = normalizedEmail ? duplicates.find(u => u.email === normalizedEmail) : null;
             const aadhaarDup = aadhaar ? duplicates.find(u => u.aadhaar === aadhaar) : null;
             if (emailDup || aadhaarDup) {
                 return res.status(400).json({ message: "User with this Email or Aadhaar already exists." });
             }
 
-            // Mobile: allow duplicate only when new registrant is <= 15
+            // Mobile: allow duplicate only when the new registrant is a minor
             const mobileMatches = duplicates.filter(u => u.mobile === mobile);
             if (mobileMatches.length > 0) {
-                if (age > 15) {
+                if (age > MINOR_AGE_LIMIT) {
                     return res.status(400).json({ message: "User with this Mobile already exists." });
                 }
 
@@ -550,7 +554,7 @@ export const registerPlayer = async (req, res) => {
                 const familyMemberIds = new Set((familyRels || []).map(r => r.of_player_id));
 
                 const directHeadCandidates = mobileMatches
-                    .filter(u => !familyMemberIds.has(u.id) && (u.age == null || Number(u.age) >= 16))
+                    .filter(u => !familyMemberIds.has(u.id) && (u.age == null || Number(u.age) > MINOR_AGE_LIMIT))
                     .sort((a, b) => new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime());
 
                 if (directHeadCandidates.length > 0) {
@@ -564,7 +568,7 @@ export const registerPlayer = async (req, res) => {
                             .in("id", derivedHeadIds)
                             .order("created_at", { ascending: true });
 
-                        const adultDerivedHeads = (derivedHeads || []).filter(h => h.age == null || Number(h.age) >= 16);
+                        const adultDerivedHeads = (derivedHeads || []).filter(h => h.age == null || Number(h.age) > MINOR_AGE_LIMIT);
                         if (adultDerivedHeads.length > 0) {
                             selectedHeadPlayerId = adultDerivedHeads[0].id;
                         }
@@ -595,7 +599,7 @@ export const registerPlayer = async (req, res) => {
                 first_name: firstName,
                 last_name: lastName,
                 name: `${firstName} ${lastName}`.trim(),
-                email,
+                email: normalizedEmail,
                 mobile,
                 dob,
                 age,
@@ -618,7 +622,7 @@ export const registerPlayer = async (req, res) => {
         if (error) throw error;
 
         // 6b. For minors sharing a mobile, auto-link under selected head as Child
-        if (age <= 15 && selectedHeadPlayerId && selectedHeadPlayerId !== newUserId) {
+        if (age <= MINOR_AGE_LIMIT && selectedHeadPlayerId && selectedHeadPlayerId !== newUserId) {
             const { error: relationError } = await supabaseAdmin
                 .from("family_relations")
                 .upsert(
@@ -655,14 +659,19 @@ export const registerPlayer = async (req, res) => {
             { expiresIn: "7d" }
         );
 
-        // 10. Send Welcome Email (send the plain-text password, not the hash)
-        try {
-            await sendRegistrationSuccessEmail(user.email, {
-                name: user.name,
-                playerId: user.player_id,
-                password: plainPassword
-            });
-        } catch (emailErr) { console.error("Welcome Email Error:", emailErr.message); }
+        // 10. Send Welcome Email (send the plain-text password, not the hash).
+        //     Minors may have no email at all — the WhatsApp message below is
+        //     their only delivery of the Player ID and password, and it goes to
+        //     the parent's number, which is the intended recipient anyway.
+        if (user.email) {
+            try {
+                await sendRegistrationSuccessEmail(user.email, {
+                    name: user.name,
+                    playerId: user.player_id,
+                    password: plainPassword
+                });
+            } catch (emailErr) { console.error("Welcome Email Error:", emailErr.message); }
+        }
 
         // 10b. Send Welcome WhatsApp (alongside email, non-blocking)
         try {
@@ -701,142 +710,219 @@ export const registerPlayer = async (req, res) => {
 
 /* ================= LOGIN PLAYER ================= */
 
+// A profile-selection token is only good for the few seconds it takes to tap a
+// face, and on its own it grants access to nothing.
+const PROFILE_SELECTION_TTL = "5m";
+
+const playerTokenExpiresIn = () => {
+    const raw = process.env.PLAYER_JWT_EXPIRES_IN;
+    // Accept only simple duration strings: digits followed by s/m/h/d/w (e.g. 7d, 30m)
+    if (raw && /^\d+[smhdw]$/.test(raw)) return raw;
+    if (raw) console.warn(`[playerLogin] PLAYER_JWT_EXPIRES_IN "${raw}" is not a valid duration — falling back to "7d"`);
+    return "7d";
+};
+
+// The signed-in payload. Shared by password login and profile selection so the
+// two entry points can never drift apart.
+const buildPlayerSession = (user) => ({
+    success: true,
+    token: jwt.sign({ id: user.id, role: 'player' }, process.env.JWT_SECRET, { expiresIn: playerTokenExpiresIn() }),
+    user: {
+        id: user.id,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        role: 'player',
+        photos: user.photos,
+        // dob + gender are needed for category eligibility. Without them
+        // the client fell back to the stale `age` column and computed a
+        // different birth year than the pages that read the dashboard,
+        // so the same player showed Eligible on one screen and Not
+        // Eligible on another. Age is derived from dob here.
+        dob: user.dob,
+        gender: user.gender,
+        age: resolveAge(user)
+    },
+});
+
+// Only what the chooser needs to draw a card. Deliberately no email, aadhaar or
+// address — this list is rendered before anyone has said who they are.
+const toProfileSummary = (user) => ({
+    id: user.id,
+    player_id: user.player_id,
+    name: user.name || `${user.first_name || ""} ${user.last_name || ""}`.trim(),
+    photos: user.photos,
+    age: resolveAge(user),
+    relation: user.__relation || 'Head',
+});
+
+// Given the accounts a password opened, add the minors linked under any of them
+// so a parent sees the whole household in one chooser.
+const expandFamilyProfiles = async (matched) => {
+    const headIds = matched.map(u => u.id);
+    const heads = matched.map(u => ({ ...u, __relation: 'Head' }));
+
+    const { data: relations, error } = await supabaseAdmin
+        .from("family_relations")
+        .select("of_player_id, relation")
+        .in("head_player_id", headIds);
+
+    // This error must not be swallowed. Falling through to `relations || []`
+    // collapses the chooser down to the parent alone, which is indistinguishable
+    // from "this parent has no children" — the exact failure the feature exists
+    // to prevent. Fail loudly so the client retries instead of hiding the kids.
+    if (error) throw error;
+
+    const memberIds = [...new Set(
+        (relations || []).map(r => r.of_player_id).filter(id => id && !headIds.includes(id))
+    )];
+    if (memberIds.length === 0) return heads;
+
+    const { data: members, error: membersError } = await supabaseAdmin
+        .from("users")
+        .select("*")
+        .in("id", memberIds);
+    if (membersError) throw membersError;
+
+    const relationById = new Map((relations || []).map(r => [r.of_player_id, r.relation]));
+    const linked = (members || [])
+        .filter(m => m.role === 'player')
+        .map(m => ({ ...m, __relation: relationById.get(m.id) || 'Child' }))
+        .sort((a, b) => (resolveAge(b) ?? 0) - (resolveAge(a) ?? 0));
+
+    return [...heads, ...linked];
+};
+
 export const loginPlayer = async (req, res) => {
     try {
         const { playerIdOrAadhaar, password } = req.body;
         if (!playerIdOrAadhaar || !password) return res.status(400).json({ message: "Missing credentials" });
 
         const input = playerIdOrAadhaar.toString().trim();
-        let user = null;
+
+        // Candidates are every account this identifier could refer to. Only a
+        // mobile number can resolve to more than one (a parent and their minors
+        // share it) — Player ID, email and aadhaar are unique, so those always
+        // yield exactly one account and never raise a profile chooser.
+        let candidates = [];
         let resolvedByMobile = false;
 
         if (input.toUpperCase().startsWith('P')) {
-            // Player ID lookup (unique)
             const { data } = await supabaseAdmin.from("users").select("*").eq('player_id', input).maybeSingle();
-            user = data;
+            if (data) candidates = [data];
         } else if (input.includes('@')) {
-            // Email lookup (unique)
             const { data } = await supabaseAdmin.from("users").select("*").eq('email', input).maybeSingle();
-            user = data;
+            if (data) candidates = [data];
         } else if (!isNaN(input)) {
-            // Could be mobile, aadhaar — try aadhaar first (unique)
+            // Could be mobile or aadhaar — aadhaar is unique, so try it first.
             const { data: aadhaarUser } = await supabaseAdmin.from("users").select("*").eq('aadhaar', input).maybeSingle();
             if (aadhaarUser) {
-                user = aadhaarUser;
+                candidates = [aadhaarUser];
             } else {
-                // Try mobile (may return multiple due to family sharing)
                 const { data: mobileUsers } = await supabaseAdmin.from("users").select("*").eq('mobile', input);
-                if (mobileUsers && mobileUsers.length === 1) {
+                if (mobileUsers && mobileUsers.length > 0) {
                     resolvedByMobile = true;
-                    const onlyUser = mobileUsers[0];
-
-                    // Block mobile login for family member accounts
-                    const { data: relAsMember } = await supabaseAdmin
-                        .from("family_relations")
-                        .select("id")
-                        .eq("of_player_id", onlyUser.id)
-                        .maybeSingle();
-
-                    if (relAsMember) {
-                        return res.status(403).json({
-                            message: "For child/family accounts, login with Player ID or Email only."
-                        });
-                    }
-
-                    user = onlyUser;
-                } else if (mobileUsers && mobileUsers.length > 1) {
-                    resolvedByMobile = true;
-                    // Multiple users share this mobile — allow login only for head
-                    const { data: familyRels } = await supabaseAdmin
-                        .from("family_relations")
-                        .select("head_player_id, of_player_id")
-                        .or(`head_player_id.in.(${mobileUsers.map(u => u.id).join(',')}),of_player_id.in.(${mobileUsers.map(u => u.id).join(',')})`);
-
-                    const headIds = new Set((familyRels || []).map(r => r.head_player_id));
-                    const memberIds = new Set((familyRels || []).map(r => r.of_player_id));
-
-                    // Prefer user who is a head and not a member (pure head). Fall back to non-member adult.
-                    let headCandidate = mobileUsers.find(u => headIds.has(u.id) && !memberIds.has(u.id));
-                    if (!headCandidate) {
-                        headCandidate = mobileUsers.find(u => !memberIds.has(u.id) && (u.age == null || Number(u.age) >= 16));
-                    }
-
-                    if (!headCandidate) {
-                        return res.status(403).json({
-                            message: "For child/family accounts, login with Player ID or Email only."
-                        });
-                    }
-
-                    user = headCandidate;
+                    candidates = mobileUsers;
                 }
             }
         } else {
-            // Fallback: try player_id or aadhaar
-            // Use ilike for case-insensitive matching of player_id (e.g. p1139 vs P1139)
+            // Fallback: case-insensitive player_id (e.g. p1139 vs P1139) or aadhaar
             const { data } = await supabaseAdmin.from("users").select("*").or(`player_id.ilike.${input},aadhaar.eq.${input}`).maybeSingle();
-            user = data;
+            if (data) candidates = [data];
         }
 
-        if (!user) return res.status(401).json({ message: "Invalid credentials" });
-        if (user.role !== 'player') return res.status(403).json({ message: "This account is for Admins." });
+        if (candidates.length === 0) return res.status(401).json({ message: "Invalid credentials" });
 
-        // Safety guard: if this login resolved from mobile, never allow family-member account by mobile
-        if (resolvedByMobile) {
-            const { data: relAsMember } = await supabaseAdmin
-                .from("family_relations")
-                .select("id")
-                .eq("of_player_id", user.id)
-                .maybeSingle();
+        const playerCandidates = candidates.filter(u => u.role === 'player');
+        if (playerCandidates.length === 0) return res.status(403).json({ message: "This account is for Admins." });
 
-            if (relAsMember) {
-                return res.status(403).json({
-                    message: "For child/family accounts, login with Player ID or Email only."
-                });
+        // Match the supplied password against every candidate. Each account
+        // carries its own password (default: that person's DOB as DDMMYYYY), so
+        // this is what decides *which* person on a shared number is signing in.
+        const matched = [];
+        for (const candidate of playerCandidates) {
+            let isMatch = false;
+            try {
+                isMatch = await bcrypt.compare(password, candidate.password || "");
+            } catch (compareErr) {
+                // Log only the error code/type — never the message (could contain hash fragments)
+                console.error("PASSWORD COMPARE ERROR [player]:", compareErr?.code || compareErr?.name || "unexpected error");
+                return res.status(500).json({ message: "Login failed. Please try again." });
             }
+            if (isMatch) matched.push(candidate);
         }
 
-        // Bcrypt password comparison
-        let isMatch;
-        try {
-            isMatch = await bcrypt.compare(password, user.password);
-        } catch (compareErr) {
-            // Log only the error code/type — never the message (could contain hash fragments)
-            console.error("PASSWORD COMPARE ERROR [player]:", compareErr?.code || compareErr?.name || "unexpected error");
-            return res.status(500).json({ message: "Login failed. Please try again." });
+        if (matched.length === 0) return res.status(401).json({ message: "Invalid credentials" });
+
+        // The profile chooser, for mobile logins only. Signing in as the head of
+        // a family also unlocks the minors linked under them, so one parent
+        // password reaches every child. The reverse is deliberately NOT true: a
+        // minor's password only ever opens the minor's own account, otherwise a
+        // child who knows their own DOB could walk into the parent's profile.
+        let profiles = matched;
+        if (resolvedByMobile) {
+            profiles = await expandFamilyProfiles(matched);
         }
-        if (!isMatch) return res.status(401).json({ message: "Invalid credentials" });
 
-        const playerTokenExpiresIn = (() => {
-            const raw = process.env.PLAYER_JWT_EXPIRES_IN;
-            // Accept only simple duration strings: digits followed by s/m/h/d/w (e.g. 7d, 30m)
-            if (raw && /^\d+[smhdw]$/.test(raw)) return raw;
-            if (raw) console.warn(`[playerLogin] PLAYER_JWT_EXPIRES_IN "${raw}" is not a valid duration — falling back to "7d"`);
-            return "7d";
-        })();
-        const token = jwt.sign({ id: user.id, role: 'player' }, process.env.JWT_SECRET, { expiresIn: playerTokenExpiresIn });
+        if (profiles.length > 1) {
+            // Nothing is authenticated yet beyond "this password opened one of
+            // these accounts", so the token pins the exact set — otherwise
+            // /login/select-profile could be pointed at any user id at all.
+            const selectionToken = jwt.sign(
+                { type: 'profile_selection', ids: profiles.map(p => p.id) },
+                process.env.JWT_SECRET,
+                { expiresIn: PROFILE_SELECTION_TTL }
+            );
+            return res.json({
+                success: true,
+                requiresProfileSelection: true,
+                selectionToken,
+                profiles: profiles.map(toProfileSummary),
+            });
+        }
 
-        res.json({
-            success: true,
-            token,
-            user: {
-                id: user.id,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                role: 'player',
-                photos: user.photos,
-                // dob + gender are needed for category eligibility. Without them
-                // the client fell back to the stale `age` column and computed a
-                // different birth year than the pages that read the dashboard,
-                // so the same player showed Eligible on one screen and Not
-                // Eligible on another. Age is derived from dob here.
-                dob: user.dob,
-                gender: user.gender,
-                age: resolveAge(user)
-            },
-        });
+        return res.json(buildPlayerSession(profiles[0]));
     } catch (err) {
         console.error("LOGIN ERROR:", err);
         res.status(500).json({ message: err.message });
+    }
+};
+
+/* ================= LOGIN — PROFILE SELECTION ================= */
+
+// Second half of a shared-mobile login: the password already proved which
+// household is signing in, this picks which member of it.
+export const selectLoginProfile = async (req, res) => {
+    try {
+        const { selectionToken, userId } = req.body;
+        if (!selectionToken || !userId) {
+            return res.status(400).json({ message: "Missing profile selection" });
+        }
+
+        let decoded;
+        try {
+            decoded = jwt.verify(selectionToken, process.env.JWT_SECRET);
+        } catch {
+            return res.status(401).json({ message: "Profile selection expired. Please log in again." });
+        }
+        if (decoded.type !== 'profile_selection' || !Array.isArray(decoded.ids)) {
+            return res.status(401).json({ message: "Invalid profile selection. Please log in again." });
+        }
+
+        // The token is the ONLY proof of authentication at this point, so the
+        // chosen id has to be one the password actually unlocked. Without this
+        // check the endpoint would mint a session for any user id on request.
+        if (!decoded.ids.includes(userId)) {
+            return res.status(403).json({ message: "That profile is not available on this login." });
+        }
+
+        const { data: user } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
+        if (!user) return res.status(404).json({ message: "Profile not found" });
+        if (user.role !== 'player') return res.status(403).json({ message: "This account is for Admins." });
+
+        res.json(buildPlayerSession(user));
+    } catch (err) {
+        console.error("PROFILE SELECT ERROR:", err);
+        res.status(500).json({ message: "Failed to open profile" });
     }
 };
 

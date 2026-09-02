@@ -73,3 +73,58 @@ export async function uploadBase64(base64Data, bucket, folder = 'misc', original
         return null; // Return null on failure so flow can decide valid behavior
     }
 }
+
+/**
+ * Uploads a raw Buffer (i.e. a multipart file) to storage.
+ *
+ * Exists because uploadBase64 cannot carry a video. A base64 data URI has to
+ * travel in the JSON body, which express caps at 15 MB, and base64 inflates a
+ * file by a third — so that path tops out around 11 MB. A multipart request
+ * does not touch the JSON body parser at all, and the storage layer underneath
+ * is an S3 PutObject, which is comfortable with far larger objects.
+ *
+ * @param {Buffer} buffer      - File contents.
+ * @param {string} mimeType    - Content type to store against the object.
+ * @param {string} bucket      - Bucket name (e.g. 'event-assets').
+ * @param {string} folder      - Folder within the bucket.
+ * @param {string} originalName- Original file name; kept in the key so the
+ *   stored object is recognisable in the bucket listing.
+ * @returns {Promise<string|null>} Public URL, or null on failure.
+ */
+export async function uploadBuffer(buffer, mimeType, bucket, folder = 'misc', originalName = '') {
+    if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+
+    try {
+        // Prefer the real extension from the upload; fall back to the MIME
+        // subtype ("video/quicktime" -> "quicktime" is wrong as an extension,
+        // so the explicit map below covers the common video types).
+        const VIDEO_EXT = {
+            'video/mp4': 'mp4',
+            'video/webm': 'webm',
+            'video/quicktime': 'mov',
+            'video/x-msvideo': 'avi',
+            'video/x-matroska': 'mkv',
+        };
+        const nameExt = (String(originalName).match(/\.([a-zA-Z0-9]{1,5})$/) || [])[1];
+        const ext = (VIDEO_EXT[mimeType] || nameExt || mimeType.split('/')[1] || 'bin').toLowerCase();
+
+        const slug = slugifyFileName(originalName);
+        const unique = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
+        const filename = `${folder}/${slug ? `${unique}_${slug}` : unique}.${ext}`;
+
+        const { error } = await supabaseAdmin.storage
+            .from(bucket)
+            .upload(filename, buffer, { contentType: mimeType, upsert: true });
+
+        if (error) {
+            console.error(`Buffer upload error for ${filename} in ${bucket}:`, error.message);
+            throw error;
+        }
+
+        const { data: urlData } = supabaseAdmin.storage.from(bucket).getPublicUrl(filename);
+        return urlData.publicUrl;
+    } catch (err) {
+        console.error("uploadBuffer failed:", err.message);
+        return null;
+    }
+}
