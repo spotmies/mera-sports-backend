@@ -2,8 +2,11 @@ import QRCode from 'qrcode';
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet, cacheDel } from "../config/redisClient.js";
 import { getPublicEventId, resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/eventResolver.js";
+import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePaymentGateway } from "../utils/paymentGateway.js";
+import { invalidateEventAccessCache } from "../middleware/eventAccess.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { loadCommunities, normalizeCommunityIds, normalizeInstituteNames, normalizeRestrictionMessage, resolveCommunityNames, validateCommunityIds } from "../utils/communityRestriction.js";
 
 /**
  * Invalidate all event-related caches. Call after any event write so public
@@ -49,6 +52,83 @@ const getAssignedEventIdsForAdmin = async (adminId) => {
         console.error('getAssignedEventIdsForAdmin error:', err?.message || err);
         return [];
     }
+};
+
+// ── Which fields a create/edit request may set ───────────────────────────────
+// Everything else in the body (created_by, qr_code, public_id, assigned_by…)
+// is ignored. Before this, both handlers wrote whatever the client sent.
+const EVENT_EDITABLE_FIELDS = [
+    "name", "sport", "location", "venue", "start_date", "end_date", "start_time",
+    "banner_image", "document_file", "document_url", "document_description", "is_document_required",
+    "rules_and_regulations", "sponsors", "categories", "pincode", "state", "city",
+    "google_map_link", "show_slots", "event_format_type",
+    // allowed_community_names is input-only: new group names the admin typed,
+    // turned into apartments ids below and never written to events.
+    "community_restrictions_enabled", "allowed_community_ids", "allowed_community_names", "allowed_institute_names", "community_restriction_message",
+    // Organiser's note shown to players in a pop-up while they register.
+    "registration_message",
+];
+// Who runs an event and its lifecycle status are the superadmin's call.
+const SUPERADMIN_ONLY_EVENT_FIELDS = ["assigned_admin_ids", "assigned_to", "status"];
+
+const pickEventFields = (body, { superadmin, includePayment }) => {
+    const allowed = [
+        ...EVENT_EDITABLE_FIELDS,
+        ...(superadmin ? SUPERADMIN_ONLY_EVENT_FIELDS : []),
+        ...(includePayment ? PAYMENT_SETTING_FIELDS : []),
+    ];
+    const picked = {};
+    for (const field of allowed) {
+        if (Object.prototype.hasOwnProperty.call(body || {}, field)) picked[field] = body[field];
+    }
+    return picked;
+};
+
+// Normalises community-restriction fields in-place on `fields` (a picked create
+// or update payload). Returns an error message to send as a 400, or null.
+// `current` is the stored event, needed on update when only one of the two
+// fields was sent. Turning the restriction off also clears the list, so the
+// event is open to everyone again and no stale ids linger.
+const applyCommunityRestriction = async (fields, current = null) => {
+    const has = (key) => Object.prototype.hasOwnProperty.call(fields, key);
+    const hasEnabled = has("community_restrictions_enabled");
+    const hasIds = has("allowed_community_ids");
+    const hasNames = has("allowed_community_names");
+    const hasMessage = has("community_restriction_message");
+    const hasInstitutes = has("allowed_institute_names");
+    // The player-facing message stands on its own: it is saved whether or not an
+    // allow-list restriction is on.
+    if (hasMessage) fields.community_restriction_message = normalizeRestrictionMessage(fields.community_restriction_message);
+    if (!hasEnabled && !hasIds && !hasNames && !hasInstitutes) return null;
+
+    const enabled = hasEnabled
+        ? fields.community_restrictions_enabled === true
+        : current?.community_restrictions_enabled === true;
+    const newNames = hasNames ? fields.allowed_community_names : [];
+    delete fields.allowed_community_names;
+
+    if (!enabled) {
+        fields.community_restrictions_enabled = false;
+        fields.allowed_community_ids = [];
+        // allowed_institute_names is only written when the request sent it, so
+        // turning a restriction off never needs that column to exist.
+        return null;
+    }
+
+    const requested = normalizeCommunityIds([
+        ...(hasIds ? (fields.allowed_community_ids || []) : (current?.allowed_community_ids || [])),
+        ...(await resolveCommunityNames(newNames)),
+    ]);
+    // Ids that no longer exist are dropped rather than saved.
+    const { ids } = await validateCommunityIds(requested);
+    const institutes = normalizeInstituteNames(hasInstitutes ? fields.allowed_institute_names : current?.allowed_institute_names);
+    if (ids.length === 0 && institutes.length === 0) {
+        return "Select at least one community or institute, or turn off Community Restrictions";
+    }
+    fields.allowed_institute_names = institutes;
+    fields.community_restrictions_enabled = true;
+    fields.allowed_community_ids = ids;
+    return null;
 };
 
 const loadAssignedAdminsForEvent = async (eventId) => {
@@ -114,6 +194,7 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
         if (insertError.code === '42P01') return;
         throw insertError;
     }
+    await invalidateEventAccessCache("*", normalizedEventId);
 };
 
 // GET /api/events/list
@@ -210,6 +291,23 @@ export const getEventDetails = async (req, res) => {
 
         eventData.news = newsData || [];
 
+        // Community restriction: expose ids + names so the admin form can show
+        // the saved selection and the player page can name the communities.
+        // Events from before the feature have neither column — normalise them.
+        eventData.community_restrictions_enabled = eventData.community_restrictions_enabled === true;
+        eventData.allowed_community_ids = normalizeCommunityIds(eventData.allowed_community_ids);
+        eventData.community_restriction_message = eventData.community_restriction_message || null;
+        eventData.registration_message = eventData.registration_message || null;
+        eventData.allowed_institute_names = normalizeInstituteNames(eventData.allowed_institute_names);
+        try {
+            eventData.allowed_communities = eventData.community_restrictions_enabled
+                ? await loadCommunities(eventData.allowed_community_ids)
+                : [];
+        } catch (communityErr) {
+            console.error('loadCommunities error:', communityErr?.message || communityErr);
+            eventData.allowed_communities = [];
+        }
+
         // Stats — team_id lets team/doubles categories count distinct teams, not
         // individual players. (Singles: team_id null → count rows. Team/Doubles:
         // team_id shared → count distinct team_ids.) regStats fetched in the batch above.
@@ -278,12 +376,26 @@ export const createEvent = async (req, res) => {
             sponsors,
             assigned_admin_ids,
             assigned_to,
+            // Pulled out of `rest` so the raw data: URL cannot overwrite the
+            // uploaded file's URL when `...rest` is spread into the insert.
+            payment_qr_image: paymentQrInput,
+            payment_gateway: paymentGatewayInput,
             ...rest
         } = req.body;
         if (!name || !sport || !start_date) return res.status(400).json({ message: "Missing required fields" });
 
+        const payment_gateway = paymentGatewayInput ?? "manual";
+        if (!PAYMENT_GATEWAYS.includes(payment_gateway)) {
+            return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
+        }
+        if (acceptsManual(payment_gateway) && !paymentQrInput) {
+            return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
+        }
+
         const created_by = req.user.id;
-        const normalizedAssignedAdminIds = Array.isArray(assigned_admin_ids)
+        const isSuperAdmin = req.user?.role === 'superadmin';
+        // Only a superadmin assigns admins; anyone else's choice is ignored.
+        const normalizedAssignedAdminIds = !isSuperAdmin ? [] : Array.isArray(assigned_admin_ids)
             ? Array.from(new Set(assigned_admin_ids.filter(isUuid)))
             : (assigned_to && isUuid(assigned_to) ? [assigned_to] : []);
         const primaryAssignedAdminId = normalizedAssignedAdminIds[0] || null;
@@ -293,7 +405,7 @@ export const createEvent = async (req, res) => {
         const uploadedDocUrl = (document_file && document_file.startsWith('data:'))
             ? await uploadBase64(document_file, 'event-documents', 'docs')
             : (document_url || null);
-        const payment_qr_image = await uploadBase64(req.body.payment_qr_image, 'event-assets', 'payment-qrs');
+        const payment_qr_image = await uploadBase64(paymentQrInput, 'event-assets', 'payment-qrs');
 
         let processedSponsors = [];
         if (sponsors && Array.isArray(sponsors)) {
@@ -307,14 +419,22 @@ export const createEvent = async (req, res) => {
             }));
         }
 
+        const pickedFields = pickEventFields(rest, { superadmin: isSuperAdmin, includePayment: true });
+        if (Object.prototype.hasOwnProperty.call(pickedFields, "registration_message")) {
+            pickedFields.registration_message = normalizeRestrictionMessage(pickedFields.registration_message);
+        }
+        const communityError = await applyCommunityRestriction(pickedFields);
+        if (communityError) return res.status(400).json({ message: communityError });
+
         const { data, error } = await supabaseAdmin.from('events').insert({
             name, sport, start_date, created_by,
-            banner_url, document_url: uploadedDocUrl, payment_qr_image,
+            banner_url, document_url: uploadedDocUrl, payment_qr_image, payment_gateway,
             sponsors: processedSponsors,
             status: 'upcoming',
             assigned_to: primaryAssignedAdminId,
             assigned_by: primaryAssignedAdminId ? created_by : null,
-            ...rest
+            // upi_id rides in here: payment settings are open at creation.
+            ...pickedFields
         }).select().single();
 
         if (error) throw error;
@@ -394,8 +514,41 @@ export const createEvent = async (req, res) => {
 export const updateEvent = async (req, res) => {
     try {
         const { id } = req.params;
-        const updates = req.body;
+        const isSuperAdmin = req.user?.role === 'superadmin';
+        // Only known fields are written. Payment settings are fixed at creation
+        // and, like admin assignment, only a superadmin may change them; for
+        // anyone else they are dropped rather than rejected, because older edit
+        // forms send them back unchanged.
+        const updates = pickEventFields(req.body, { superadmin: isSuperAdmin, includePayment: isSuperAdmin });
         let assignedAdminIdsInput;
+
+        if (updates.hasOwnProperty('registration_message')) {
+            updates.registration_message = normalizeRestrictionMessage(updates.registration_message);
+        }
+        const touchesCommunity = ['community_restrictions_enabled', 'allowed_community_ids', 'allowed_community_names', 'allowed_institute_names'].some((k) => updates.hasOwnProperty(k));
+        let currentCommunity = null;
+        if (touchesCommunity && !(updates.hasOwnProperty('community_restrictions_enabled') && updates.hasOwnProperty('allowed_community_ids'))) {
+            const { data: cur } = await supabaseAdmin.from('events').select('*').eq('id', id).maybeSingle();
+            currentCommunity = cur;
+        }
+        const communityError = await applyCommunityRestriction(updates, currentCommunity);
+        if (communityError) return res.status(400).json({ message: communityError });
+
+        if (isSuperAdmin && (updates.hasOwnProperty('payment_gateway') || updates.hasOwnProperty('payment_qr_image'))) {
+            if (updates.hasOwnProperty('payment_gateway') && !PAYMENT_GATEWAYS.includes(updates.payment_gateway)) {
+                return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
+            }
+            const { data: current, error: currentError } = await supabaseAdmin
+                .from('events').select('payment_gateway, payment_qr_image').eq('id', id).maybeSingle();
+            if (currentError) throw currentError;
+            const nextGateway = normalizePaymentGateway(
+                updates.hasOwnProperty('payment_gateway') ? updates.payment_gateway : current?.payment_gateway
+            );
+            const nextQr = updates.hasOwnProperty('payment_qr_image') ? updates.payment_qr_image : current?.payment_qr_image;
+            if (acceptsManual(nextGateway) && !nextQr) {
+                return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
+            }
+        }
 
         if (updates.banner_image) {
             updates.banner_url = await uploadBase64(updates.banner_image, 'event-assets', 'banners');
@@ -450,6 +603,10 @@ export const updateEvent = async (req, res) => {
 
         // document_file is already handled above (uploaded and converted to document_url, then deleted)
         delete updates.data; // Also remove potential junk
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ message: "Nothing in this request can be changed by you" });
+        }
 
         const { data, error } = await supabaseAdmin.from('events').update(updates).eq('id', id).select().single();
         if (error) throw error;

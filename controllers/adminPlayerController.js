@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
+import { withoutPassword } from "../utils/userSanitize.js";
 
 // Strip PostgREST filter-injection chars and SQL LIKE wildcards (% matches all rows, _ matches any char)
 const sanitizeSearch = (s) =>
@@ -70,7 +71,7 @@ export const listPlayers = async (req, res) => {
 
         res.json({
             success: true,
-            players: rowsRes.data,
+            players: (rowsRes.data || []).map(withoutPassword),
             total_count: total,
             counts: { total, verified, pending, rejected },
         });
@@ -121,7 +122,7 @@ export const getPlayerDetails = async (req, res) => {
             amountPaid: reg.amount_paid
         })) : [];
 
-        res.json({ success: true, player });
+        res.json({ success: true, player: withoutPassword(player) });
     } catch (err) {
         console.error("ADMIN PLAYER DETAIL ERROR:", err);
         res.status(500).json({ message: "Failed to fetch player details" });

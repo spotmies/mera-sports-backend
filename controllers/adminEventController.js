@@ -4,7 +4,9 @@ import { createNotification } from "../services/notificationService.js";
 import { invalidateDashboardForRegistration } from "../utils/dashboardCache.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { sendRegistrationStatusWhatsApp } from "../utils/whatsapp.js";
+import { notifyRegistrationApproved } from "../utils/approvalNotifications.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
+import { getManageableEventIds } from "../middleware/eventAccess.js";
 
 // Fire-and-forget WhatsApp status update to the registration's player
 const notifyRegistrationStatusWhatsApp = (playerId, eventName, registrationNo, status) => {
@@ -120,9 +122,18 @@ const attachMemberPlayerCodes = async (registrations) => {
 };
 
 /* ================= REGISTRATIONS & TRANSACTIONS ================= */
+/**
+ * Which admin's events a list request is limited to. An admin always sees only
+ * their own (created or assigned) events — the `admin_id` the browser sends is
+ * ignored for them, since trusting it let any admin read anyone's payments.
+ * A superadmin sees everything, or one admin's events if they ask for that.
+ */
+const resolveScopedAdminId = (req) =>
+    req.user?.role === 'superadmin' ? (req.query.admin_id || null) : req.user?.id;
+
 export const getRegistrations = async (req, res) => {
     try {
-        const { eventId, admin_id, page, limit } = req.query;
+        const { eventId, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
@@ -134,35 +145,12 @@ export const getRegistrations = async (req, res) => {
 
         if (eventId) query = query.eq('event_id', eventId);
 
-        const requestingAdminId = req.user?.role === 'superadmin'
-            ? null
-            : (admin_id || req.user?.id);
-
-        if (requestingAdminId) {
-            // Run both queries concurrently to avoid sequential round-trips
-            const [directResult, assignmentResult] = await Promise.all([
-                supabaseAdmin.from('events').select('id').or(`created_by.eq.${requestingAdminId},assigned_to.eq.${requestingAdminId}`),
-                supabaseAdmin.from('event_admin_assignments').select('event_id').eq('admin_id', requestingAdminId),
-            ]);
-
-            if (directResult.error) throw directResult.error;
-            if (assignmentResult.error) {
-                if (assignmentResult.error.code === '42P01') {
-                    console.warn('[getRegistrations] event_admin_assignments table does not exist — multi-assignment filter skipped.');
-                } else {
-                    throw assignmentResult.error;
-                }
-            }
-
-            const allowedEventIds = new Set();
-            (directResult.data || []).forEach((eventRow) => allowedEventIds.add(eventRow.id));
-            (assignmentResult.data || []).forEach((row) => allowedEventIds.add(row.event_id));
-
-            const eventIds = Array.from(allowedEventIds).filter((value) => value !== null && value !== undefined);
+        const scopedAdminId = resolveScopedAdminId(req);
+        if (scopedAdminId) {
+            const eventIds = Array.from(await getManageableEventIds(scopedAdminId));
             if (eventIds.length === 0) {
-                return res.json({ success: true, registrations: [] });
+                return res.json({ success: true, registrations: [], total_count: 0 });
             }
-
             query = query.in('event_id', eventIds);
         }
 
@@ -186,7 +174,7 @@ export const getRegistrations = async (req, res) => {
 
 export const getTransactions = async (req, res) => {
     try {
-        const { eventId, admin_id, page, limit } = req.query;
+        const { eventId, page, limit } = req.query;
         let query = supabaseAdmin.from("event_registrations")
             .select(`
                 id, event_id, player_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
@@ -197,31 +185,12 @@ export const getTransactions = async (req, res) => {
             .order('created_at', { ascending: false });
 
         if (eventId) query = query.eq('event_id', eventId);
-        if (admin_id) {
-            // Run both queries concurrently to avoid sequential round-trips
-            const [directResult, assignmentResult] = await Promise.all([
-                supabaseAdmin.from('events').select('id').or(`created_by.eq.${admin_id},assigned_to.eq.${admin_id}`),
-                supabaseAdmin.from('event_admin_assignments').select('event_id').eq('admin_id', admin_id),
-            ]);
-
-            if (directResult.error) throw directResult.error;
-            if (assignmentResult.error) {
-                if (assignmentResult.error.code === '42P01') {
-                    console.warn('[getTransactions] event_admin_assignments table does not exist — multi-assignment filter skipped.');
-                } else {
-                    throw assignmentResult.error;
-                }
-            }
-
-            const allowedEventIds = new Set();
-            (directResult.data || []).forEach((eventRow) => allowedEventIds.add(eventRow.id));
-            (assignmentResult.data || []).forEach((row) => allowedEventIds.add(row.event_id));
-
-            const eventIds = Array.from(allowedEventIds).filter((value) => value !== null && value !== undefined);
+        const scopedAdminId = resolveScopedAdminId(req);
+        if (scopedAdminId) {
+            const eventIds = Array.from(await getManageableEventIds(scopedAdminId));
             if (eventIds.length === 0) {
-                return res.json({ success: true, transactions: [] });
+                return res.json({ success: true, transactions: [], total_count: 0 });
             }
-
             query = query.in('event_id', eventIds);
         }
 
@@ -267,7 +236,8 @@ export const verifyTransaction = async (req, res) => {
                 `Your registration for ${updatedReg.events?.name} (Reg No: ${updatedReg.registration_no}) has been verified.`,
                 "success"
             );
-            notifyRegistrationStatusWhatsApp(updatedReg.player_id, updatedReg.events?.name, updatedReg.registration_no, "Verified");
+            // Approval is what releases the receipt: email + WhatsApp with the PDF.
+            notifyRegistrationApproved(id);
         }
         res.json({ success: true, message: "Transaction verified" });
     } catch (err) {
@@ -313,10 +283,25 @@ export const bulkUpdateTransactions = async (req, res) => {
         if (!ids || !Array.isArray(ids) || ids.length === 0) return res.status(400).json({ message: "Invalid IDs" });
         if (!['verified', 'rejected'].includes(status)) return res.status(400).json({ message: "Invalid status" });
 
+        // An admin can only act on registrations of events they manage; the
+        // rest of the selection is skipped and reported back, not failed.
+        let allowedIds = ids;
+        if (req.user?.role !== 'superadmin') {
+            const { data: rows, error: lookupError } = await supabaseAdmin
+                .from("event_registrations").select("id, event_id").in("id", ids);
+            if (lookupError) throw lookupError;
+            const manageable = await getManageableEventIds(req.user.id);
+            allowedIds = (rows || []).filter((r) => manageable.has(String(r.event_id))).map((r) => r.id);
+        }
+        const skipped = ids.length - allowedIds.length;
+        if (allowedIds.length === 0) {
+            return res.status(403).json({ message: "None of the selected registrations belong to your events", skipped });
+        }
+
         const { data: updatedRegs, error, count } = await supabaseAdmin
             .from("event_registrations")
             .update({ status })
-            .in("id", ids)
+            .in("id", allowedIds)
             .select('id, player_id, team_id, registration_no, events(name)');
 
         if (error) throw error;
@@ -336,10 +321,11 @@ export const bulkUpdateTransactions = async (req, res) => {
                 const type = status === 'verified' ? "success" : "error";
                 const msg = `Your registration for ${reg.events?.name} (Reg No: ${reg.registration_no}) was ${status}.`;
                 createNotification(reg.player_id, title, msg, type);
-                notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
+                if (status === 'verified') notifyRegistrationApproved(reg.id);
+                else notifyRegistrationStatusWhatsApp(reg.player_id, reg.events?.name, reg.registration_no, statusLabel);
             });
         }
-        res.json({ success: true, message: `Transactions ${status}`, count });
+        res.json({ success: true, message: `Transactions ${status}`, count, skipped });
     } catch (err) {
         console.error("BULK UPDATE ERROR:", err);
         res.status(500).json({ message: "Batch update failed" });

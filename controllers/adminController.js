@@ -1,6 +1,9 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { createNotification } from "../services/notificationService.js";
+import { getManageableEventIds, invalidateEventAccessCache } from "../middleware/eventAccess.js";
+import { withoutPassword } from "../utils/userSanitize.js";
+import { invalidateAdminAuthCache, invalidateAdminPermissionCache } from "../middleware/rbacMiddleware.js";
 
 // GET /api/admin/list-admins
 export const listAdmins = async (req, res) => {
@@ -204,6 +207,29 @@ export const getVerifiedInstitutes = async (req, res) => {
     }
 };
 
+// GET /api/admin/institutes/names
+// Names only, open to any admin: the event form's Community Restrictions picker
+// needs them, and /institutes/verified is super-admin-only and returns contact
+// details an event creator has no business seeing.
+export const getInstituteNames = async (req, res) => {
+    try {
+        const { data, error } = await supabaseAdmin
+            .from("users")
+            .select("institute_name, name")
+            .eq("role", "institutehead")
+            .eq("verification", "verified");
+        if (error) throw error;
+
+        const names = Array.from(new Set(
+            (data || []).map((row) => String(row.institute_name || row.name || "").trim()).filter(Boolean)
+        )).sort((a, b) => a.localeCompare(b));
+        res.json({ success: true, institutes: names });
+    } catch (err) {
+        console.error("FETCH INSTITUTE NAMES ERROR:", err);
+        res.status(500).json({ message: "Failed to fetch institutes" });
+    }
+};
+
 // PUT /api/admin/institutes/:id/approve
 export const approveInstitute = async (req, res) => {
     try {
@@ -262,6 +288,8 @@ export const approveAdmin = async (req, res) => {
                 reports: true
             }, { onConflict: "admin_id", ignoreDuplicates: true });
 
+        // verifyAdmin caches status for a minute; let the approval apply now.
+        await Promise.all([invalidateAdminAuthCache(adminId), invalidateAdminPermissionCache(adminId)]);
         res.json({ success: true, message: "Admin approved successfully" });
     } catch (err) {
         console.error("APPROVE ADMIN ERROR:", err);
@@ -274,6 +302,7 @@ export const rejectAdmin = async (req, res) => {
     try {
         const { error } = await supabaseAdmin.from("users").update({ verification: "rejected" }).eq("id", req.params.id);
         if (error) throw error;
+        await invalidateAdminAuthCache(req.params.id);
         res.json({ success: true, message: "Admin application rejected" });
     } catch (err) {
         console.error("REJECT ADMIN ERROR:", err);
@@ -286,6 +315,19 @@ export const deleteAdmin = async (req, res) => {
     try {
         const targetAdminId = req.params.id;
         const superAdminId = req.user.id;
+
+        // This endpoint used to delete whatever user id it was given — a
+        // player, or the caller's own account.
+        if (targetAdminId === superAdminId) {
+            return res.status(400).json({ message: "You cannot delete your own account" });
+        }
+        const { data: target, error: targetError } = await supabaseAdmin
+            .from('users').select('role').eq('id', targetAdminId).maybeSingle();
+        if (targetError) throw targetError;
+        if (!target) return res.status(404).json({ message: "Admin not found" });
+        if (!['admin', 'superadmin', 'institutehead'].includes(target.role)) {
+            return res.status(400).json({ message: "Only admin accounts can be deleted here" });
+        }
 
         // 1. Unassign events
         const { error: unassignError } = await supabaseAdmin.from('events').update({ assigned_to: null }).eq('assigned_to', targetAdminId);
@@ -312,6 +354,12 @@ export const deleteAdmin = async (req, res) => {
         const { error: deletePublicError } = await supabaseAdmin.from('users').delete().eq('id', targetAdminId);
         if (deletePublicError) throw deletePublicError;
 
+        // Lock the deleted account out now rather than when caches expire.
+        await Promise.all([
+            invalidateAdminAuthCache(targetAdminId),
+            invalidateAdminPermissionCache(targetAdminId),
+            invalidateEventAccessCache(targetAdminId),
+        ]);
         res.json({ success: true, message: "Admin deleted and events re-organized." });
     } catch (err) {
         console.error("DELETE ADMIN ERROR:", err);
@@ -332,16 +380,32 @@ export const getDashboardStats = async (req, res) => {
         const { data: recentPlayers } = await supabaseAdmin.from("users").select("*").eq("role", "player").order("created_at", { ascending: false }).limit(6);
         const { data: rejectedPlayersList } = await supabaseAdmin.from("users").select("*").eq("role", "player").eq("verification", "rejected").order("created_at", { ascending: false }).limit(5);
 
+        // Payments and revenue belong to events, so an admin only sees the
+        // figures for events they manage. Player numbers stay platform-wide,
+        // like the Players page.
+        let scopedEventIds = null;
+        if (req.user?.role !== 'superadmin') {
+            scopedEventIds = Array.from(await getManageableEventIds(req.user.id));
+        }
+        const forScope = (query) => (scopedEventIds ? query.in("event_id", scopedEventIds) : query);
+        const noEvents = scopedEventIds !== null && scopedEventIds.length === 0;
+
         // Transactions
-        const { data: rejectedTransactions } = await supabaseAdmin
+        const { data: rejectedTransactions } = noEvents ? { data: [] } : await forScope(supabaseAdmin
             .from("event_registrations")
             .select(`*, events(name), users:player_id(first_name, last_name, player_id)`)
-            .eq("status", "rejected")
+            .eq("status", "rejected"))
             .order("created_at", { ascending: false })
             .limit(5);
 
+        // Payments awaiting review (same statuses the Transactions page treats as pending)
+        const { count: pendingTransactionsCount } = noEvents ? { count: 0 } : await forScope(supabaseAdmin
+            .from("event_registrations")
+            .select("*", { count: 'exact', head: true })
+            .in("status", ["pending_verification", "pending", "payment_pending", "registered"]));
+
         // Revenue
-        const { data: approvedTxns } = await supabaseAdmin.from("event_registrations").select("amount_paid").eq("status", "verified");
+        const { data: approvedTxns } = noEvents ? { data: [] } : await forScope(supabaseAdmin.from("event_registrations").select("amount_paid").eq("status", "verified"));
         const totalRevenue = approvedTxns?.reduce((sum, txn) => sum + (Number(txn.amount_paid) || 0), 0) || 0;
         const totalTransactionsCount = approvedTxns?.length || 0;
 
@@ -353,10 +417,11 @@ export const getDashboardStats = async (req, res) => {
                 pendingPlayers: pendingPlayers || 0,
                 rejectedPlayers: rejectedPlayersCount || 0,
                 totalRevenue,
-                totalTransactionsCount
+                totalTransactionsCount,
+                pendingTransactionsCount: pendingTransactionsCount || 0
             },
-            recentPlayers: recentPlayers || [],
-            rejectedPlayersList: rejectedPlayersList || [],
+            recentPlayers: (recentPlayers || []).map(withoutPassword),
+            rejectedPlayersList: (rejectedPlayersList || []).map(withoutPassword),
             rejectedTransactions: rejectedTransactions || []
         });
     } catch (err) {
@@ -405,6 +470,7 @@ export const updateAdminRole = async (req, res) => {
             .eq("id", targetAdminId);
 
         if (error) throw error;
+        await Promise.all([invalidateAdminAuthCache(targetAdminId), invalidateEventAccessCache(targetAdminId)]);
 
         // --- NOTIFICATIONS ---
         // Fetch names for notification text
@@ -536,6 +602,7 @@ export const updatePermissions = async (req, res) => {
 
         if (error) throw error;
 
+        await invalidateAdminPermissionCache(adminId);
         res.json({ success: true, message: "Permissions updated successfully." });
     } catch (err) {
         console.error("UPDATE PERMISSIONS ERROR:", err);

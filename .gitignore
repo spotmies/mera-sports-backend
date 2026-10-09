@@ -25,3 +25,4 @@ scripts.zip
 *.njsproj
 *.sln
 *.sw?
+.agents/

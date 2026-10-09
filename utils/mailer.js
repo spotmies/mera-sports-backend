@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import { Resend } from 'resend';
 import { generateReceiptPdf, receiptFilename } from './receiptPdf.js';
+import { formatDateIST } from './dateFormat.js';
 
 dotenv.config({ quiet: true });
 
@@ -29,26 +30,30 @@ export const sendRegistrationEmail = async (toEmail, details) => {
         }).join(', ')
         : category;
 
+    // Manual payments wait for an admin to check the screenshot: no receipt yet.
+    const isPending = /pending/i.test(String(details.status || ''));
+
     const html = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e0e0e0; border-radius: 8px; overflow: hidden;">
-            <div style="background-color: #4F46E5; padding: 20px; text-align: center; color: white;">
-                <h1 style="margin: 0;">Registration Confirmed!</h1>
+            <div style="background-color: ${isPending ? '#F59E0B' : '#4F46E5'}; padding: 20px; text-align: center; color: white;">
+                <h1 style="margin: 0;">${isPending ? 'Registration Received' : 'Registration Confirmed!'}</h1>
             </div>
             <div style="padding: 30px;">
                 <p>Dear <strong>${playerName}</strong>,</p>
-                <p>Your registration for <strong>${eventName}</strong> has been successfully received.</p>
+                <p>Your registration for <strong>${eventName}</strong> has been successfully received.${isPending ? ' It is pending verification by the organiser.' : ''}</p>
 
                 <div style="background-color: #f9fafb; padding: 15px; border-radius: 6px; margin: 20px 0;">
                     <p style="margin: 5px 0;"><strong>Registration No:</strong> ${registrationNo}</p>
                     <p style="margin: 5px 0;"><strong>Event:</strong> ${eventName}</p>
                     <p style="margin: 5px 0;"><strong>Categories:</strong> ${categoriesText}</p>
                     <p style="margin: 5px 0;"><strong>Amount Paid:</strong> ₹${amount}</p>
-                    <p style="margin: 5px 0;"><strong>Date:</strong> ${new Date(date).toLocaleDateString()}</p>
+                    <p style="margin: 5px 0;"><strong>Date:</strong> ${formatDateIST(date)}</p>
                     <p style="margin: 5px 0;"><strong>Status:</strong> <span style="text-transform: uppercase;">${details.status || 'Verified'}</span></p>
                 </div>
 
-                <p>Your receipt is attached to this email as a PDF. Please carry a digital or physical copy to the venue for verification.</p>
-                <p>Good luck!</p>
+                ${isPending
+                    ? '<p>Your payment is being verified. Once the organiser approves it, you will receive your receipt by email and WhatsApp, and it will be available to download from the app.</p>'
+                    : '<p>Your receipt is attached to this email as a PDF. Please carry a digital or physical copy to the venue for verification.</p><p>Good luck!</p>'}
             </div>
             <div style="background-color: #f3f4f6; padding: 15px; text-align: center; color: #6b7280; font-size: 12px;">
                 &copy; ${new Date().getFullYear()} Sports Paramount. All rights reserved.
@@ -59,11 +64,13 @@ export const sendRegistrationEmail = async (toEmail, details) => {
     // Build attachments — degrade gracefully if PDF generation fails
     let attachments = [];
     try {
-        const pdfBuffer = await generateReceiptPdf(details);
-        attachments = [{
-            filename: receiptFilename(registrationNo),
-            content: pdfBuffer.toString('base64'),
-        }];
+        if (!isPending) {
+            const pdfBuffer = await generateReceiptPdf(details);
+            attachments = [{
+                filename: receiptFilename(registrationNo),
+                content: pdfBuffer.toString('base64'),
+            }];
+        }
     } catch (pdfErr) {
         console.error('Receipt PDF generation failed, sending email without attachment:', pdfErr.message);
     }
@@ -72,7 +79,7 @@ export const sendRegistrationEmail = async (toEmail, details) => {
         const { error } = await resend.emails.send({
             from: FROM_ADDRESS,
             to: [toEmail],
-            subject: `Registration Confirmed: ${eventName}`,
+            subject: isPending ? `Registration Received (Pending Verification): ${eventName}` : `Registration Confirmed: ${eventName}`,
             html,
             attachments,
         });

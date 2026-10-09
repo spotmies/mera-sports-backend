@@ -323,17 +323,25 @@ export const checkConflict = async (req, res) => {
     try {
         const userId = req.user.id;
         const { email, mobile } = req.body;
-        const { data: currentUser } = await supabaseAdmin.from("users").select("age, dob").eq("id", userId).maybeSingle();
+        const { data: currentUser } = await supabaseAdmin.from("users").select("age, dob, email, mobile").eq("id", userId).maybeSingle();
         // Derived from dob — the stored age column is stale for anyone who has
         // had a birthday since signup.
         const resolvedAge = resolveAge(currentUser);
         const allowSharedMobile = resolvedAge !== null && resolvedAge <= 15;
 
-        if (email) {
+        // Only a field that is actually being changed can conflict. The client sends
+        // both values every time, so without this an unchanged mobile that another
+        // account also holds blocked an email-only edit with "Mobile already taken".
+        // update-profile applies the same rule when it saves.
+        const norm = (v) => String(v ?? "").trim().toLowerCase();
+        const emailChanged = norm(email) !== norm(currentUser?.email);
+        const mobileChanged = norm(mobile) !== norm(currentUser?.mobile);
+
+        if (email && emailChanged) {
             const { data } = await supabaseAdmin.from("users").select("id").eq("email", email).neq("id", userId).maybeSingle();
             if (data) return res.status(409).json({ conflict: true, field: 'email', message: "Email already taken" });
         }
-        if (mobile) {
+        if (mobile && mobileChanged) {
             const { data } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).maybeSingle();
             if (data && !allowSharedMobile) return res.status(409).json({ conflict: true, field: 'mobile', message: "Mobile already taken" });
         }

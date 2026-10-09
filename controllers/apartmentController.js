@@ -81,10 +81,28 @@ export const getApartments = async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: "Failed to fetch apartments" }); }
 };
 
+const APARTMENT_LIMITS = { name: 100, locality: 60, zone: 60 };
+
+// Returns an error message, or null when the (partial) payload is valid.
+const validateApartmentFields = ({ name, pincode, locality, zone }) => {
+    if (name !== undefined && (typeof name !== "string" || name.trim().length < 3 || name.trim().length > APARTMENT_LIMITS.name))
+        return `Apartment name must be 3-${APARTMENT_LIMITS.name} characters`;
+    if (locality !== undefined && locality !== null && String(locality).trim().length > APARTMENT_LIMITS.locality)
+        return `Locality must be at most ${APARTMENT_LIMITS.locality} characters`;
+    if (zone !== undefined && zone !== null && String(zone).trim().length > APARTMENT_LIMITS.zone)
+        return `Zone must be at most ${APARTMENT_LIMITS.zone} characters`;
+    if (pincode !== undefined && pincode !== null && pincode !== "" && !/^\d{6}$/.test(String(pincode).trim()))
+        return "Pincode must be exactly 6 digits";
+    return null;
+};
+
 export const addApartment = async (req, res) => {
     try {
         const { name, pincode, locality, zone } = req.body;
         if (!name || typeof name !== "string") return res.status(400).json({ success: false, message: "Invalid name" });
+
+        const validationError = validateApartmentFields(req.body);
+        if (validationError) return res.status(400).json({ success: false, message: validationError });
 
         const trimmedName = name.trim();
         const { data: existing } = await supabaseAdmin.from("apartments").select("id").ilike("name", trimmedName).maybeSingle();
@@ -100,6 +118,8 @@ export const updateApartment = async (req, res) => {
     try {
         const { id } = req.params;
         const { name, pincode, locality, zone } = req.body;
+        const validationError = validateApartmentFields(req.body);
+        if (validationError) return res.status(400).json({ success: false, message: validationError });
         const updateData = {};
         if (name) updateData.name = name.trim();
         if (pincode !== undefined) updateData.pincode = pincode;

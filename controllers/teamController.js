@@ -234,6 +234,9 @@ export const lookupPlayer = async (req, res) => {
             player: {
                 id: player.id,
                 player_id: player.player_id,
+                // Decided server-side from the verified token, so the client
+                // never has to guess which id format identifies "me".
+                is_self: player.id === req.user?.id,
                 name: `${player.first_name} ${player.last_name}`,
                 age,
                 mobile: maskTail(player.mobile),
@@ -246,10 +249,30 @@ export const lookupPlayer = async (req, res) => {
     }
 };
 
+/**
+ * The captain is always part of the team implicitly, so a member list must not
+ * contain them (or the same player twice). Returns an error message, or null.
+ */
+const validateTeamMembers = (members, captainId) => {
+    const list = Array.isArray(members) ? members : [];
+    const seen = new Set();
+    for (const m of list) {
+        const key = m?.id || m?.player_id;
+        if (!key) continue;
+        if (captainId && m?.id === captainId) return "You are the captain and already part of the team. Add other players as members.";
+        if (seen.has(key)) return "The same player is added more than once.";
+        seen.add(key);
+    }
+    return null;
+};
+
 export const createTeam = async (req, res) => {
     try {
         const { team_name, sport, members } = req.body;
         const userId = req.user.id;
+
+        const memberError = validateTeamMembers(members, userId);
+        if (memberError) return res.status(400).json({ success: false, message: memberError });
 
         const { data: profile } = await supabaseAdmin.from('users').select('first_name, last_name, mobile').eq('id', userId).maybeSingle();
         const captainName = profile ? `${profile.first_name} ${profile.last_name}`.trim() : "Unknown";
@@ -277,6 +300,9 @@ export const updateTeam = async (req, res) => {
         const { data: team, error: fetchError } = await supabaseAdmin.from('player_teams').select('*').eq('id', id).maybeSingle();
         if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
+
+        const memberError = validateTeamMembers(members, userId);
+        if (memberError) return res.status(400).json({ success: false, message: memberError });
 
         const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name, sport, members: members || [] }).eq('id', id).select().maybeSingle();
         if (error) throw error;

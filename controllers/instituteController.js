@@ -125,7 +125,7 @@ const isRealDate = (y, m, d) => {
 const toIsoDate = (y, m, d) => (isRealDate(y, m, d) ? `${y}-${pad2(m)}-${pad2(d)}` : null);
 
 /** The date formats a sheet may legitimately use, for error messages. */
-export const ACCEPTED_DOB_FORMATS = "DD-MM-YYYY (e.g. 05-08-2011) or YYYY-MM-DD";
+export const ACCEPTED_DOB_FORMATS = "DD/MM/YYYY (e.g. 05/08/2011) or YYYY-MM-DD";
 
 /**
  * Most students one bulk import may carry.
@@ -663,7 +663,7 @@ export const finalizeBulkImport = async (req, res) => {
                 last_name: student.last_name,
                 email: student.email,
                 mobile: student.mobile,
-                aadhaar: student.aadhaar ? `***${String(student.aadhaar).slice(-4)}` : null,
+                aadhaar: student.aadhaar ? `••••••••${String(student.aadhaar).slice(-4)}` : null,
                 dob: student.dob,
                 gender: student.gender,
                 institute_name: student.institute_name,

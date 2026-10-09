@@ -7,8 +7,17 @@ import { resolveEventByIdentifier, resolveEventIdByIdentifier } from "../utils/e
 import { sendRegistrationEmail } from "../utils/mailer.js";
 import { publishReceiptPdf } from "../utils/receiptDelivery.js";
 import { generateReceiptPdf, receiptFilename } from "../utils/receiptPdf.js";
-import { sendRegistrationReceiptWhatsApp } from "../utils/whatsapp.js";
+import { sendRegistrationReceiptWhatsApp, sendRegistrationWhatsApp } from "../utils/whatsapp.js";
+import { isReceiptEligible } from "../utils/approvalNotifications.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { acceptsManual, acceptsRazorpay } from "../utils/paymentGateway.js";
+import { assertCommunityAllowed } from "../utils/communityRestriction.js";
+
+// These routes accept any signed token, so staff accounts must be turned away
+// explicitly. Listing staff roles (rather than requiring 'player') keeps older
+// player tokens working.
+const STAFF_ROLES = new Set(["admin", "superadmin", "institutehead"]);
+const isStaffRole = (role) => STAFF_ROLES.has(role);
 
 // ── Server-side fee computation ──────────────────────────────────────────────
 // The fee shown in the player app is derived from events.categories (jsonb).
@@ -302,13 +311,19 @@ const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amou
                 paymentId, paymentMode,
             };
 
+            // Payments awaiting admin approval get a "pending" notice only — the
+            // receipt is sent by notifyRegistrationApproved once it is verified.
+            const awaitingApproval = !isReceiptEligible(status);
+
             // The email builds its own PDF; WhatsApp needs one Meta can fetch.
-            const receipt = user?.mobile ? await publishReceiptPdf(details) : null;
+            const receipt = (user?.mobile && !awaitingApproval) ? await publishReceiptPdf(details) : null;
 
             await Promise.allSettled([
                 user?.email ? sendRegistrationEmail(user.email, details) : Promise.resolve(),
                 user?.mobile
-                    ? sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {})
+                    ? (awaitingApproval
+                        ? sendRegistrationWhatsApp(user.mobile, details)
+                        : sendRegistrationReceiptWhatsApp(user.mobile, details, receipt || {}))
                     : Promise.resolve(),
             ]);
         } catch (e) { console.error("Email/WhatsApp Error:", e); }
@@ -405,14 +420,16 @@ export const createRazorpayOrder = async (req, res) => {
         const { eventId, amount, categories, teamMemberCount, teamId } = req.body;
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
-        if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
         if (!eventId || !Array.isArray(categories) || categories.length === 0) {
             return res.status(400).json({ message: "Missing fields: eventId and categories are required" });
         }
 
-        const event = await resolveEventByIdentifier(eventId, "id, categories, payment_gateway");
+        // "*" rather than a column list so this keeps working on a database
+        // that has not had the community-restriction migration applied yet.
+        const event = await resolveEventByIdentifier(eventId, "*");
         if (!event) return res.status(404).json({ message: "Event not found" });
-        if ((event.payment_gateway || "manual") !== "razorpay") {
+        if (!acceptsRazorpay(event.payment_gateway)) {
             return res.status(400).json({ message: "This event does not accept Razorpay payments" });
         }
 
@@ -428,8 +445,11 @@ export const createRazorpayOrder = async (req, res) => {
         // is bypassable. Runs before the order is created so an ineligible player
         // is never charged.
         const { data: payingUser } = await supabaseAdmin
-            .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+            .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
         assertPlayerEligible(payingUser, categoryObjects);
+        // Community-restricted events: checked before the order exists, so a
+        // player outside the allowed communities is never charged.
+        await assertCommunityAllowed(event, payingUser);
         if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
             return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
         }
@@ -487,7 +507,7 @@ export const verifyRazorpayPayment = async (req, res) => {
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature, eventId, categories, teamId } = req.body;
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
-        if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
         if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId || !categories) {
             return res.status(400).json({ message: "Missing fields" });
         }
@@ -822,25 +842,47 @@ export const submitManualPayment = async (req, res) => {
         const userId = req.user?.id;
 
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
-        if (!eventId || !amount || !categories || !screenshot) return res.status(400).json({ message: "Missing fields" });
-        if (req.user.role === "admin") return res.status(403).json({ message: "Admins cannot register." });
+        // `amount` is no longer required: the stored amount is computed here.
+        if (!eventId || !Array.isArray(categories) || categories.length === 0 || !screenshot) return res.status(400).json({ message: "Missing fields" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
 
-        const eventForEligibility = await resolveEventByIdentifier(eventId, "id, categories");
+        const eventForEligibility = await resolveEventByIdentifier(eventId, "*");
         if (!eventForEligibility) return res.status(404).json({ message: "Event not found" });
         const resolvedEventId = eventForEligibility.id;
+        if (!acceptsManual(eventForEligibility.payment_gateway)) {
+            return res.status(400).json({ message: "This event only accepts online payment" });
+        }
 
         // Same eligibility gate as the Razorpay path — manual payments must not
         // be a way around it. The closed-category gate rides along for the same
-        // reason.
+        // reason. The fee computed here is also what gets stored: the amount the
+        // browser sends used to be saved as-is, so an edited request could record
+        // any figure as paid and skew the payment reports.
+        let fee;
         try {
             assertCategoriesOpen(eventForEligibility, categories);
-            const { categoryObjects } = computeRegistrationFee(eventForEligibility, categories);
+            const computed = computeRegistrationFee(eventForEligibility, categories);
+            fee = computed.fee;
+            const { categoryObjects } = computed;
             const { data: payingUser } = await supabaseAdmin
-                .from("users").select("gender, dob, age").eq("id", userId).maybeSingle();
+                .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
             assertPlayerEligible(payingUser, categoryObjects);
+            await assertCommunityAllowed(eventForEligibility, payingUser);
         } catch (eligErr) {
             if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message, ...(eligErr.code ? { code: eligErr.code } : {}) });
             throw eligErr;
+        }
+
+        if (!(fee > 0)) {
+            return res.status(400).json({
+                message: "This selection totals ₹0. Free registration is not supported yet — contact the organiser.",
+                code: "ZERO_AMOUNT_ORDER",
+            });
+        }
+        if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
+            // Not rejected: the player has already paid by UPI before submitting,
+            // and the admin checks the screenshot against the stored amount.
+            console.warn(`[submitManualPayment] client amount ${amount} != server fee ${fee} (user ${userId}, event ${resolvedEventId})`);
         }
 
         const screenshotUrl = await uploadBase64(screenshot, "event-assets", "payment-proofs");
@@ -854,7 +896,7 @@ export const submitManualPayment = async (req, res) => {
             manual_transaction_id: transactionId || null,
             payment_mode: "manual",
             screenshot_url: screenshotUrl,
-            amount,
+            amount: fee,
             currency: "INR",
             user_id: userId,
         }).select().maybeSingle();
@@ -868,7 +910,7 @@ export const submitManualPayment = async (req, res) => {
             player_id: userId,
             registration_no: registrationNo,
             categories,
-            amount_paid: amount,
+            amount_paid: fee,
             transaction_id: transaction.id,
             screenshot_url: screenshotUrl,
             manual_transaction_id: transactionId || null,
@@ -891,7 +933,7 @@ export const submitManualPayment = async (req, res) => {
             userId,
             eventId: resolvedEventId,
             registrationNo,
-            amount,
+            amount: fee,
             categories,
             teamId,
             paymentId: transactionId || null,
@@ -918,6 +960,40 @@ const RECEIPT_STATUS_LABELS = {
     registered: "Submitted",
     rejected: "Rejected",
     cancelled: "Cancelled",
+};
+
+/**
+ * GET /api/payment/registration-status/:registrationNo
+ *
+ * Lightweight owner-only status lookup so the success screen can flip from
+ * "Pending Verification" to "Approved" without a reload.
+ */
+export const getRegistrationStatus = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+        const { data: registration, error } = await supabaseAdmin
+            .from("event_registrations")
+            .select("registration_no, player_id, status, screenshot_url")
+            .eq("registration_no", req.params.registrationNo)
+            .maybeSingle();
+        if (error) throw error;
+        if (!registration || registration.player_id !== userId) {
+            return res.status(404).json({ message: "Registration not found" });
+        }
+
+        res.json({
+            success: true,
+            status: registration.status,
+            label: RECEIPT_STATUS_LABELS[registration.status] || registration.status,
+            receiptReady: isReceiptEligible(registration.status),
+            screenshotUrl: registration.screenshot_url || null,
+        });
+    } catch (err) {
+        console.error("Registration status error:", err);
+        res.status(500).json({ message: "Could not fetch status" });
+    }
 };
 
 /**
@@ -949,6 +1025,15 @@ export const downloadRegistrationReceipt = async (req, res) => {
         // make them enumerable.
         if (!registration || registration.player_id !== userId) {
             return res.status(404).json({ message: "Receipt not found" });
+        }
+
+        // The receipt is released only after admin approval.
+        if (!isReceiptEligible(registration.status)) {
+            return res.status(403).json({
+                message: "Receipt will be available once your registration is approved",
+                code: "RECEIPT_NOT_READY",
+                status: registration.status,
+            });
         }
 
         const [{ data: user }, { data: event }, { data: transaction }] = await Promise.all([

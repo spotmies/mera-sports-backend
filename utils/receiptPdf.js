@@ -1,5 +1,6 @@
 import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
+import { formatDateTimeIST } from "./dateFormat.js";
 
 /**
  * Server-side registration receipt PDF.
@@ -30,9 +31,10 @@ const formatCategories = (category) => {
         .join(", ") || "-";
 };
 
+// DD/MM/YYYY, h:mm AM/PM in India time (see dateFormat.js). Missing/invalid -> now, as before.
 const formatDate = (date) => {
     const d = date ? new Date(date) : new Date();
-    return Number.isNaN(d.getTime()) ? new Date().toLocaleString("en-IN") : d.toLocaleString("en-IN");
+    return formatDateTimeIST(Number.isNaN(d.getTime()) ? new Date() : d);
 };
 
 /**

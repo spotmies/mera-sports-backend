@@ -5,6 +5,7 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
 // The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
 import { fetchCategoryBracketRows, isUuid, resolveMatchCategoryKey } from "../utils/categoryKeys.js";
+import { getManageableEventIds } from "../middleware/eventAccess.js";
 
 // Backward-compat: legacy schema has round_name NOT NULL. Our v2 is per-category,
 // so we store a stable value in round_name to satisfy the constraint.
@@ -4088,7 +4089,12 @@ export const getBulkDrawSummary = async (req, res) => {
         const { eventIds } = req.query;
         if (!eventIds) return res.json({ success: true, summary: {} });
 
-        const ids = eventIds.split(',').filter(Boolean);
+        let ids = eventIds.split(',').filter(Boolean);
+        // An admin only gets summaries for events they manage.
+        if (req.user?.role !== "superadmin") {
+            const manageable = await getManageableEventIds(req.user.id);
+            ids = ids.filter((id) => manageable.has(String(id)));
+        }
         if (ids.length === 0) return res.json({ success: true, summary: {} });
 
         const { data, error } = await supabaseAdmin

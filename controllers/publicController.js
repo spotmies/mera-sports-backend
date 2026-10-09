@@ -236,12 +236,20 @@ ${body}
     }
 };
 
+// Where the player site lives. The admin app builds shareable links from this,
+// since it is a different origin from the player site.
+const getPublicSiteUrl = () =>
+    (process.env.PUBLIC_APP_URL || process.env.FRONTEND_URL || "").replace(/\/$/, "");
+
 // GET /api/public/settings
 export const getPublicSettings = async (req, res) => {
     try {
+        // The server keeps its own short cache (busted on admin save); stop
+        // browsers/proxies from layering another one on top of it.
+        res.set("Cache-Control", "no-store");
         // Cache-aside: settings change rarely — cache for 2 min.
         const cached = await cacheGet("public:settings");
-        if (cached) return res.json({ success: true, settings: cached });
+        if (cached) return res.json({ success: true, settings: { ...cached, public_site_url: getPublicSiteUrl() } });
 
         const { data: settings, error } = await supabaseAdmin
             .from("platform_settings")
@@ -253,7 +261,7 @@ export const getPublicSettings = async (req, res) => {
 
         const payload = settings || { platform_name: 'Sports Paramount', logo_url: '' };
         await cacheSet("public:settings", payload, 120);
-        res.json({ success: true, settings: payload });
+        res.json({ success: true, settings: { ...payload, public_site_url: getPublicSiteUrl() } });
     } catch (err) {
         console.error("PUBLIC SETTINGS ERROR:", err);
         res.json({

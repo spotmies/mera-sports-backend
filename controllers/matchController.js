@@ -1669,8 +1669,13 @@ export const updateMatchScore = async (req, res) => {
                                 updatePayload.winner = winnerIdA;
                             } else if (player2SetsWon > player1SetsWon) {
                                 updatePayload.winner = winnerIdB;
+                            } else if (isLeagueMatch) {
+                                updatePayload.winner = null; // Draw allowed in league
                             } else {
-                                updatePayload.winner = isLeagueMatch ? null : winnerIdA;
+                                return res.status(400).json({
+                                    success: false,
+                                    message: "Total points and set wins are level. A knockout match needs a winner - please correct the scores.",
+                                });
                             }
                         }
                     } else {
@@ -1692,8 +1697,13 @@ export const updateMatchScore = async (req, res) => {
                                 updatePayload.winner = winnerIdA;
                             } else if (player2SetsWon > player1SetsWon) {
                                 updatePayload.winner = winnerIdB;
+                            } else if (isLeagueMatch) {
+                                updatePayload.winner = null;
                             } else {
-                                updatePayload.winner = isLeagueMatch ? null : winnerIdA;
+                                return res.status(400).json({
+                                    success: false,
+                                    message: "Set wins are level. A knockout match needs a winner - please correct the set scores.",
+                                });
                             }
                         }
                     }
@@ -1712,9 +1722,13 @@ export const updateMatchScore = async (req, res) => {
                             updatePayload.winner = winnerIdA;
                         } else if (p2Score > p1Score) {
                             updatePayload.winner = winnerIdB;
+                        } else if (String(currentMatch.round_name || '').trim().toUpperCase() === 'LEAGUE') {
+                            updatePayload.winner = null;
                         } else {
-                            const isLeagueMatch = currentMatch.round_name === 'LEAGUE';
-                            updatePayload.winner = isLeagueMatch ? null : winnerIdA;
+                            return res.status(400).json({
+                                success: false,
+                                message: "The scores are level. A knockout match needs a winner - please correct the scores.",
+                            });
                         }
                     }
                 }
@@ -2075,6 +2089,8 @@ export const finalizeRoundMatches = async (req, res) => {
 
                 finalScore = {
                     sets: sets,
+                    // Stored like the single-match save does, so readers know how the result was decided.
+                    winnerMode: categoryWinnerMode,
                     ...(Array.isArray(score.homePlayerGoals) ? { homePlayerGoals: score.homePlayerGoals } : {}),
                     ...(Array.isArray(score.awayPlayerGoals) ? { awayPlayerGoals: score.awayPlayerGoals } : {}),
                     ...(score.playerGoals && typeof score.playerGoals === 'object' ? { playerGoals: score.playerGoals } : {}),

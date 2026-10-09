@@ -12,6 +12,7 @@ import {
     updateMatchScore,
     updateRoundSelectedSets
 } from "../controllers/matchController.js";
+import { fromBody, fromParam, fromRow, requireEventAccess } from "../middleware/eventAccess.js";
 import { verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
@@ -26,48 +27,57 @@ const router = express.Router();
 // GET /api/events/:id/matches (getPublicMatches), which stays unauthenticated.
 router.use(verifyAdmin);
 
+// On top of that, an admin may only touch matches of events they manage. Each
+// route names its event differently, hence one guard per shape.
+const byEventParam = requireEventAccess(fromParam("eventId"));
+const byBodyEvent = requireEventAccess(fromBody("eventId", "event_id"));
+const byMatchRow = requireEventAccess(fromRow("matches", "matchId"));
+const byBulkMatches = requireEventAccess((req) =>
+    Array.isArray(req.body?.matches) ? req.body.matches.map((m) => m?.event_id) : null
+);
+
 // Generate matches from existing bracket (Idempotent)
 // POST /api/admin/matches/generate/:eventId/:categoryId
-router.post("/generate/:eventId/:categoryId", generateMatchesFromBracket);
+router.post("/generate/:eventId/:categoryId", byEventParam, generateMatchesFromBracket);
 
 // Generate league (round-robin) matches from league blueprint (Idempotent)
 // POST /api/admin/matches/generate-league/:eventId/:categoryId
-router.post("/generate-league/:eventId/:categoryId", generateLeagueMatches);
+router.post("/generate-league/:eventId/:categoryId", byEventParam, generateLeagueMatches);
 
 // Create manual match
 // POST /api/admin/matches
-router.post("/", createMatch);
+router.post("/", byBodyEvent, createMatch);
 
 // Create matches in bulk
 // POST /api/admin/matches/bulk
-router.post("/bulk", createMatchesBulk);
+router.post("/bulk", byBulkMatches, createMatchesBulk);
 
 // Finalize all matches in a round (calculate winners and set COMPLETED)
 // POST /api/admin/matches/:eventId/finalize
-router.post("/:eventId/finalize", finalizeRoundMatches);
+router.post("/:eventId/finalize", byEventParam, finalizeRoundMatches);
 
 // Update selected sets (Best of N) for a bracket round
 // POST /api/admin/matches/round-sets
-router.post("/round-sets/update", updateRoundSelectedSets);
+router.post("/round-sets/update", byBodyEvent, updateRoundSelectedSets);
 
 // Clear ONLY scores for a category (MUST come before full delete route)
 // DELETE /api/admin/matches/category/:eventId/scores?categoryId=xxx&categoryName=xxx&roundName=...
-router.delete("/category/:eventId/scores", clearCategoryScores);
+router.delete("/category/:eventId/scores", byEventParam, clearCategoryScores);
 
 // Delete all matches for a category (MUST come before parameterized routes)
 // DELETE /api/admin/matches/category/:eventId?categoryId=xxx&categoryName=xxx&roundName=...
-router.delete("/category/:eventId", deleteCategoryMatches);
+router.delete("/category/:eventId", byEventParam, deleteCategoryMatches);
 
 // Update score and status
 // PUT /api/admin/matches/:matchId/score
-router.put("/:matchId/score", updateMatchScore);
+router.put("/:matchId/score", byMatchRow, updateMatchScore);
 
 // Delete match (MUST come before GET /:eventId to avoid conflicts)
 // DELETE /api/admin/matches/:matchId
-router.delete("/:matchId", deleteMatch);
+router.delete("/:matchId", byMatchRow, deleteMatch);
 
 // Get matches for event (with optional categoryId query)
 // GET /api/admin/matches/:eventId
-router.get("/:eventId", getMatches);
+router.get("/:eventId", byEventParam, getMatches);
 
 export default router;

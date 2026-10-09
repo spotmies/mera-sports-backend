@@ -4,6 +4,8 @@
 // concurrent individual player registrations to queue behind it.
 process.env.UV_THREADPOOL_SIZE = '16';
 
+import compression from "compression";
+import { invalidateReadCacheOnWrite } from "./middleware/responseCache.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -42,6 +44,8 @@ if (!process.env.JWT_SECRET) {
 const app = express();
 
 app.use(cors());
+// gzip JSON responses: brackets/apartments/event lists are 40-190 KB of repetitive JSON.
+app.use(compression());
 
 // Webhook MUST be mounted before express.json() so it receives the raw body
 // Razorpay signature verification requires the exact raw bytes — JSON parsing corrupts it
@@ -50,6 +54,8 @@ app.post("/api/payment/webhook", express.raw({ type: "application/json" }), razo
 
 app.use(express.json({ limit: "15mb" }));
 app.use(express.urlencoded({ limit: "15mb", extended: true }));
+// After any successful write, drop the public GET cache (see middleware/responseCache.js).
+app.use("/api", invalidateReadCacheOnWrite);
 app.use("/api/player", playerDashboardRoutes);
 app.use("/api/contact", contactRoutes);
 app.use("/api/auth", authRoutes);
