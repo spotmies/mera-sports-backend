@@ -8,12 +8,21 @@ const sanitizeSearch = (s) =>
 // GET /api/admin/players
 export const listPlayers = async (req, res) => {
     try {
-        const { page, limit, search } = req.query;
+        const { page, limit, search, status } = req.query;
 
         const safe = search ? sanitizeSearch(search) : null;
         const searchExpr = safe
-            ? `first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%`
+            ? `first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%,city.ilike.%${safe}%`
             : null;
+
+        // Status narrows the rows only, never the tiles: the tiles keep
+        // describing the whole (searched) set so the segmented control can show
+        // what each segment holds. Pending includes null — older rows have none.
+        const statusExpr = {
+            verified: "verification.eq.verified",
+            rejected: "verification.in.(rejected,failed)",
+            pending: "verification.is.null,verification.not.in.(verified,rejected,failed)",
+        }[status] || null;
 
         /**
          * One definition of "the players we are talking about", reused by the row
@@ -29,7 +38,12 @@ export const listPlayers = async (req, res) => {
             return q;
         };
 
-        let query = scoped({ count: "exact" }).order("created_at", { ascending: false });
+        let query = statusExpr
+            ? supabaseAdmin.from("users").select("*", { count: "exact" }).eq("role", "player")
+                // One `or` holding both groups: search OR-list AND status OR-list.
+                .or(searchExpr ? `and(or(${searchExpr}),or(${statusExpr}))` : statusExpr)
+            : scoped({ count: "exact" });
+        query = query.order("created_at", { ascending: false });
 
         if (page && limit) {
             const pageNum = parseInt(page, 10);
@@ -41,15 +55,19 @@ export const listPlayers = async (req, res) => {
 
         // head: true asks PostgREST for the count alone — the matching rows are
         // never serialised or sent, so these stay cheap as the table grows.
-        const [rowsRes, verifiedRes, rejectedRes] = await Promise.all([
+        const [rowsRes, verifiedRes, rejectedRes, totalRes] = await Promise.all([
             query,
             scoped({ count: "exact", head: true }).eq("verification", "verified"),
             scoped({ count: "exact", head: true }).in("verification", ["rejected", "failed"]),
+            // With a status filter the row count is that segment's size, not the total.
+            statusExpr ? scoped({ count: "exact", head: true }) : null,
         ]);
 
         if (rowsRes.error) throw rowsRes.error;
+        if (totalRes?.error) throw totalRes.error;
 
-        const total = rowsRes.count ?? 0;
+        const rowCount = rowsRes.count ?? 0;
+        const total = totalRes ? totalRes.count ?? 0 : rowCount;
 
         // A failed count must not be reported as zero — that would read as "no
         // verified players" rather than "we could not tell". Fall back to null
@@ -72,7 +90,7 @@ export const listPlayers = async (req, res) => {
         res.json({
             success: true,
             players: (rowsRes.data || []).map(withoutPassword),
-            total_count: total,
+            total_count: rowCount,
             counts: { total, verified, pending, rejected },
         });
     } catch (err) {
@@ -102,15 +120,28 @@ export const getPlayerDetails = async (req, res) => {
 
         const { data: registrations } = await supabaseAdmin
             .from("event_registrations")
-            .select(`*, events(id, name, sport, start_date, start_time, location, venue, categories)`)
+            .select(`*, events(id, name, sport, start_date, end_date, start_time, location, venue)`)
             .eq("player_id", id)
             .order("created_at", { ascending: false });
+
+        // Event dates are plain YYYY-MM-DD, so string comparison orders them.
+        const today = new Date().toISOString().slice(0, 10);
+        const eventStatus = (ev) => {
+            if (!ev?.start_date) return 'upcoming';
+            if (ev.start_date > today) return 'upcoming';
+            return (ev.end_date || ev.start_date) < today ? 'completed' : 'ongoing';
+        };
+        // The categories the player entered live on the registration (strings
+        // or {name}/{category} objects), not on the event.
+        const categoryLabels = (reg) => (Array.isArray(reg.categories) ? reg.categories : [])
+            .map(c => typeof c === 'string' ? c : (c?.name || c?.category || c?.Category || ''))
+            .filter(Boolean);
 
         player.eventsParticipated = registrations ? registrations.map(reg => ({
             eventId: reg.events?.id,
             eventName: reg.events?.name,
             sport: reg.events?.sport,
-            categories: reg.events?.category ? [reg.events.category] : [],
+            categories: categoryLabels(reg),
             registrationId: reg.registration_no,
             paymentStatus: reg.status === 'verified' ? 'paid' : (reg.status === 'rejected' ? 'failed' : 'pending'),
             playerStatus: reg.status,
@@ -118,7 +149,7 @@ export const getPlayerDetails = async (req, res) => {
             eventTime: reg.events?.start_time || "N/A",
             eventLocation: reg.events?.location || "Unknown",
             eventVenue: reg.events?.venue || "Unknown",
-            eventStatus: 'upcoming',
+            eventStatus: eventStatus(reg.events),
             amountPaid: reg.amount_paid
         })) : [];
 

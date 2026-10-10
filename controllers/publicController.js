@@ -251,13 +251,26 @@ export const getPublicSettings = async (req, res) => {
         const cached = await cacheGet("public:settings");
         if (cached) return res.json({ success: true, settings: { ...cached, public_site_url: getPublicSiteUrl() } });
 
-        const { data: settings, error } = await supabaseAdmin
+        // `*` rather than a column list: the site-content columns (address,
+        // social links, hours...) arrive with a migration, and naming them here
+        // would make this whole read fail — phone and email included — on a
+        // database that has not run it yet. Only the public keys are returned.
+        const { data: row, error } = await supabaseAdmin
             .from("platform_settings")
-            .select("platform_name, logo_url, support_email, support_phone, logo_size, registration_config")
+            .select("*")
             .eq("id", 1)
             .maybeSingle();
 
         if (error) throw error;
+
+        const PUBLIC_KEYS = [
+            "platform_name", "logo_url", "support_email", "support_phone", "logo_size", "registration_config",
+            "whatsapp_number", "address", "map_url", "footer_tagline",
+            "instagram_url", "facebook_url", "youtube_url", "x_url",
+        ];
+        const settings = row
+            ? Object.fromEntries(PUBLIC_KEYS.filter((k) => k in row).map((k) => [k, row[k]]))
+            : null;
 
         const payload = settings || { platform_name: 'Sports Paramount', logo_url: '' };
         await cacheSet("public:settings", payload, 120);

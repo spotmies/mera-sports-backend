@@ -532,9 +532,17 @@ export const generateLeagueMatches = async (req, res) => {
                 });
             }
 
+            // Label strategies below only consider configs that carry no id of their
+            // own. A config keyed to another category id is that category's league;
+            // matching it by (base) name generated this category's matches from a
+            // same-named sibling's participants ("U-13 Singles" for "U-13 Doubles").
+            const labelCandidates = categoryId
+                ? allLeagues.filter(l => !l.category_id || String(l.category_id).trim() === "")
+                : allLeagues;
+
             // Strategy 2: Exact category_label match
             if (!leagueConfig && categoryLabel) {
-                leagueConfig = allLeagues.find(l => {
+                leagueConfig = labelCandidates.find(l => {
                     const lLabel = l.category_label;
                     if (!lLabel) return false;
                     // Exact match
@@ -562,7 +570,7 @@ export const generateLeagueMatches = async (req, res) => {
                 };
 
                 const normalizedSearchLabel = normalizeLabel(categoryLabel);
-                leagueConfig = allLeagues.find(l => {
+                leagueConfig = labelCandidates.find(l => {
                     const lLabel = l.category_label;
                     if (!lLabel) return false;
                     const normalizedLLabel = normalizeLabel(lLabel);
@@ -583,7 +591,7 @@ export const generateLeagueMatches = async (req, res) => {
             // Strategy 4: Partial match (fallback - most lenient)
             if (!leagueConfig && categoryLabel) {
                 const normalizedLabel = String(categoryLabel).toLowerCase().trim();
-                leagueConfig = allLeagues.find(l => {
+                leagueConfig = labelCandidates.find(l => {
                     const lLabel = l.category_label;
                     if (!lLabel) return false;
                     const normalizedLLabel = String(lLabel).toLowerCase().trim();

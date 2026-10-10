@@ -5,6 +5,7 @@ import { uploadBase64 } from "../utils/uploadHelper.js";
 import { invalidateMatchesCache } from "../utils/matchesCache.js";
 // The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
 import { fetchCategoryBracketRows, isUuid, resolveMatchCategoryKey } from "../utils/categoryKeys.js";
+import { filterRegistrationsForCategory } from "../utils/categoryMatching.js";
 import { getManageableEventIds } from "../middleware/eventAccess.js";
 
 // Backward-compat: legacy schema has round_name NOT NULL. Our v2 is per-category,
@@ -786,54 +787,10 @@ export const createFullBracketStructure = async (req, res) => {
                 return registrations; // Already filtered to these playerIds
             }
             
-            const label = categoryLabel || bracket.category || "";
-            const parts = label.split(" - ");
-            const drawCatName = parts[0] || "";
-
-            const matchesCategory = (reg) => {
-                const regCats = Array.isArray(reg.categories) ? reg.categories : (reg.category ? [reg.category] : []);
-
-                return regCats.some((c) => {
-                    // Primary: category id exact match (if available)
-                    if (categoryId && isUuid(categoryId) && typeof c === "object" && c.id) {
-                        if (String(c.id) === String(categoryId)) return true;
-                    }
-
-                    const regCatName = (typeof c === "object" ? (c.name || c.category) : String(c || "")).trim();
-                    const regGender = (typeof c === "object" ? c.gender : null) || reg.gender;
-                    const regMatchType = typeof c === "object" ? (c.match_type || c.matchType) : null;
-
-                    const nDrawName = drawCatName.toLowerCase().trim();
-                    const nRegName = regCatName.toLowerCase().trim();
-                    const nameMatch =
-                        nDrawName === nRegName ||
-                        nDrawName.startsWith(nRegName) ||
-                        nDrawName.includes(nRegName) ||
-                        nRegName.includes(nDrawName);
-                    if (!nameMatch) return false;
-
-                    const nameGenderMatch = drawCatName.match(/\((Male|Female|Mixed)\)/i);
-                    const nameGender = nameGenderMatch ? nameGenderMatch[1] : null;
-                    const explicitDrawGender = nameGender || parts[1];
-                    const isDrawMixed =
-                        (explicitDrawGender && explicitDrawGender.toLowerCase() === "mixed") ||
-                        nDrawName.includes("mixed");
-
-                    if (!isDrawMixed && explicitDrawGender && explicitDrawGender !== "Open") {
-                        const pGender = (regGender || "").toLowerCase();
-                        const dGender = String(explicitDrawGender || "").toLowerCase();
-                        if (pGender && !pGender.includes("mixed") && pGender !== dGender) return false;
-                    }
-
-                    const drawMatchType = parts[2];
-                    if (drawMatchType && regMatchType) {
-                        if (drawMatchType.toLowerCase() !== String(regMatchType).toLowerCase()) return false;
-                    }
-                    return true;
-                });
-            };
-
-            return registrations.filter(matchesCategory);
+            // Id-decisive matching (utils/categoryMatching.js): a numeric category id
+            // used to fall through to substring name matching, which mixed entrants of
+            // same-named categories and sized the bracket off the wrong player count.
+            return filterRegistrationsForCategory(registrations, categoryId || req.body?.categoryId, categoryLabel || bracket.category || "");
         })();
 
         // Extract players (teams or individuals)
@@ -2347,63 +2304,8 @@ export const addBracketRound = async (req, res) => {
                     const { data: registrations, error: regError } = await registrationsQuery;
 
                     if (!regError && registrations && registrations.length > 0) {
-                        // Filter registrations by category - match frontend logic
-                        const parts = categoryLabel ? categoryLabel.split(" - ") : [];
-                        const drawCatName = parts[0] || "";
-
-                        const categoryRegistrations = registrations.filter(reg => {
-                            const regCats = Array.isArray(reg.categories) ? reg.categories : (reg.category ? [reg.category] : []);
-
-                            return regCats.some(cat => {
-                                // PRIMARY CHECK: ID Match
-                                if (categoryId && isUuid(categoryId)) {
-                                    const catId = typeof cat === 'object' ? (cat?.id || null) : cat;
-                                    if (catId && String(catId) === String(categoryId)) {
-                                        return true;
-                                    }
-                                }
-
-                                // SECONDARY CHECK: Fuzzy String Match
-                                const regCatNameRaw = typeof cat === "object" ? (cat?.name || cat?.category || null) : String(cat || "");
-                                const regCatName = regCatNameRaw ? String(regCatNameRaw).trim() : "";
-                                if (!regCatName) return false;
-
-                                const regGender = (typeof cat === "object" ? (cat?.gender || null) : null) || reg.gender;
-                                const regMatchType = typeof cat === "object" ? (cat?.match_type || cat?.matchType || null) : null;
-
-                                const nDrawName = drawCatName.toLowerCase().trim();
-                                const nRegName = regCatName.toLowerCase().trim();
-
-                                const nameMatch = nDrawName === nRegName ||
-                                    nDrawName.startsWith(nRegName) ||
-                                    nDrawName.includes(nRegName) ||
-                                    nRegName.includes(nDrawName);
-
-                                if (!nameMatch) return false;
-
-                                // Gender matching
-                                const nameGenderMatch = drawCatName.match(/\((Male|Female|Mixed)\)/i);
-                                const nameGender = nameGenderMatch ? nameGenderMatch[1] : null;
-                                const explicitDrawGender = nameGender || (parts[1] || "");
-
-                                const isDrawMixed = (explicitDrawGender && explicitDrawGender.toLowerCase() === "mixed") ||
-                                    nDrawName.includes("mixed");
-
-                                if (!isDrawMixed && explicitDrawGender && explicitDrawGender !== "Open") {
-                                    const pGender = (regGender || "").toLowerCase();
-                                    const dGender = String(explicitDrawGender || "").toLowerCase();
-                                    if (pGender && !pGender.includes("mixed") && pGender !== dGender) return false;
-                                }
-
-                                // Match type matching
-                                const drawMatchType = parts[2];
-                                if (drawMatchType && regMatchType) {
-                                    if (drawMatchType.toLowerCase() !== String(regMatchType).toLowerCase()) return false;
-                                }
-
-                                return true;
-                            });
-                        });
+                        // Same id-decisive rule as the frontend draws (utils/categoryMatching.js).
+                        const categoryRegistrations = filterRegistrationsForCategory(registrations, categoryId || req.body?.categoryId, categoryLabel);
 
                         // Extract players from registrations - handle teams and individual players
                         const players = [];
