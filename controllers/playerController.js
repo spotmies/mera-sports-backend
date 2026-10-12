@@ -6,6 +6,7 @@ import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { dashboardCacheKey, DASHBOARD_CACHE_TTL, invalidateDashboardCache } from "../utils/dashboardCache.js";
 import { calculateAge, MINOR_AGE_LIMIT, resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
+import { isTeamMatchType } from "../utils/registrationRules.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 
@@ -237,7 +238,7 @@ export const getPlayerDashboard = async (req, res) => {
         relevantTeamIds = [...new Set(relevantTeamIds)];
 
         // Fetch Registrations
-        let query = supabaseAdmin.from("event_registrations").select(`*, events ( id, public_id, name, sport, start_date, location )`).order('created_at', { ascending: false });
+        let query = supabaseAdmin.from("event_registrations").select(`*, events ( id, public_id, name, sport, start_date, end_date, location )`).order('created_at', { ascending: false });
         if (relevantTeamIds.length > 0) {
             query = query.or(`player_id.eq.${userId},team_id.in.(${relevantTeamIds.join(',')})`);
         } else {
@@ -281,8 +282,19 @@ export const getPlayerDashboard = async (req, res) => {
                     );
                 }
             }
+            // A partner/team-mate plays only the Doubles/Team categories of a
+            // row their captain paid for. Rows from before per-category teams
+            // could list the captain's singles alongside, and showing those
+            // marked the partner as "registered" in a draw they were never in.
+            const isPayer = reg.player_id === userId;
+            let categories = reg.categories;
+            if (!isPayer && Array.isArray(categories)) {
+                categories = categories.filter((c) =>
+                    !(c && typeof c === "object" && c.matchType) || isTeamMatchType(c.matchType));
+            }
             return {
                 ...reg,
+                categories,
                 events: reg.events
                     ? { ...reg.events, public_id: getPublicEventId(reg.events) }
                     : reg.events,
@@ -290,7 +302,10 @@ export const getPlayerDashboard = async (req, res) => {
                 team_details: teamDetails,
                 is_team_member: isTeamMember,
                 is_captain: isCaptain,
-                registered_by: reg.player_id === userId ? 'self' : 'team'
+                registered_by: isPayer ? 'self' : 'team',
+                // Who entered this player, for "Registered by <captain>" on the
+                // event and dashboard pages. Null when they registered themselves.
+                registered_by_name: isPayer ? null : (teamDetails?.captain_name || null),
             };
         });
 

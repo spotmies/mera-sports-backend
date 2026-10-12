@@ -29,7 +29,8 @@ import {
     getAllCategories,
     getBrackets,
     getEventNews,
-    getRegistrations, getTransactions,
+    getRegistrations,
+    getRegistrationFilters, getTransactions,
     rejectTransaction,
     saveBracket,
     updateEventNews,
@@ -112,6 +113,8 @@ router.post("/settings", superOnly, updateSettings);
 /* ================= EVENT MANAGEMENT (GLOBAL) ================= */
 router.get("/all-categories", verifyAdmin, getAllCategories);
 router.get("/registrations", verifyAdmin, getRegistrations);
+// Event/category dropdown options for the registrations page
+router.get("/registrations/filters", verifyAdmin, getRegistrationFilters);
 router.get("/transactions", verifyAdmin, getTransactions);
 
 /* ================= TRANSACTION ACTIONS ================= */

@@ -399,15 +399,21 @@ export const getDashboardStats = async (req, res) => {
             .limit(5);
 
         // Payments awaiting review (same statuses the Transactions page treats as pending)
-        const { count: pendingTransactionsCount } = noEvents ? { count: 0 } : await forScope(supabaseAdmin
-            .from("event_registrations")
-            .select("*", { count: 'exact', head: true })
-            .in("status", ["pending_verification", "pending", "payment_pending", "registered"]));
+        // Counted as PAYMENTS, not rows: one payment writes a registration row
+        // per category entry, all sharing transaction_id. Rows with no
+        // transaction (legacy) count as their own payment.
+        const distinctPayments = (rows) => new Set((rows || []).map((r) => r.transaction_id || `row:${r.id}`)).size;
 
-        // Revenue
-        const { data: approvedTxns } = noEvents ? { data: [] } : await forScope(supabaseAdmin.from("event_registrations").select("amount_paid").eq("status", "verified"));
+        const { data: pendingRows } = noEvents ? { data: [] } : await forScope(supabaseAdmin
+            .from("event_registrations")
+            .select("id, transaction_id")
+            .in("status", ["pending_verification", "pending", "payment_pending", "registered"]));
+        const pendingTransactionsCount = distinctPayments(pendingRows);
+
+        // Revenue — summed over rows (each row holds its own share of the payment).
+        const { data: approvedTxns } = noEvents ? { data: [] } : await forScope(supabaseAdmin.from("event_registrations").select("id, transaction_id, amount_paid").eq("status", "verified"));
         const totalRevenue = approvedTxns?.reduce((sum, txn) => sum + (Number(txn.amount_paid) || 0), 0) || 0;
-        const totalTransactionsCount = approvedTxns?.length || 0;
+        const totalTransactionsCount = distinctPayments(approvedTxns);
 
         res.json({
             success: true,

@@ -254,27 +254,98 @@ export const playerPaths = {
 
     /* ── payments ────────────────────────────────────────────────────────── */
 
+    "/api/payment/check-teams": {
+        post: {
+            tags: ["Payments"],
+            summary: "Which of my saved teams can enter this category",
+            description:
+                "Player token only. Runs the full registration rules (each member's age/gender, pair/team size, nobody already entered in the category) for every team the caller captains, against one category. Feeds the partner/team chooser.",
+            security: auth,
+            requestBody: jsonBody(
+                obj(
+                    {
+                        eventId: { oneOf: [{ type: "integer" }, { type: "string" }], example: 13 },
+                        categoryId: { type: "string", example: "1712345678901" },
+                    },
+                    ["eventId", "categoryId"]
+                )
+            ),
+            responses: {
+                ...okEnvelope("One verdict per saved team.", {
+                    teams: {
+                        type: "array",
+                        items: obj({
+                            teamId: { type: "string", format: "uuid" },
+                            eligible: { type: "boolean" },
+                            reason: { type: "string", nullable: true },
+                            code: { type: "string", nullable: true },
+                        }),
+                    },
+                }),
+                ...errors(400, 401, 403, 404, 500),
+            },
+        },
+    },
+    "/api/payment/validate-registration": {
+        post: {
+            tags: ["Payments"],
+            summary: "Check a registration against every rule without paying",
+            description:
+                "Player token only. Runs the same checks order creation and manual payment apply: closed categories; age/gender of the payer AND of every partner/team member; only the team's captain may register it; Doubles = captain + exactly 1 partner, Team within the category's min/max; nobody (payer or member) already holding a place in that category. The player app calls it before showing the payment step. 400 bodies carry `code` (e.g. ALREADY_REGISTERED, NOT_TEAM_CAPTAIN, TEAM_SIZE, NOT_ELIGIBLE, TEAM_REQUIRED) and `categoryId`.",
+            security: auth,
+            requestBody: jsonBody(
+                obj(
+                    {
+                        eventId: { oneOf: [{ type: "integer" }, { type: "string" }], example: 13 },
+                        entries: {
+                            type: "array",
+                            description: "Each category being entered, with the pair/squad entered in it (null for singles).",
+                            items: obj({
+                                categoryId: { type: "string", example: "1712345678901" },
+                                teamId: { type: "string", format: "uuid", nullable: true },
+                            }, ["categoryId"]),
+                        },
+                    },
+                    ["eventId", "entries"]
+                )
+            ),
+            responses: {
+                ...okEnvelope("Every entry is acceptable.", {
+                    fee: { type: "number", example: 1700 },
+                    entries: { type: "array", items: { type: "object", additionalProperties: true } },
+                }),
+                ...errors(400, 401, 403, 404, 500),
+            },
+        },
+    },
     "/api/payment/create-razorpay-order": {
         post: {
             tags: ["Payments"],
             summary: "Create a Razorpay order for an event registration",
             description:
-                "Player token only (admins get 403). The server recomputes the fee from the event's categories and rejects a mismatched `amount` with 400 — you cannot register cheaper by editing the request.",
+                "Player token only (admins get 403). Applies every rule of /validate-registration, then recomputes the fee from the event's categories and rejects a mismatched `amount` with 400 — you cannot register cheaper by editing the request. One payment can enter several categories, each Doubles/Team category with its own team; it is stored as one registration row per team entry plus one for the singles, all under one registration number.",
             security: auth,
             requestBody: jsonBody(
                 obj(
                     {
                         eventId: { oneOf: [{ type: "integer" }, { type: "string" }], example: 13 },
                         amount: { type: "number", description: "Rupees. Must match the server-side total.", example: 500 },
+                        entries: {
+                            type: "array",
+                            description: "Each category being entered, with the pair/squad entered in it (null for singles).",
+                            items: obj({
+                                categoryId: { type: "string", example: "1712345678901" },
+                                teamId: { type: "string", format: "uuid", nullable: true },
+                            }, ["categoryId"]),
+                        },
                         categories: {
                             type: "array",
-                            description: "The categories being entered.",
+                            description: "Legacy clients: the categories being entered, with one `teamId` applied to their Doubles/Team categories. Ignored when `entries` is sent.",
                             items: { type: "object", additionalProperties: true },
                         },
-                        teamMemberCount: { type: "integer", example: 5, description: "Squad size at order time. Recorded on the order notes for support lookups only — it does not affect the amount charged (a category's entry fee covers the whole pair/team)." },
-                        teamId: { type: "string", format: "uuid", nullable: true },
+                        teamId: { type: "string", format: "uuid", nullable: true, description: "Legacy clients only — see `categories`." },
                     },
-                    ["eventId", "categories"]
+                    ["eventId"]
                 )
             ),
             responses: {

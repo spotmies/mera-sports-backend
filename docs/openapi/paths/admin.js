@@ -329,16 +329,37 @@ export const adminPaths = {
         get: {
             tags: ["Admin · Registrations"],
             summary: "List registrations",
-            description: "Scope with `eventId`, or with `admin_id` to see only the events that admin owns or is assigned to.",
+            description: "Scope with `eventId`, or with `admin_id` to see only the events that admin owns or is assigned to. All filters apply to every registration BEFORE paging, and `total_count` is the filtered total.",
             security: auth,
             parameters: [
                 { name: "eventId", in: "query", schema: { type: "string", example: "13" } },
                 { name: "admin_id", in: "query", schema: { type: "string", format: "uuid" } },
+                { name: "search", in: "query", schema: { type: "string" }, description: "Player name, player id, registration no or event name (substring, case-insensitive)." },
+                { name: "status", in: "query", schema: { type: "string", enum: ["all", "pending", "verified", "rejected"] }, description: "`pending` covers pending, payment_pending, registered, pending_verification and Submitted." },
+                { name: "category", in: "query", schema: { type: "string", example: "Adults (Male) - Doubles" }, description: "Category label, or a bare category name." },
+                { name: "apartment", in: "query", schema: { type: "string" } },
                 p("Page"),
                 p("Limit"),
             ],
             responses: {
                 ...okEnvelope("Registrations.", { registrations: arrayOf("Registration"), total_count: { type: "integer" } }),
+                ...errors(401, 403, 500),
+            },
+        },
+    },
+
+    "/api/admin/registrations/filters": {
+        get: {
+            tags: ["Admin · Registrations"],
+            summary: "Event and category options for the registrations filters",
+            description: "Every event the caller can see (scoped like the list), plus the category labels configured on them.",
+            security: auth,
+            parameters: [{ name: "admin_id", in: "query", schema: { type: "string", format: "uuid" } }],
+            responses: {
+                ...okEnvelope("Filter options.", {
+                    events: { type: "array", items: { type: "object", additionalProperties: true } },
+                    categories: { type: "array", items: { type: "string" } },
+                }),
                 ...errors(401, 403, 500),
             },
         },

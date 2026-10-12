@@ -12,6 +12,15 @@ import { isReceiptEligible } from "../utils/approvalNotifications.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { acceptsManual, acceptsRazorpay } from "../utils/paymentGateway.js";
 import { assertCommunityAllowed } from "../utils/communityRestriction.js";
+import {
+    allocateAmount,
+    badRequestBody,
+    entriesFromNotes,
+    entriesFromRequest,
+    groupsForPaidOrder,
+    packEntriesIntoNotes,
+    validateRegistrationEntries,
+} from "../utils/registrationRules.js";
 
 // These routes accept any signed token, so staff accounts must be turned away
 // explicitly. Listing staff roles (rather than requiring 'player') keeps older
@@ -19,189 +28,8 @@ import { assertCommunityAllowed } from "../utils/communityRestriction.js";
 const STAFF_ROLES = new Set(["admin", "superadmin", "institutehead"]);
 const isStaffRole = (role) => STAFF_ROLES.has(role);
 
-// ── Server-side fee computation ──────────────────────────────────────────────
-// The fee shown in the player app is derived from events.categories (jsonb).
-// It is recomputed here from the same data so the charged amount can never be
-// tampered with from the browser. Mirrors EventRegistration.tsx fee logic.
-const DEFAULT_CATEGORY_FEE = 500; // player-app fallback when a category has no fee
-
-/**
- * Parses a configured entry fee. Returns null when no fee is recorded, so a
- * genuine 0 (free category) stays distinguishable from "not set" — `Number(x)
- * || null` collapsed both to null and silently made free categories billable.
- * An empty string is "not set", not zero.
- */
-const parseEntryFee = (value) => {
-    if (value === null || value === undefined) return null;
-    const raw = String(value).trim();
-    if (raw === "") return null;
-    const parsed = Number(raw);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
-};
-
-const normalizeEventCategories = (event) => {
-    const raw = Array.isArray(event?.categories) ? event.categories : [];
-    return raw.map((c, idx) => {
-        const isObj = c && typeof c === "object";
-        const name = (isObj ? (c.category || c.Category || c.name || "Unknown") : String(c)).trim();
-        return {
-            id: (isObj && c.id) || `cat-${idx}`,
-            name,
-            gender: (isObj && c.gender) || "Mixed",
-            matchType: (isObj && c.matchType) || "Singles",
-            entryFee: isObj ? parseEntryFee(c.entryFee ?? c.fee) : null,
-            // Carried through so assertCategoriesOpen can see the admin's
-            // manual close switch. Kept on the normalized object rather than
-            // re-read from the raw array so both live behind one lookup.
-            registrationClosed: isObj ? c.registrationClosed === true : false,
-        };
-    });
-};
-
-// Same matching rules the player app uses when it maps selected ids to categories
-const findEventCategory = (normalizedCategories, catId) =>
-    normalizedCategories.find(
-        (c) => c.id === catId || `${c.name}-${c.gender}` === catId || c.name === catId
-    ) || null;
-
-// The category's entry fee is the price of ONE entry into that category, whatever
-// an "entry" means for its match type: one player for Singles, one pair for
-// Doubles, one squad for Team. It is never multiplied by the number of people on
-// the entry — a ₹1400 Doubles category costs ₹1400 for the pair, not ₹2800, and a
-// ₹1400 9-a-side Team category costs ₹1400 for the squad, not ₹12,600.
-//
-// Returns { fee, categoryObjects }. Throws (statusCode 400) on unknown category ids.
-const computeRegistrationFee = (event, requestedCategoryIds) => {
-    const normalized = normalizeEventCategories(event);
-    // `??` not `||` — a first category priced at 0 must not fall through to the
-    // default fee.
-    const baseFee = normalized[0]?.entryFee ?? DEFAULT_CATEGORY_FEE;
-
-    let feeSum = 0;
-    const categoryObjects = [];
-
-    for (const rawId of requestedCategoryIds) {
-        const catId = String(rawId && typeof rawId === "object" ? rawId.id : rawId);
-        const cat = findEventCategory(normalized, catId);
-        if (!cat) {
-            const err = new Error(`Unknown category for this event: ${catId}`);
-            err.statusCode = 400;
-            throw err;
-        }
-        const fee = cat.entryFee ?? baseFee;
-        feeSum += fee;
-        // Deliberately NOT spreading `cat` — these objects are persisted onto
-        // event_registrations.categories, so a transient flag like
-        // registrationClosed would be frozen into the row and read back years
-        // later as if it described the registration.
-        categoryObjects.push({ id: cat.id, name: cat.name, gender: cat.gender, fee, matchType: cat.matchType });
-    }
-
-    // One entry fee per selected category. Team size is deliberately not a factor.
-    return { fee: feeSum, categoryObjects };
-};
-
-// ── Registration window (server-side mirror of the player app's check) ───────
-/**
- * Throws a 400 when a requested category has been closed by the organiser.
- *
- * The admin's close switch is what makes this necessary: it can flip while a
- * player is mid-checkout, so the player app's own check — made when the page
- * loaded — is already stale by the time the request lands here. A tab left open
- * since the morning would otherwise pay into a category that shut at 2pm.
- *
- * Only the manual flag is enforced. The `lastDateToRegister` deadline has never
- * been checked server-side on this path, and quietly starting to reject on it
- * here would change behaviour for every event, not just the ones an organiser
- * has closed by hand. That gap is worth closing on its own terms.
- */
-const assertCategoriesOpen = (event, requestedCategoryIds) => {
-    const normalized = normalizeEventCategories(event);
-    for (const rawId of requestedCategoryIds) {
-        const catId = String(rawId && typeof rawId === "object" ? rawId.id : rawId);
-        const cat = findEventCategory(normalized, catId);
-        if (cat?.registrationClosed) {
-            const err = new Error(`Registration for "${cat.name}" has been closed by the organiser`);
-            err.statusCode = 400;
-            // Machine-readable so the player app can tell this apart from the
-            // other 400s and re-read the event, instead of leaving an open-
-            // looking tile behind a "category is closed" toast.
-            err.code = "CATEGORY_CLOSED";
-            throw err;
-        }
-    }
-};
-
-// ── Category eligibility (server-side mirror of the player app's check) ──────
-// The player app disables ineligible categories, but that is browser-side only.
-// Without this the gate is cosmetic: a crafted request could enter any category.
-//
-// Age rules are encoded in the category NAME, exactly as the player app parses
-// them: "U-15" => max age 15, "Above 40" => min age 40, "All" => unrestricted.
-const parseCategoryAgeRules = (name) => {
-    const label = String(name || "");
-    const maxMatch = label.match(/(?:U|Under)[-\s]?(\d+)/i);
-    const minMatch = label.match(/(?:Above|Over)\s*(\d+)|\b(\d+)\s*\+/i);
-    return {
-        ageLimit: maxMatch ? Number.parseInt(maxMatch[1], 10) : undefined,
-        minAge: minMatch ? Number.parseInt(minMatch[1] ?? minMatch[2], 10) : undefined,
-    };
-};
-
-// Returns the player's birth year, or null when nothing usable is on file.
-const resolveBirthYear = (user, currentYear) => {
-    if (user?.dob) {
-        const parsed = new Date(user.dob);
-        if (!Number.isNaN(parsed.getTime())) return parsed.getFullYear();
-    }
-    const age = Number(user?.age);
-    if (Number.isFinite(age) && age > 0) return currentYear - age;
-    return null;
-};
-
-/**
- * Throws a 400 if the player may not enter one of the requested categories.
- *
- * Mirrors the player app's policy deliberately, including the lenient part: a
- * player with no date of birth or age on file is allowed through, because most
- * accounts have neither and blocking them would stop registration entirely.
- * Tighten this only once DOB collection is in place.
- */
-const assertPlayerEligible = (user, categoryObjects) => {
-    const playerGender = String(user?.gender || "").toLowerCase();
-    const currentYear = new Date().getFullYear();
-    const birthYear = resolveBirthYear(user, currentYear);
-
-    for (const cat of categoryObjects) {
-        const categoryGender = String(cat.gender || "Mixed").toLowerCase();
-        if (playerGender && categoryGender !== "mixed" && categoryGender !== "open") {
-            if (categoryGender !== playerGender) {
-                const err = new Error(`You are not eligible for "${cat.name}" (gender restricted)`);
-                err.statusCode = 400;
-                throw err;
-            }
-        }
-
-        if (birthYear === null) continue; // no age on file — see note above
-
-        const { ageLimit, minAge } = parseCategoryAgeRules(cat.name);
-        // "Under 9" is strictly under 9 — the player must not turn 9 this year,
-        // so the earliest allowed birth year is (currentYear - ageLimit + 1).
-        // In 2026: U-9 => 2018, U-12 => 2015, U-15 => 2012.
-        if (ageLimit !== undefined && birthYear < currentYear - ageLimit + 1) {
-            const err = new Error(
-                `You are not eligible for "${cat.name}" — born ${currentYear - ageLimit + 1} or later required`
-            );
-            err.statusCode = 400;
-            throw err;
-        }
-        if (minAge !== undefined && birthYear > currentYear - minAge) {
-            const err = new Error(`You are not eligible for "${cat.name}" (minimum age ${minAge})`);
-            err.statusCode = 400;
-            throw err;
-        }
-    }
-};
+// Fee, eligibility, team and duplicate-entry rules live in utils/registrationRules.js
+// so every writer below applies the same ones.
 
 const getRazorpayInstance = () => {
     const { RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET } = process.env;
@@ -218,26 +46,49 @@ const getRazorpayInstance = () => {
 // reload). They race, so every path goes through these helpers and treats an
 // already-recorded order as success rather than an error.
 
-// Rebuild category objects from the ids stored in the order notes, using the
-// event's own category definitions so fees are authoritative.
-const rebuildCategoriesFromNotes = async (notes) => {
+// Rebuild the rows to store from the order notes, using the event's own
+// category definitions so fees are authoritative. `fallback` is used only when
+// the notes carry no categories at all (very old orders, or an oversized legacy
+// catIds that was dropped at order time): it is the client's own selection,
+// stored as one row, exactly as before.
+const rebuildGroupsFromNotes = async (notes, fallback = null) => {
     try {
-        if (notes?.catIds) {
+        const entries = entriesFromNotes(notes);
+        if (entries.length > 0) {
             const { data: event } = await supabaseAdmin
                 .from("events")
                 .select("id, categories")
                 .eq("id", notes.eventId)
                 .maybeSingle();
             if (event) {
-                return computeRegistrationFee(event, String(notes.catIds).split(",")).categoryObjects;
+                const groups = groupsForPaidOrder(event, entries);
+                if (groups.length > 0) return groups;
             }
         } else if (notes?.categories) {
-            return JSON.parse(notes.categories);
+            return [{ teamId: notes.teamId || null, categories: JSON.parse(notes.categories), fee: 0 }];
         }
     } catch (catErr) {
         console.warn("Could not reconstruct categories from order notes:", catErr.message);
     }
-    return [];
+    if (fallback) return [{ teamId: fallback.teamId || null, categories: fallback.categories || [], fee: 0 }];
+    return [{ teamId: notes?.teamId || null, categories: [], fee: 0 }];
+};
+
+/**
+ * The registration a payment produced, as one record. A payment writes one row
+ * per Doubles/Team entry plus one for the singles; they share the transaction
+ * and registration number, so callers see the summed amount and all categories.
+ */
+const summarizeRegistrationRows = (rows) => {
+    if (!rows || rows.length === 0) return null;
+    const first = rows[0];
+    return {
+        registration_no: first.registration_no,
+        player_id: first.player_id,
+        event_id: first.event_id,
+        amount_paid: rows.reduce((sum, r) => sum + (Number(r.amount_paid) || 0), 0),
+        categories: rows.flatMap((r) => (Array.isArray(r.categories) ? r.categories : (r.categories ? [r.categories] : []))),
+    };
 };
 
 // Look up whatever has already been recorded for a Razorpay order.
@@ -250,19 +101,55 @@ const findExistingOrderRecord = async (orderId) => {
     if (txErr) throw txErr;
     if (!transaction) return null;
 
-    const { data: registration, error: regErr } = await supabaseAdmin
+    const { data: rows, error: regErr } = await supabaseAdmin
         .from("event_registrations")
-        .select("registration_no, player_id, event_id, amount_paid")
-        .eq("transaction_id", transaction.id)
-        .maybeSingle();
+        .select("registration_no, player_id, event_id, amount_paid, categories")
+        .eq("transaction_id", transaction.id);
     if (regErr) throw regErr;
 
-    return { transaction, registration: registration || null };
+    return { transaction, registration: summarizeRegistrationRows(rows) };
 };
 
-// Insert transaction + verified registration as one unit (rolls the transaction
-// back if the registration insert fails, so a retry can re-attempt both).
-const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId, amount, categories, teamId }) => {
+/**
+ * Write the registration rows for one payment. They go in as a single INSERT
+ * (atomic in Postgres), sharing the transaction and registration number. If the
+ * insert fails the transaction row is removed, so a retry re-attempts both.
+ * Returns { transaction, registrationNo, rows }.
+ */
+const insertRegistrationRows = async ({ transaction, userId, eventId, groups, rowFields }) => {
+    const registrationNo = `REG-${Date.now()}`;
+    const rows = groups.map((g) => ({
+        event_id: eventId,
+        player_id: userId,
+        registration_no: registrationNo,
+        categories: g.categories,
+        amount_paid: g.fee,
+        transaction_id: transaction.id,
+        team_id: g.teamId || null,
+        ...rowFields,
+    }));
+
+    const { error: regError } = await supabaseAdmin.from("event_registrations").insert(rows);
+    if (regError) {
+        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+        throw regError;
+    }
+
+    // The player's dashboard is cached for 15 minutes. Without this the person
+    // who just paid — and every partner/team-mate they entered — keeps seeing
+    // "No events found" until the TTL lapses, while the admin screen already
+    // shows the registration.
+    const teamIds = [...new Set(groups.map((g) => g.teamId).filter(Boolean))];
+    await Promise.allSettled([
+        invalidateDashboardForRegistration({ userId }),
+        ...teamIds.map((teamId) => invalidateDashboardForRegistration({ userId, teamId })),
+    ]);
+
+    return { transaction, registrationNo, rows };
+};
+
+// Insert transaction + verified registration rows as one unit.
+const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId, amount, groups }) => {
     const { data: transaction, error: txError } = await supabaseAdmin.from("transactions").insert({
         order_id: orderId,
         payment_id: paymentId,
@@ -274,33 +161,20 @@ const recordVerifiedRegistration = async ({ orderId, paymentId, userId, eventId,
 
     if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
 
-    const registrationNo = `REG-${Date.now()}`;
-    const { error: regError } = await supabaseAdmin.from("event_registrations").insert({
-        event_id: eventId,
-        player_id: userId,
-        registration_no: registrationNo,
-        categories,
-        amount_paid: amount,
-        transaction_id: transaction.id,
-        team_id: teamId || null,
-        status: "verified",
+    return insertRegistrationRows({
+        transaction,
+        userId,
+        eventId,
+        groups: allocateAmount(groups, amount),
+        rowFields: { status: "verified" },
     });
-
-    if (regError) {
-        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
-        throw regError;
-    }
-
-    // The player's dashboard is cached for 15 minutes. Without this the person
-    // who just paid keeps seeing "No events found" until the TTL lapses, while
-    // the admin screen already shows their verified registration.
-    await invalidateDashboardForRegistration({ userId, teamId });
-
-    return { transaction, registrationNo };
 };
 
+const allCategoriesOf = (groups) => groups.flatMap((g) => g.categories || []);
+
 // Email + WhatsApp + team notifications — fire-and-forget, never blocks the response.
-const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amount, categories, teamId, paymentId, paymentMode = "razorpay", status = "Confirmed" }) => {
+const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amount, groups, paymentId, paymentMode = "razorpay", status = "Confirmed" }) => {
+    const categories = allCategoriesOf(groups);
     (async () => {
         try {
             const { data: user } = await supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", userId).single();
@@ -329,19 +203,27 @@ const dispatchRegistrationSideEffects = ({ userId, eventId, registrationNo, amou
         } catch (e) { console.error("Email/WhatsApp Error:", e); }
     })();
 
-    if (teamId) {
-        notifyTeamMembersOfRegistration(teamId, eventId).catch(e =>
+    // Each partner / squad is told which category they were entered in.
+    for (const g of groups) {
+        if (!g.teamId) continue;
+        notifyTeamMembersOfRegistration(g.teamId, eventId, g.categories, status).catch(e =>
             console.error("Team registration notification error:", e)
         );
     }
 };
+
+const describeCategories = (categories) =>
+    (categories || [])
+        .map((c) => (c && typeof c === "object" ? `${c.name}${c.gender ? ` (${c.gender})` : ""}${c.matchType ? ` ${c.matchType}` : ""}` : String(c)))
+        .filter(Boolean)
+        .join(", ");
 
 /**
  * Batch-resolve team member UUIDs and notify them of event registration.
  * Uses a single prefetch query instead of sequential per-member lookups,
  * and Promise.allSettled for safe parallel notification delivery.
  */
-async function notifyTeamMembersOfRegistration(teamId, eventId) {
+async function notifyTeamMembersOfRegistration(teamId, eventId, categories = [], status = "Confirmed") {
     try {
         // Fetch team and event data in parallel
         const [teamResult, eventResult] = await Promise.all([
@@ -355,15 +237,21 @@ async function notifyTeamMembersOfRegistration(teamId, eventId) {
 
         const eventName = event?.name || 'an event';
         const captainName = team.captain_name || 'Your captain';
+        const categoryText = describeCategories(categories);
+        const paymentText = isReceiptEligible(status)
+            ? "The entry fee is paid."
+            : "Payment is awaiting the organiser's verification.";
 
-        // Batch-resolve all member UUIDs in a single query
+        // Batch-resolve all member UUIDs in a single query. Masked mobiles
+        // ("XXXXXX4785", stored by the Player-ID lookup) are skipped — they can
+        // never match and would only break the filter.
         const playerIds = [];
         const mobiles = [];
         const knownIds = [];
         for (const m of team.members) {
             if (m.id) knownIds.push(m.id);
             if (m.player_id) playerIds.push(m.player_id.toUpperCase());
-            if (m.mobile) mobiles.push(m.mobile);
+            if (m.mobile && /^\d{10,15}$/.test(String(m.mobile))) mobiles.push(m.mobile);
         }
 
         const orFilters = [];
@@ -398,8 +286,9 @@ async function notifyTeamMembersOfRegistration(teamId, eventId) {
             return createNotification(
                 userId,
                 'Team Event Registration',
-                `${captainName} registered your team "${team.team_name}" for "${eventName}".`,
-                'info'
+                `${captainName} (captain) registered you with "${team.team_name}" for "${eventName}"${categoryText ? ` — ${categoryText}` : ''}. ${paymentText}`,
+                'info',
+                '/dashboard?tab=events'
             );
         });
 
@@ -414,14 +303,107 @@ async function notifyTeamMembersOfRegistration(teamId, eventId) {
     }
 }
 
-// POST /api/payment/create-razorpay-order
-export const createRazorpayOrder = async (req, res) => {
+/**
+ * Load the paying player and run every registration rule for this request.
+ * Shared by the validate endpoint, order creation and manual payment so the
+ * player is told about a problem before paying, by the same rules that guard
+ * the write. Throws statusCode-400 errors.
+ */
+const validateRequestForUser = async (event, userId, body) => {
+    const { data: payingUser } = await supabaseAdmin
+        .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
+    const result = await validateRegistrationEntries({
+        event,
+        userId,
+        payingUser,
+        entries: entriesFromRequest(body),
+    });
+    // Community-restricted events: checked before anything is paid, so a
+    // player outside the allowed communities is never charged.
+    await assertCommunityAllowed(event, payingUser);
+    return result;
+};
+
+// POST /api/payment/check-teams  { eventId, categoryId }
+// Which of the player's saved teams can be entered in this category, and why
+// not for the rest — the full registration rules (each member's age/gender,
+// pair/team size, nobody already entered in the category), run per team. Feeds
+// the partner/team chooser so an ineligible saved team is greyed out with the
+// reason before it is picked, not after Continue.
+export const checkTeamsForCategory = async (req, res) => {
     try {
-        const { eventId, amount, categories, teamMemberCount, teamId } = req.body;
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
         if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
-        if (!eventId || !Array.isArray(categories) || categories.length === 0) {
+        const { eventId, categoryId } = req.body || {};
+        if (!eventId || !categoryId) return res.status(400).json({ message: "eventId and categoryId are required" });
+
+        const event = await resolveEventByIdentifier(eventId, "*");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        const [{ data: payingUser }, { data: teams, error: teamsErr }] = await Promise.all([
+            supabaseAdmin.from("users").select("gender, dob, age").eq("id", userId).maybeSingle(),
+            supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId)
+                .or("status.is.null,status.neq.deleted"),
+        ]);
+        if (teamsErr) throw teamsErr;
+
+        const results = [];
+        for (const team of teams || []) {
+            try {
+                await validateRegistrationEntries({
+                    event, userId, payingUser,
+                    entries: [{ categoryId: String(categoryId), teamId: team.id }],
+                });
+                results.push({ teamId: team.id, eligible: true });
+            } catch (err) {
+                if (err.statusCode !== 400) throw err;
+                results.push({ teamId: team.id, eligible: false, reason: err.message, code: err.code || null });
+            }
+        }
+        res.json({ success: true, teams: results });
+    } catch (err) {
+        console.error("Check Teams Error:", err);
+        res.status(500).json({ message: "Could not check your teams" });
+    }
+};
+
+// POST /api/payment/validate-registration
+// Dry run of the checks order creation and manual payment will apply. The
+// player app calls it on "Continue", which matters most for QR payments: there
+// the player pays by UPI BEFORE submitting, so a rejection at submit time would
+// come after the money has left their account.
+export const validateRegistration = async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
+        if (!req.body?.eventId) return res.status(400).json({ message: "eventId is required" });
+
+        const event = await resolveEventByIdentifier(req.body.eventId, "*");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+
+        const { fee, groups } = await validateRequestForUser(event, userId, req.body);
+        res.json({
+            success: true,
+            fee,
+            entries: groups.map((g) => ({ teamId: g.teamId, categoryIds: g.categories.map((c) => String(c.id)), fee: g.fee })),
+        });
+    } catch (err) {
+        if (err.statusCode === 400) return res.status(400).json(badRequestBody(err));
+        console.error("Validate Registration Error:", err);
+        res.status(500).json({ message: "Could not validate registration" });
+    }
+};
+
+// POST /api/payment/create-razorpay-order
+export const createRazorpayOrder = async (req, res) => {
+    try {
+        const { eventId, amount } = req.body;
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
+        if (!eventId || entriesFromRequest(req.body).length === 0) {
             return res.status(400).json({ message: "Missing fields: eventId and categories are required" });
         }
 
@@ -433,23 +415,13 @@ export const createRazorpayOrder = async (req, res) => {
             return res.status(400).json({ message: "This event does not accept Razorpay payments" });
         }
 
-        // Before anything else: a category the organiser has closed cannot be
-        // entered, however the request got here.
-        assertCategoriesOpen(event, categories);
-
-        // The server-computed fee is authoritative. The client-sent amount is only
-        // compared so a stale or tampered UI fails loudly instead of mischarging.
-        const { fee, categoryObjects } = computeRegistrationFee(event, categories);
-
-        // Eligibility is enforced here as well as in the UI — the UI check alone
-        // is bypassable. Runs before the order is created so an ineligible player
-        // is never charged.
-        const { data: payingUser } = await supabaseAdmin
-            .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
-        assertPlayerEligible(payingUser, categoryObjects);
-        // Community-restricted events: checked before the order exists, so a
-        // player outside the allowed communities is never charged.
-        await assertCommunityAllowed(event, payingUser);
+        // Every rule — closed categories, eligibility of the payer AND of each
+        // partner/team member, captaincy, team size, duplicate entries,
+        // community — runs before the order exists, so a rejected request is
+        // never charged. The server-computed fee is authoritative; the
+        // client-sent amount is only compared so a stale or tampered UI fails
+        // loudly instead of mischarging.
+        const { fee, groups } = await validateRequestForUser(event, userId, req.body);
         if (amount !== undefined && Math.round(Number(amount) * 100) !== Math.round(fee * 100)) {
             return res.status(400).json({ message: "Amount mismatch — please refresh the page and try again" });
         }
@@ -465,7 +437,6 @@ export const createRazorpayOrder = async (req, res) => {
             });
         }
 
-        const catIds = categories.map((c) => (c && typeof c === "object" ? c.id : c)).join(",");
         const razorpay = getRazorpayInstance();
         const order = await razorpay.orders.create({
             amount: Math.round(fee * 100), // paise
@@ -473,15 +444,13 @@ export const createRazorpayOrder = async (req, res) => {
             receipt: `rec_${Date.now()}`,
             notes: {
                 // Consumed by verify (ownership/event checks) and by the webhook
-                // fallback to rebuild the registration if the browser callback dies.
-                // Razorpay caps note values at 256 chars — skip catIds if oversized.
+                // and reconcile fallbacks to rebuild the registration if the
+                // browser callback dies. Each category travels with the team it
+                // was entered with ("catId:teamId", packed across e0..e9 —
+                // Razorpay caps a note value at 256 chars).
                 userId,
                 eventId: String(event.id),
-                catIds: catIds.length <= 250 ? catIds : "",
-                // Informational only — squad size at order time, for support
-                // lookups. It does not affect the price (see computeRegistrationFee).
-                teamMemberCount: String(Number.parseInt(teamMemberCount, 10) || 0),
-                teamId: teamId || "",
+                ...packEntriesIntoNotes(groups),
             },
         });
 
@@ -493,10 +462,10 @@ export const createRazorpayOrder = async (req, res) => {
             key_id: process.env.RAZORPAY_KEY_ID,
         });
     } catch (err) {
-        console.error("Razorpay Order Error:", err);
-        // `code` rides along when the thrower set one (CATEGORY_CLOSED), so the
+        // `code` / `categoryId` ride along when the thrower set them, so the
         // client can react to the specific cause rather than parse the message.
-        if (err.statusCode === 400) return res.status(400).json({ message: err.message, ...(err.code ? { code: err.code } : {}) });
+        if (err.statusCode === 400) return res.status(400).json(badRequestBody(err));
+        console.error("Razorpay Order Error:", err);
         res.status(500).json({ message: "Failed to create payment order" });
     }
 };
@@ -508,7 +477,10 @@ export const verifyRazorpayPayment = async (req, res) => {
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
         if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId || !categories) {
+        // `categories` / `entries` are optional here: what was bought is read
+        // from the order notes. A body selection is only a last-resort fallback
+        // for orders whose notes carry none.
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !eventId) {
             return res.status(400).json({ message: "Missing fields" });
         }
 
@@ -584,18 +556,21 @@ export const verifyRazorpayPayment = async (req, res) => {
 
         const paidAmount = order.amount / 100; // authoritative — set server-side at order creation
 
+        // What was bought — each category with the team it was entered with —
+        // comes from the order notes written at creation, never from the body.
+        const groups = await rebuildGroupsFromNotes(orderNotes, Array.isArray(categories) ? { categories, teamId } : null);
+
         const { registrationNo } = await recordVerifiedRegistration({
             orderId: razorpay_order_id,
             paymentId: razorpay_payment_id,
             userId,
             eventId: resolvedEventId,
             amount: paidAmount,
-            categories,
-            teamId,
+            groups,
         });
 
         dispatchRegistrationSideEffects({
-            userId, eventId: resolvedEventId, registrationNo, amount: paidAmount, categories, teamId,
+            userId, eventId: resolvedEventId, registrationNo, amount: paidAmount, groups,
             paymentId: razorpay_payment_id,
         });
 
@@ -669,13 +644,12 @@ export const getRazorpayOrderStatus = async (req, res) => {
         }
 
         const amount = order.amount_paid / 100;
-        const categories = await rebuildCategoriesFromNotes(notes);
-        const teamId = notes.teamId || null;
+        const groups = await rebuildGroupsFromNotes(notes);
 
         let registrationNo;
         try {
             ({ registrationNo } = await recordVerifiedRegistration({
-                orderId, paymentId, userId, eventId: resolvedEventId, amount, categories, teamId,
+                orderId, paymentId, userId, eventId: resolvedEventId, amount, groups,
             }));
         } catch (writeErr) {
             // The webhook may have won the race between our lookup and this insert.
@@ -695,7 +669,7 @@ export const getRazorpayOrderStatus = async (req, res) => {
 
         console.log("Reconcile: recovered unrecorded paid order", orderId, "→", registrationNo);
         dispatchRegistrationSideEffects({
-            userId, eventId: resolvedEventId, registrationNo, amount, categories, teamId, paymentId,
+            userId, eventId: resolvedEventId, registrationNo, amount, groups, paymentId,
         });
 
         res.json({ success: true, status: "registered", registrationNo, paymentId, amount, eventId: resolvedEventId, recovered: true });
@@ -797,7 +771,7 @@ export const razorpayWebhook = async (req, res) => {
 
                 // Frontend callback never fired — create registration as fallback
                 const amount = amountPaise / 100;
-                const categories = await rebuildCategoriesFromNotes(notes);
+                const groups = await rebuildGroupsFromNotes(notes);
 
                 const { registrationNo } = await recordVerifiedRegistration({
                     orderId,
@@ -805,8 +779,7 @@ export const razorpayWebhook = async (req, res) => {
                     userId: notes.userId,
                     eventId: notes.eventId,
                     amount,
-                    categories,
-                    teamId: notes.teamId,
+                    groups,
                 });
                 console.log("Webhook fallback: registration created", registrationNo);
 
@@ -815,8 +788,7 @@ export const razorpayWebhook = async (req, res) => {
                     eventId: notes.eventId,
                     registrationNo,
                     amount,
-                    categories,
-                    teamId: notes.teamId,
+                    groups,
                     paymentId,
                 });
             }
@@ -838,12 +810,12 @@ export const razorpayWebhook = async (req, res) => {
 // POST /api/payment/submit-manual-payment
 export const submitManualPayment = async (req, res) => {
     try {
-        const { eventId, amount, categories, transactionId, screenshot, teamId, document } = req.body;
+        const { eventId, amount, transactionId, screenshot, document } = req.body;
         const userId = req.user?.id;
 
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
         // `amount` is no longer required: the stored amount is computed here.
-        if (!eventId || !Array.isArray(categories) || categories.length === 0 || !screenshot) return res.status(400).json({ message: "Missing fields" });
+        if (!eventId || entriesFromRequest(req.body).length === 0 || !screenshot) return res.status(400).json({ message: "Missing fields" });
         if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
 
         const eventForEligibility = await resolveEventByIdentifier(eventId, "*");
@@ -853,23 +825,20 @@ export const submitManualPayment = async (req, res) => {
             return res.status(400).json({ message: "This event only accepts online payment" });
         }
 
-        // Same eligibility gate as the Razorpay path — manual payments must not
-        // be a way around it. The closed-category gate rides along for the same
-        // reason. The fee computed here is also what gets stored: the amount the
-        // browser sends used to be saved as-is, so an edited request could record
-        // any figure as paid and skew the payment reports.
+        // Same rules as the Razorpay path — manual payments must not be a way
+        // around them (eligibility of payer and members, captaincy, team size,
+        // duplicates, closed categories, community). The player app runs the
+        // same checks via /validate-registration BEFORE showing the QR, so a
+        // rejection here only happens if something changed in between. The fee
+        // computed here is also what gets stored: the amount the browser sends
+        // used to be saved as-is, so an edited request could record any figure
+        // as paid and skew the payment reports.
         let fee;
+        let groups;
         try {
-            assertCategoriesOpen(eventForEligibility, categories);
-            const computed = computeRegistrationFee(eventForEligibility, categories);
-            fee = computed.fee;
-            const { categoryObjects } = computed;
-            const { data: payingUser } = await supabaseAdmin
-                .from("users").select("gender, dob, age, apartment, institute_name").eq("id", userId).maybeSingle();
-            assertPlayerEligible(payingUser, categoryObjects);
-            await assertCommunityAllowed(eventForEligibility, payingUser);
+            ({ fee, groups } = await validateRequestForUser(eventForEligibility, userId, req.body));
         } catch (eligErr) {
-            if (eligErr.statusCode === 400) return res.status(400).json({ message: eligErr.message, ...(eligErr.code ? { code: eligErr.code } : {}) });
+            if (eligErr.statusCode === 400) return res.status(400).json(badRequestBody(eligErr));
             throw eligErr;
         }
 
@@ -903,30 +872,22 @@ export const submitManualPayment = async (req, res) => {
 
         if (txError || !transaction) throw txError || new Error("Tx Insert Failed");
 
-        // 2. Create Registration
-        const registrationNo = `REG-${Date.now()}`;
-        const { error: regError } = await supabaseAdmin.from("event_registrations").insert({
-            event_id: resolvedEventId,
-            player_id: userId,
-            registration_no: registrationNo,
-            categories,
-            amount_paid: fee,
-            transaction_id: transaction.id,
-            screenshot_url: screenshotUrl,
-            manual_transaction_id: transactionId || null,
-            team_id: teamId || null,
-            document_url: documentUrl,
-            status: 'pending_verification'
+        // 2. Create the registration rows — one per Doubles/Team entry, one for
+        //    the singles — all sharing this transaction and registration number.
+        //    The helper also drops the payer's and every team-mate's cached
+        //    dashboard.
+        const { registrationNo } = await insertRegistrationRows({
+            transaction,
+            userId,
+            eventId: resolvedEventId,
+            groups,
+            rowFields: {
+                screenshot_url: screenshotUrl,
+                manual_transaction_id: transactionId || null,
+                document_url: documentUrl,
+                status: "pending_verification",
+            },
         });
-
-        if (regError) {
-            await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
-            throw regError;
-        }
-
-        // Same reason as the verified path: the cached dashboard predates this
-        // registration and would hide it for up to 15 minutes.
-        await invalidateDashboardForRegistration({ userId, teamId });
 
         // 3. Email + WhatsApp + team notifications (Async)
         dispatchRegistrationSideEffects({
@@ -934,8 +895,7 @@ export const submitManualPayment = async (req, res) => {
             eventId: resolvedEventId,
             registrationNo,
             amount: fee,
-            categories,
-            teamId,
+            groups,
             paymentId: transactionId || null,
             paymentMode: "manual",
             status: "Pending Verification",
@@ -947,6 +907,34 @@ export const submitManualPayment = async (req, res) => {
         console.error("Manual Payment Error:", err);
         res.status(500).json({ message: "Internal Server Error" });
     }
+};
+
+/**
+ * The caller's registration by number, merged across its rows. One payment
+ * writes a row per Doubles/Team entry plus one for the singles, all under the
+ * same number; admin approval moves them together, so they normally share a
+ * status. Should they ever differ, the one still needing attention wins
+ * (pending/rejected over verified), so a receipt is never released early.
+ * Returns null when the caller owns no row with that number.
+ */
+const loadOwnedRegistration = async (registrationNo, userId, fields) => {
+    const { data: rows, error } = await supabaseAdmin
+        .from("event_registrations")
+        .select(fields)
+        .eq("registration_no", registrationNo)
+        .eq("player_id", userId)
+        .order("created_at", { ascending: true });
+    if (error) throw error;
+    if (!rows || rows.length === 0) return null;
+
+    const unsettled = rows.find((r) => !isReceiptEligible(r.status));
+    return {
+        ...rows[0],
+        status: (unsettled || rows[0]).status,
+        amount_paid: rows.reduce((sum, r) => sum + (Number(r.amount_paid) || 0), 0),
+        categories: rows.flatMap((r) => (Array.isArray(r.categories) ? r.categories : (r.categories ? [r.categories] : []))),
+        screenshot_url: rows.find((r) => r.screenshot_url)?.screenshot_url || null,
+    };
 };
 
 // Raw registration status → the wording players see on the receipt.
@@ -973,13 +961,10 @@ export const getRegistrationStatus = async (req, res) => {
         const userId = req.user?.id;
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
-        const { data: registration, error } = await supabaseAdmin
-            .from("event_registrations")
-            .select("registration_no, player_id, status, screenshot_url")
-            .eq("registration_no", req.params.registrationNo)
-            .maybeSingle();
-        if (error) throw error;
-        if (!registration || registration.player_id !== userId) {
+        const registration = await loadOwnedRegistration(
+            req.params.registrationNo, userId, "registration_no, player_id, status, screenshot_url"
+        );
+        if (!registration) {
             return res.status(404).json({ message: "Registration not found" });
         }
 
@@ -1013,17 +998,17 @@ export const downloadRegistrationReceipt = async (req, res) => {
         if (!userId) return res.status(401).json({ message: "Unauthorized" });
         if (!registrationNo) return res.status(400).json({ message: "Missing registration number" });
 
-        const { data: registration, error: regErr } = await supabaseAdmin
-            .from("event_registrations")
-            .select("registration_no, player_id, event_id, categories, amount_paid, status, created_at, transaction_id, manual_transaction_id")
-            .eq("registration_no", registrationNo)
-            .maybeSingle();
-        if (regErr) throw regErr;
+        // All rows of the payment (one per Doubles/Team entry plus singles)
+        // make one receipt: every category, the total amount.
+        const registration = await loadOwnedRegistration(
+            registrationNo, userId,
+            "registration_no, player_id, event_id, categories, amount_paid, status, created_at, transaction_id, manual_transaction_id"
+        );
 
         // 404 rather than 403 for someone else's registration: registration
         // numbers are `REG-<timestamp>`, so a distinguishable response would
         // make them enumerable.
-        if (!registration || registration.player_id !== userId) {
+        if (!registration) {
             return res.status(404).json({ message: "Receipt not found" });
         }
 

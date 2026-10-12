@@ -26,6 +26,22 @@ export const notifyRegistrationApproved = (registrationId) => {
                 .maybeSingle();
             if (!reg) return;
 
+            // One payment can be several rows (one per Doubles/Team entry plus
+            // the singles) under one registration number. The receipt covers
+            // the whole payment: every category, the total amount.
+            if (reg.transaction_id) {
+                const { data: siblings } = await supabaseAdmin
+                    .from("event_registrations")
+                    .select("categories, amount_paid")
+                    .eq("transaction_id", reg.transaction_id)
+                    .order("created_at", { ascending: true });
+                if (Array.isArray(siblings) && siblings.length > 1) {
+                    reg.categories = siblings.flatMap((s) =>
+                        Array.isArray(s.categories) ? s.categories : (s.categories ? [s.categories] : []));
+                    reg.amount_paid = siblings.reduce((sum, s) => sum + (Number(s.amount_paid) || 0), 0);
+                }
+            }
+
             const [{ data: user }, { data: event }, { data: tx }] = await Promise.all([
                 supabaseAdmin.from("users").select("email, first_name, mobile").eq("id", reg.player_id).maybeSingle(),
                 supabaseAdmin.from("events").select("name").eq("id", reg.event_id).maybeSingle(),

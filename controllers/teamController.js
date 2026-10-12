@@ -1,5 +1,6 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { createNotification } from "../services/notificationService.js";
+import { INACTIVE_STATUS_FILTER } from "../utils/registrationRules.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (value) => typeof value === "string" && UUID_RE.test(value.trim());
@@ -137,7 +138,10 @@ export const getMyTeams = async (req, res) => {
         const userId = req.user.id;
 
         // 1. Teams where user is captain
-        const { data: captainTeams, error } = await supabaseAdmin.from('player_teams').select('*').eq('captain_id', userId).order('created_at', { ascending: false });
+        const { data: captainTeams, error } = await supabaseAdmin.from('player_teams').select('*').eq('captain_id', userId)
+            // Retired (deleted after use) teams are kept only for history.
+            .or('status.is.null,status.neq.deleted')
+            .order('created_at', { ascending: false });
         if (error) throw error;
 
         // 2. Teams where user is a member (lookup by UUID, mobile, or player_id)
@@ -159,6 +163,7 @@ export const getMyTeams = async (req, res) => {
                     .from('player_teams')
                     .select('*')
                     .neq('captain_id', userId)
+                    .or('status.is.null,status.neq.deleted')
                     // Must be a pre-stringified JSON array: given a JS array,
                     // supabase-js builds a Postgres *array* literal
                     // (`cs.{[object Object]}`) instead of a jsonb one.
@@ -220,7 +225,7 @@ const maskTail = (value, visible = 4, groupWith = "") => {
 export const lookupPlayer = async (req, res) => {
     try {
         const { playerId } = req.params;
-        const { data: player, error } = await supabaseAdmin.from('users').select('id, first_name, last_name, dob, mobile, player_id, aadhaar').ilike('player_id', playerId).maybeSingle();
+        const { data: player, error } = await supabaseAdmin.from('users').select('id, first_name, last_name, dob, age, gender, mobile, player_id, aadhaar').ilike('player_id', playerId).maybeSingle();
         if (error || !player) return res.status(404).json({ success: false, message: "Player ID not found" });
 
         let age = "";
@@ -228,6 +233,14 @@ export const lookupPlayer = async (req, res) => {
             const ageDt = new Date(Date.now() - new Date(player.dob).getTime());
             age = Math.abs(ageDt.getUTCFullYear() - 1970).toString();
         }
+        // Birth year + gender let the registration page check the member
+        // against a category's age/gender rule the moment they are added. The
+        // server re-checks at registration either way. Same leniency as the
+        // server: no DOB/age on file → null, and the age rule is not applied.
+        let birthYear = null;
+        const dobDate = player.dob ? new Date(player.dob) : null;
+        if (dobDate && !Number.isNaN(dobDate.getTime())) birthYear = dobDate.getFullYear();
+        else if (Number(player.age) > 0) birthYear = new Date().getFullYear() - Number(player.age);
 
         res.json({
             success: true,
@@ -239,6 +252,8 @@ export const lookupPlayer = async (req, res) => {
                 is_self: player.id === req.user?.id,
                 name: `${player.first_name} ${player.last_name}`,
                 age,
+                gender: player.gender || null,
+                birth_year: birthYear,
                 mobile: maskTail(player.mobile),
                 aadhaar: maskTail(player.aadhaar, 4, "-"),
             }
@@ -291,6 +306,57 @@ export const createTeam = async (req, res) => {
     }
 };
 
+const firstName = (name) => String(name || "").trim().split(/\s+/)[0] || "";
+
+/** "Ravi & Raju" — the name the registration page gives a pair left unnamed. */
+const autoTeamName = (captainName, members) => {
+    const names = [firstName(captainName), ...(Array.isArray(members) ? members : []).map((m) => firstName(m?.name))].filter(Boolean);
+    return names.length > 1 ? names.join(" & ") : `${firstName(captainName) || "My"}'s team`;
+};
+
+/**
+ * Is this name just the players' first names joined ("&" or "/", any case,
+ * ignoring a trailing "[tag]" like seeded "[seed-mc]")?
+ */
+const isAutoTeamName = (teamName, captainName, members) => {
+    const names = [firstName(captainName), ...(Array.isArray(members) ? members : []).map((m) => firstName(m?.name))]
+        .filter(Boolean).map((n) => n.toLowerCase());
+    if (names.length < 2) return false;
+    const normalized = String(teamName || "").replace(/\s*\[[^\]]*\]\s*$/, "").trim().toLowerCase().replace(/\s+/g, " ");
+    return [" & ", " / ", " and "].some((sep) => normalized === names.join(sep));
+};
+
+/** Who is on a roster, order-insensitive: sorted uuid / player-code keys. */
+const memberKeySet = (members) =>
+    (Array.isArray(members) ? members : [])
+        .map((m) => String(m?.id || m?.player_id || m?.mobile || m?.name || "").trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+
+/**
+ * Name of an event this team holds an active (pending or confirmed) entry in
+ * that has not finished yet, or null. Past events do not lock the team, so a
+ * pair can be reshuffled for next season.
+ */
+const activeRegistrationEventName = async (teamId) => {
+    const { data: regs, error } = await supabaseAdmin
+        .from("event_registrations")
+        .select("id, events ( name, start_date, end_date )")
+        .eq("team_id", teamId)
+        .not("status", "in", INACTIVE_STATUS_FILTER);
+    if (error) throw error;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const live = (regs || []).find((r) => {
+        const ev = Array.isArray(r.events) ? r.events[0] : r.events;
+        const lastDay = String(ev?.end_date || ev?.start_date || "").slice(0, 10);
+        return !lastDay || lastDay >= today;
+    });
+    if (!live) return null;
+    const ev = Array.isArray(live.events) ? live.events[0] : live.events;
+    return ev?.name ? `"${ev.name}"` : "an upcoming event";
+};
+
 export const updateTeam = async (req, res) => {
     try {
         const { id } = req.params;
@@ -298,18 +364,48 @@ export const updateTeam = async (req, res) => {
         const userId = req.user.id;
 
         const { data: team, error: fetchError } = await supabaseAdmin.from('player_teams').select('*').eq('id', id).maybeSingle();
-        if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
+        if (fetchError || !team || team.status === "deleted") return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
 
-        const memberError = validateTeamMembers(members, userId);
+        // A body without `members` (e.g. a rename) keeps the roster as it is,
+        // rather than wiping it.
+        const nextMembers = Array.isArray(members) ? members : (team.members || []);
+
+        const memberError = validateTeamMembers(nextMembers, userId);
         if (memberError) return res.status(400).json({ success: false, message: memberError });
 
-        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name, sport, members: members || [] }).eq('id', id).select().maybeSingle();
+        // Roster lock: a registered pair/squad is who was entered and paid for.
+        // While the team holds an active entry in an event that has not
+        // finished, its players cannot change — otherwise the captain could
+        // swap in someone ineligible, or someone already entered in that
+        // category, after the checks ran. Renaming is still allowed.
+        if (memberKeySet(team.members).join("|") !== memberKeySet(nextMembers).join("|")) {
+            const lockedFor = await activeRegistrationEventName(id);
+            if (lockedFor) {
+                return res.status(400).json({
+                    success: false,
+                    code: "TEAM_LOCKED",
+                    message: `"${team.team_name}" is registered for ${lockedFor}, so its players can't be changed until that event is over. You can still rename the team.`,
+                });
+            }
+        }
+
+        // A pair named after its players ("Ravi & Raju", seeded "ravi / raju")
+        // must not keep a removed partner's name. If the name is still the
+        // auto-generated one and the captain didn't type a new one, rename it
+        // to the new roster. A name the captain chose is never touched.
+        let nextName = team_name ?? team.team_name;
+        const rosterChanged = memberKeySet(team.members).join("|") !== memberKeySet(nextMembers).join("|");
+        if (rosterChanged && nextName === team.team_name && isAutoTeamName(team.team_name, team.captain_name, team.members)) {
+            nextName = autoTeamName(team.captain_name, nextMembers);
+        }
+
+        const { data: updatedTeam, error } = await supabaseAdmin.from('player_teams').update({ team_name: nextName, sport, members: nextMembers }).eq('id', id).select().maybeSingle();
         if (error) throw error;
 
         // Find newly added members and notify them
         const oldMemberIds = new Set((team.members || []).map(m => m.id || m.player_id || m.mobile));
-        const newMembers = (members || []).filter(m => {
+        const newMembers = nextMembers.filter(m => {
             const key = m.id || m.player_id || m.mobile;
             return key && !oldMemberIds.has(key);
         });
@@ -334,26 +430,29 @@ export const deleteTeam = async (req, res) => {
         if (fetchError || !team) return res.status(404).json({ message: "Team not found" });
         if (team.captain_id !== userId) return res.status(403).json({ message: "Unauthorized" });
 
-        // Block deletion if team has active event registrations
-        const activeStatuses = [
-            'pending_verification', 'payment_pending', 'registered',
-            'pending', 'Submitted', 'confirmed', 'verified', 'approved', 'paid'
-        ];
-        const { data: activeRegs } = await supabaseAdmin
-            .from('event_registrations')
-            .select('id')
-            .eq('team_id', id)
-            .in('status', activeStatuses)
-            .limit(1);
-
-        if (activeRegs?.length > 0) {
+        // Blocked only while the team holds an active (pending or confirmed)
+        // entry in an event that has not finished. Once the event is over, or
+        // the entry was rejected/cancelled, the captain may delete it.
+        const lockedFor = await activeRegistrationEventName(id);
+        if (lockedFor) {
             return res.status(400).json({
                 success: false,
-                message: 'Cannot delete team while it is registered for an active event.'
+                code: "TEAM_LOCKED",
+                message: `"${team.team_name}" is registered for ${lockedFor}. You can delete it after the event is over, or if that registration is cancelled.`,
             });
         }
 
-        const { error } = await supabaseAdmin.from('player_teams').delete().eq('id', id);
+        // A team that was ever entered in an event is retired, not removed:
+        // event_registrations.team_id is ON DELETE SET NULL, so a hard delete
+        // would strip the partner/squad from past registrations, draws and
+        // results. Retired teams vanish from the player's lists and pickers.
+        const { data: pastRegs, error: pastErr } = await supabaseAdmin
+            .from('event_registrations').select('id').eq('team_id', id).limit(1);
+        if (pastErr) throw pastErr;
+
+        const { error } = pastRegs?.length
+            ? await supabaseAdmin.from('player_teams').update({ status: 'deleted' }).eq('id', id)
+            : await supabaseAdmin.from('player_teams').delete().eq('id', id);
         if (error) throw error;
         res.json({ success: true, message: "Team deleted successfully" });
     } catch (err) {

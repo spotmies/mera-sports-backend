@@ -6,6 +6,7 @@ import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePayme
 import { invalidateEventAccessCache } from "../middleware/eventAccess.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { isActiveRegistrationStatus, tallyRegistrationEntries } from "../utils/registrationRules.js";
 import { loadCommunities, normalizeCommunityIds, normalizeInstituteNames, normalizeRestrictionMessage, resolveCommunityNames, validateCommunityIds } from "../utils/communityRestriction.js";
 
 /**
@@ -201,7 +202,7 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
 export const listEvents = async (req, res) => {
     try {
         const { created_by, admin_id, page, limit, search } = req.query;
-        let query = supabaseAdmin.from('events').select('*, event_registrations(count)', { count: 'exact' }).order('start_date', { ascending: false });
+        let query = supabaseAdmin.from('events').select('*', { count: 'exact' }).order('start_date', { ascending: false });
 
         if (created_by) query = query.eq('created_by', created_by);
         if (admin_id) {
@@ -230,10 +231,39 @@ export const listEvents = async (req, res) => {
 
         const { data, count, error } = await query;
         if (error) throw error;
-        const events = (data || []).map((event) => ({
-            ...event,
-            public_id: getPublicEventId(event),
-        }));
+
+        // Registration numbers via the shared rule (active category entries,
+        // rejected separately), so this list agrees with the event page and the
+        // registrations list. The `event_registrations(count)` embed counted
+        // every row, rejected included — 184 here vs 183 on the event page.
+        const eventIds = (data || []).map((e) => e.id);
+        const rowsByEvent = new Map(eventIds.map((id) => [id, []]));
+        for (let i = 0; i < eventIds.length; i += 100) {
+            const ids = eventIds.slice(i, i + 100);
+            for (let from = 0; ; from += 1000) {
+                const { data: regs, error: regErr } = await supabaseAdmin
+                    .from("event_registrations")
+                    .select("event_id, status, team_id, categories")
+                    .in("event_id", ids)
+                    .order("id", { ascending: true })
+                    .range(from, from + 999);
+                if (regErr) throw regErr;
+                for (const r of regs || []) rowsByEvent.get(r.event_id)?.push(r);
+                if (!regs || regs.length < 1000) break;
+            }
+        }
+
+        const events = (data || []).map((event) => {
+            const tally = tallyRegistrationEntries(rowsByEvent.get(event.id) || []);
+            return {
+                ...event,
+                public_id: getPublicEventId(event),
+                // Same shape the admin pages already read, now the active count.
+                event_registrations: [{ count: tally.active }],
+                registrations_count: tally.active,
+                rejected_registrations_count: tally.rejected,
+            };
+        });
         res.json({ success: true, events, total_count: count });
     } catch (err) {
         console.error("Fetch Events Error:", err);
@@ -262,7 +292,8 @@ export const getEventDetails = async (req, res) => {
         const [assignedAdmins, { data: newsData }, { data: regStats }, { count: allRegCount }] = await Promise.all([
             loadAssignedAdminsForEvent(internalEventId),
             supabaseAdmin.from('event_news').select('*').eq('event_id', internalEventId).order('created_at', { ascending: false }),
-            supabaseAdmin.from("event_registrations").select("categories, status, team_id, player_id").eq("event_id", internalEventId).in("status", ["verified", "paid", "confirmed", "approved", "registered", "pending", "Pending", "pending_verification", "Submitted"]),
+            // Every row: tallyRegistrationEntries splits active from rejected.
+            supabaseAdmin.from("event_registrations").select("categories, status, team_id, player_id").eq("event_id", internalEventId),
             // Unfiltered row count — the stats above deliberately skip rejected
             // registrations, but deletion must consider *every* row it would
             // cascade away, so the admin UI needs the raw number too.
@@ -308,49 +339,21 @@ export const getEventDetails = async (req, res) => {
             eventData.allowed_communities = [];
         }
 
-        // Stats — team_id lets team/doubles categories count distinct teams, not
-        // individual players. (Singles: team_id null → count rows. Team/Doubles:
-        // team_id shared → count distinct team_ids.) regStats fetched in the batch above.
-        const registrationCounts = {};
-        // Tracks distinct team_ids per category key (for Team/Doubles events)
-        const teamIdsPerCategory = {};
-        if (regStats) {
-            regStats.forEach(reg => {
-                const teamId = reg.team_id;
-                const processKey = (key) => {
-                    if (teamId) {
-                        // Team or Doubles registration — count distinct teams/pairs
-                        if (!teamIdsPerCategory[key]) teamIdsPerCategory[key] = new Set();
-                        teamIdsPerCategory[key].add(teamId);
-                    } else {
-                        // Individual (Singles) registration — count rows
-                        registrationCounts[key] = (registrationCounts[key] || 0) + 1;
-                    }
-                };
-                if (Array.isArray(reg.categories)) {
-                    reg.categories.forEach(cat => processKey(typeof cat === 'object' ? (cat.id || cat.name || cat.category) : cat));
-                } else if (reg.categories) {
-                    processKey(typeof reg.categories === 'object' ? (reg.categories.id || reg.categories.name || reg.categories.category) : reg.categories);
-                }
-            });
-            // Merge distinct team/pair counts into registrationCounts
-            Object.entries(teamIdsPerCategory).forEach(([key, teamSet]) => {
-                registrationCounts[key] = (registrationCounts[key] || 0) + teamSet.size;
-            });
-        }
-        eventData.registration_counts = registrationCounts;
+        // Stats — counted by tallyRegistrationEntries, the one rule every screen
+        // uses: active category entries (Doubles/Team = distinct teams), with
+        // rejected/cancelled reported separately. regStats holds every row.
+        const tally = tallyRegistrationEntries(regStats || []);
+        eventData.registration_counts = tally.byCategory;
         // A "registration" is a category entry, not a row: one player entering two
         // categories has registered twice, pays two fees and occupies two slots.
-        // regStats.length counted rows, so the headline total contradicted the
-        // per-category cards right below it (40 vs the cards' 9+18+5+12+9 = 53).
-        // Summing registrationCounts also keeps team/doubles correct — those keys
-        // already hold distinct team counts rather than one per member.
-        eventData.total_registrations_count = Object.values(registrationCounts)
-            .reduce((sum, n) => sum + (Number(n) || 0), 0);
+        eventData.total_registrations_count = tally.active;
+        // Rejected/cancelled entries — shown beside the total so it reconciles
+        // with lists that include them ("183 active · 1 rejected" = 184).
+        eventData.rejected_registrations_count = tally.rejected;
         // Distinct people, for callers that need headcount rather than entries.
-        eventData.total_players_count = regStats
-            ? new Set(regStats.map(r => r.player_id).filter(Boolean)).size
-            : 0;
+        eventData.total_players_count = new Set(
+            (regStats || []).filter(r => isActiveRegistrationStatus(r.status)).map(r => r.player_id).filter(Boolean)
+        ).size;
         // Every registration row, rejected ones included. The admin hub gates the
         // "Delete Event" button on this — see the matching guard in deleteEvent().
         eventData.all_registrations_count = allRegCount || 0;
