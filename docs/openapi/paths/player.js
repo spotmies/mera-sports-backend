@@ -96,6 +96,8 @@ export const playerPaths = {
                     photos: { type: "string", description: "`data:image/...;base64,...` or an existing URL." },
                     apartment: { type: "string" },
                     street: { type: "string" },
+                    flat_building_wing: { type: "string", maxLength: 150 },
+                    tshirt_size: { type: "string", maxLength: 20 },
                     city: { type: "string" },
                     state: { type: "string" },
                     pincode: { type: "string" },

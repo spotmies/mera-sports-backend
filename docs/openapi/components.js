@@ -157,6 +157,8 @@ export const schemas = {
             gender: { type: "string", nullable: true, enum: ["Male", "Female", "Other", null] },
             apartment: { type: "string", nullable: true },
             street: { type: "string", nullable: true },
+            flat_building_wing: { type: "string", nullable: true, maxLength: 150, description: "Flat / building / wing line of the address." },
+            tshirt_size: { type: "string", nullable: true, maxLength: 20, example: "Adult - XL", description: "Preset (`Adult - XXL…XS`, `Kids - 24…34`) or free text." },
             city: { type: "string", nullable: true },
             state: { type: "string", nullable: true },
             pincode: { type: "string", nullable: true },
@@ -573,6 +575,8 @@ export const schemas = {
                 properties: {
                     showSchool: { type: "boolean" },
                     showStreet: { type: "boolean" },
+                    showBuilding: { type: "boolean", description: "Flat / Building / Wing address field." },
+                    showTshirt: { type: "boolean", description: "T-shirt size field." },
                     showApartment: { type: "boolean" },
                 },
                 additionalProperties: true,

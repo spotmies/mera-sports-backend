@@ -9,6 +9,7 @@ import { getPublicEventId } from "../utils/eventResolver.js";
 import { isTeamMatchType } from "../utils/registrationRules.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { cleanFlatBuildingWing, cleanTshirtSize } from "../utils/playerProfileFields.js";
 
 /* ================= FAMILY VIEW HELPERS ================= */
 
@@ -50,6 +51,8 @@ const toFamilyMember = (user, relation) => ({
     photos: user.photos,
     apartment: user.apartment,
     street: user.street,
+    flat_building_wing: user.flat_building_wing ?? null,
+    tshirt_size: user.tshirt_size ?? null,
     city: user.city,
     state: user.state,
     pincode: user.pincode,
@@ -383,7 +386,7 @@ export const checkPassword = async (req, res) => {
 export const updateProfile = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { email, mobile, photos, apartment, street, city, state, pincode, country, gender, first_name, last_name } = req.body;
+        const { email, mobile, photos, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country, gender, first_name, last_name } = req.body;
 
         const { data: currentUser, error: fetchError } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
         if (fetchError || !currentUser) return res.status(404).json({ message: "User not found" });
@@ -428,7 +431,11 @@ export const updateProfile = async (req, res) => {
             pincode: pincode !== undefined ? pincode : currentUser.pincode,
             country: country !== undefined ? country : currentUser.country,
             gender: gender !== undefined ? gender : currentUser.gender,
-            photos: photoUrl || currentUser.photos
+            photos: photoUrl || currentUser.photos,
+            // Only written when the client sent them, so a database without the
+            // columns still accepts every other profile edit.
+            ...(flat_building_wing !== undefined ? { flat_building_wing: cleanFlatBuildingWing(flat_building_wing) } : {}),
+            ...(tshirt_size !== undefined ? { tshirt_size: cleanTshirtSize(tshirt_size) } : {})
         };
 
         const { data: updatedPlayer, error } = await supabaseAdmin.from("users").update(updates).eq("id", userId).select();
@@ -504,7 +511,7 @@ export const deleteAccount = async (req, res) => {
 export const addFamilyMember = async (req, res) => {
     try {
         const headUserId = req.user.id;
-        const { name, relation, dob, gender, email, aadhaar, apartment, street, city, state, pincode, country } = req.body;
+        const { name, relation, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
 
         if (!name || !relation || !dob || !gender) {
             return res.status(400).json({ message: "Name, Relation, DOB, and Gender are required" });
@@ -594,6 +601,8 @@ export const addFamilyMember = async (req, res) => {
                 gender,
                 apartment: apartment || null,
                 street: street || null,
+                ...(cleanFlatBuildingWing(flat_building_wing) ? { flat_building_wing: cleanFlatBuildingWing(flat_building_wing) } : {}),
+                ...(cleanTshirtSize(tshirt_size) ? { tshirt_size: cleanTshirtSize(tshirt_size) } : {}),
                 city: city || null,
                 state: state || null,
                 pincode: pincode || null,
@@ -642,6 +651,8 @@ export const addFamilyMember = async (req, res) => {
                 aadhaar: newUser.aadhaar,
                 apartment: newUser.apartment,
                 street: newUser.street,
+                flat_building_wing: newUser.flat_building_wing ?? null,
+                tshirt_size: newUser.tshirt_size ?? null,
                 city: newUser.city,
                 state: newUser.state,
                 pincode: newUser.pincode,
@@ -671,7 +682,7 @@ export const updateFamilyMember = async (req, res) => {
             return res.status(403).json({ message: "Not your family member" });
         }
 
-        const { name, relation: newRelation, dob, gender, email, aadhaar, apartment, street, city, state, pincode, country } = req.body;
+        const { name, relation: newRelation, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
 
         // Uniqueness, excluding the member being edited — otherwise re-saving a
         // form without touching the email would collide with the member's own
@@ -721,6 +732,8 @@ export const updateFamilyMember = async (req, res) => {
         if (aadhaar !== undefined) updateData.aadhaar = aadhaar || null;
         if (apartment !== undefined) updateData.apartment = apartment || null;
         if (street !== undefined) updateData.street = street || null;
+        if (flat_building_wing !== undefined) updateData.flat_building_wing = cleanFlatBuildingWing(flat_building_wing);
+        if (tshirt_size !== undefined) updateData.tshirt_size = cleanTshirtSize(tshirt_size);
         if (city !== undefined) updateData.city = city || null;
         if (state !== undefined) updateData.state = state || null;
         if (pincode !== undefined) updateData.pincode = pincode || null;
@@ -761,6 +774,8 @@ export const updateFamilyMember = async (req, res) => {
                 aadhaar: updatedUser.aadhaar,
                 apartment: updatedUser.apartment,
                 street: updatedUser.street,
+                flat_building_wing: updatedUser.flat_building_wing ?? null,
+                tshirt_size: updatedUser.tshirt_size ?? null,
                 city: updatedUser.city,
                 state: updatedUser.state,
                 pincode: updatedUser.pincode,

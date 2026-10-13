@@ -201,7 +201,7 @@ const syncEventAdminAssignments = async (eventId, adminIds, assignedBy) => {
 // GET /api/events/list
 export const listEvents = async (req, res) => {
     try {
-        const { created_by, admin_id, page, limit, search } = req.query;
+        const { created_by, admin_id, page, limit, search, when, today } = req.query;
         let query = supabaseAdmin.from('events').select('*', { count: 'exact' }).order('start_date', { ascending: false });
 
         if (created_by) query = query.eq('created_by', created_by);
@@ -219,6 +219,17 @@ export const listEvents = async (req, res) => {
         if (search) {
             const safe = sanitizeSearch(search);
             if (safe) query = query.ilike('name', `%${safe}%`);
+        }
+
+        // Optional split by date so the admin Events page can page PAST events
+        // on the server and fetch the (few) upcoming/ongoing ones separately.
+        // An event is past when its last day (end_date, else start_date) is
+        // before `today` — the same date-only rule the admin UI uses. `today` is
+        // sent by the client (YYYY-MM-DD) so both sides agree on the day.
+        if ((when === 'past' || when === 'upcoming') && /^\d{4}-\d{2}-\d{2}$/.test(String(today || ''))) {
+            query = when === 'past'
+                ? query.or(`end_date.lt.${today},and(end_date.is.null,start_date.lt.${today})`)
+                : query.or(`end_date.gte.${today},and(end_date.is.null,start_date.gte.${today})`);
         }
 
         if (page && limit) {

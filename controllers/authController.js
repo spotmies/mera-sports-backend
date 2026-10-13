@@ -14,6 +14,7 @@ import { sendRegistrationSuccessEmail } from "../utils/mailer.js";
 import { normalizeWhatsAppNumber, sendWelcomeWhatsApp } from "../utils/whatsapp.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
+import { cleanFlatBuildingWing, cleanTshirtSize } from "../utils/playerProfileFields.js";
 
 /* ================= FORGOT PASSWORD ================= */
 
@@ -562,7 +563,7 @@ export const registerPlayer = async (req, res) => {
     try {
         const {
             firstName, lastName, mobile, email, dob,
-            apartment, street, city, state, pincode, country,
+            apartment, street, flatBuildingWing, tshirtSize, city, state, pincode, country,
             aadhaar, schoolDetails, photos, isVerified, gender
         } = req.body;
 
@@ -705,7 +706,16 @@ export const registerPlayer = async (req, res) => {
                 password: password,
                 role: 'player',
                 verification: isVerified ? 'verified' : 'pending',
-                gender: gender || null
+                gender: gender || null,
+                // Only sent when filled in, so a database that has not yet run
+                // add_flat_building_wing_and_tshirt_size.sql keeps registering
+                // players who leave these optional fields blank.
+                ...(cleanFlatBuildingWing(flatBuildingWing)
+                    ? { flat_building_wing: cleanFlatBuildingWing(flatBuildingWing) }
+                    : {}),
+                ...(cleanTshirtSize(tshirtSize)
+                    ? { tshirt_size: cleanTshirtSize(tshirtSize) }
+                    : {})
             })
             .select()
             .maybeSingle();

@@ -21,6 +21,7 @@
     "migrate:passwords": "node scripts/migrate_passwords_bcrypt.js",
     "docs:check": "node scripts/check_openapi_coverage.mjs",
     "db:local": "node scripts/start-local-postgrest.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
     "migrate:family": "node scripts/run_family_migration.mjs"
   },
   "dependencies": {

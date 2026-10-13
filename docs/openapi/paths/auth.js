@@ -213,6 +213,8 @@ export const authPaths = {
                         aadhaar: { type: "string", example: "123412341234" },
                         apartment: { type: "string", example: "Green Meadows" },
                         street: { type: "string", example: "MVP Colony" },
+                        flatBuildingWing: { type: "string", maxLength: 150, example: "Flat 402, B Wing, Sai Residency" },
+                        tshirtSize: { type: "string", maxLength: 20, example: "Adult - XL" },
                         city: { type: "string", example: "Visakhapatnam" },
                         state: { type: "string", example: "Andhra Pradesh" },
                         pincode: { type: "string", example: "530017" },
