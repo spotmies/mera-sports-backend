@@ -203,7 +203,20 @@ export const saveLeagueConfig = async (req, res) => {
             // Preserve directKnockout flag (teams sent straight to knockout, no league rounds)
             ...(rules?.directKnockout === true ? { directKnockout: true } : {}),
             // Preserve player ranks assigned by admin in league tab
-            ...(rules?.playerRanks && typeof rules.playerRanks === 'object' && Object.keys(rules.playerRanks).length > 0 ? { playerRanks: rules.playerRanks } : {})
+            ...(rules?.playerRanks && typeof rules.playerRanks === 'object' && Object.keys(rules.playerRanks).length > 0 ? { playerRanks: rules.playerRanks } : {}),
+            // Admin's manual order for tied rows in the group tables ("G<label>|pts:<n>" -> ids).
+            // Stored so the player site ranks ties the same way and it survives a reload.
+            ...(() => {
+                const raw = rules?.tieBreakOrder;
+                if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+                const clean = {};
+                for (const [key, ids] of Object.entries(raw).slice(0, 500)) {
+                    if (typeof key !== 'string' || key.length > 120 || !Array.isArray(ids)) continue;
+                    const list = ids.filter((id) => typeof id === 'string' && id.length <= 120).slice(0, 200);
+                    if (list.length > 1) clean[key] = list;
+                }
+                return Object.keys(clean).length > 0 ? { tieBreakOrder: clean } : {};
+            })()
         };
 
         // Determine category_id and category_label

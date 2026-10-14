@@ -68,6 +68,8 @@ const EVENT_EDITABLE_FIELDS = [
     "community_restrictions_enabled", "allowed_community_ids", "allowed_community_names", "allowed_institute_names", "community_restriction_message",
     // Organiser's note shown to players in a pop-up while they register.
     "registration_message",
+    // Limit every player to one category of the event (registrationRules.js).
+    "single_category_only",
 ];
 // Who runs an event and its lifecycle status are the superadmin's call.
 const SUPERADMIN_ONLY_EVENT_FIELDS = ["assigned_admin_ids", "assigned_to", "status"];
@@ -340,6 +342,8 @@ export const getEventDetails = async (req, res) => {
         eventData.allowed_community_ids = normalizeCommunityIds(eventData.allowed_community_ids);
         eventData.community_restriction_message = eventData.community_restriction_message || null;
         eventData.registration_message = eventData.registration_message || null;
+        // Events from before the column existed read as "off".
+        eventData.single_category_only = eventData.single_category_only === true;
         eventData.allowed_institute_names = normalizeInstituteNames(eventData.allowed_institute_names);
         try {
             eventData.allowed_communities = eventData.community_restrictions_enabled
@@ -436,6 +440,9 @@ export const createEvent = async (req, res) => {
         const pickedFields = pickEventFields(rest, { superadmin: isSuperAdmin, includePayment: true });
         if (Object.prototype.hasOwnProperty.call(pickedFields, "registration_message")) {
             pickedFields.registration_message = normalizeRestrictionMessage(pickedFields.registration_message);
+        }
+        if (Object.prototype.hasOwnProperty.call(pickedFields, "single_category_only")) {
+            pickedFields.single_category_only = pickedFields.single_category_only === true;
         }
         const communityError = await applyCommunityRestriction(pickedFields);
         if (communityError) return res.status(400).json({ message: communityError });
@@ -538,6 +545,9 @@ export const updateEvent = async (req, res) => {
 
         if (updates.hasOwnProperty('registration_message')) {
             updates.registration_message = normalizeRestrictionMessage(updates.registration_message);
+        }
+        if (updates.hasOwnProperty('single_category_only')) {
+            updates.single_category_only = updates.single_category_only === true;
         }
         const touchesCommunity = ['community_restrictions_enabled', 'allowed_community_ids', 'allowed_community_names', 'allowed_institute_names'].some((k) => updates.hasOwnProperty(k));
         let currentCommunity = null;

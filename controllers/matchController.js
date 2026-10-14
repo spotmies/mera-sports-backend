@@ -10,7 +10,7 @@ import {
 } from "../utils/matchesCache.js";
 
 // The single rule for "which rows belong to this category?" — see utils/categoryKeys.js.
-import { fetchCategoryBracketRows, isUuid } from "../utils/categoryKeys.js";
+import { fetchCategoryBracketRows, isRoundScopedId, isUuid } from "../utils/categoryKeys.js";
 
 /** Normalize round name for consistent matching. ALWAYS use for any round_name comparison. */
 const normalizeRoundName = (s) => String(s ?? "").trim().toLowerCase();
@@ -2210,37 +2210,13 @@ export const finalizeRoundMatches = async (req, res) => {
         // ---- Winner propagation through bracket_data using bracket_match_id ----
         if (updates.length > 0) {
             try {
-                // Bracket lookup must be robust:
-                // - Some deployments store non-UUID category IDs (numeric/string) in category_id
-                // - Some UIs pass categoryName with extra suffixes; exact equality can fail
-                // Strategy: try category_id first (any string), then exact category name, then partial match.
-                let bracketRows = null;
-                let bracketErr = null;
+                // Same resolver as the lookup above. The hand-rolled one compared a
+                // numeric id against the uuid `category_id` column, which errors, so
+                // form-created categories (bracket keyed by `category`) never got
+                // their winners written into bracket_data here.
+                const bracketRows = await fetchCategoryBracketRows(eventId, categoryId, categoryName, { mode: 'BRACKET' });
 
-                if (categoryId) {
-                    const r1 = await supabaseAdmin
-                        .from('event_brackets')
-                        .select('*')
-                        .eq('event_id', eventId)
-                        .eq('mode', 'BRACKET')
-                        .eq('category_id', categoryId);
-                    bracketRows = r1.data;
-                    bracketErr = r1.error;
-                }
-
-                if ((!bracketRows || bracketRows.length === 0) && categoryName) {
-                    const r2 = await supabaseAdmin
-                        .from('event_brackets')
-                        .select('*')
-                        .eq('event_id', eventId)
-                        .eq('mode', 'BRACKET')
-                        .eq('category', categoryName);
-                    bracketRows = r2.data;
-                    bracketErr = r2.error;
-
-                }
-
-                if (!bracketErr && bracketRows && bracketRows.length > 0) {
+                if (bracketRows.length > 0) {
                     const bracket = bracketRows[0];
                     const bracketDataObj = bracket.bracket_data || bracket.bracketData || { rounds: [], players: [] };
                     const rounds = Array.isArray(bracketDataObj.rounds) ? bracketDataObj.rounds : [];
@@ -3106,7 +3082,8 @@ export const getPublicMatches = async (req, res) => {
             // Exact keys only. This is what the old code narrowed down to after
             // its lookups, so the lookups are skipped rather than reproduced.
             matchingCategoryIds.add(categoryId);
-            if (categoryName) matchingCategoryIds.add(categoryName);
+            // A round-scoped id's label is the base category's — see getMatches.
+            if (categoryName && !isRoundScopedId(categoryId)) matchingCategoryIds.add(categoryName);
         } else {
             // categoryName-only fallback: matches.category_id is not written
             // consistently (sometimes the category's id, sometimes its display
@@ -3258,7 +3235,11 @@ export const getMatches = async (req, res) => {
         // Accept every key the caller knows for this one category. Both values always
         // identify the same category (the client derives them from one category
         // object), so this widens nothing — it only stops rows from going missing.
-        const categoryKeys = [categoryId, categoryName]
+        //
+        // Except for a round-scoped id ("<id>_R2"): the label sent with it is the BASE
+        // category's label, so OR-ing it in returned the base round's label-keyed rows
+        // inside Round 2. Round rows are always written under the round id.
+        const categoryKeys = [categoryId, isRoundScopedId(categoryId) ? null : categoryName]
             .map((v) => (v == null ? "" : String(v).trim()))
             .filter((v) => v.length > 0);
         const uniqueCategoryKeys = Array.from(new Set(categoryKeys));

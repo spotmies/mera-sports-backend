@@ -213,6 +213,19 @@ export const assertCategoriesOpen = (event, requestedCategoryIds) => {
     }
 };
 
+// ── One category per player (organiser's event-level switch) ────────────────
+/**
+ * events.single_category_only: the organiser limits every player to ONE
+ * category of the event, however many they are eligible for. A player holds a
+ * place the same way the duplicate check counts it — registered themselves, or
+ * entered by a captain as a partner/team-mate — and a rejected or cancelled
+ * entry frees them again. Enforced in validateRegistrationEntries; paid-order
+ * rebuilds (verify/webhook/reconcile) never re-check, so a captured payment is
+ * always recorded.
+ */
+export const isSingleCategoryOnly = (event) => event?.single_category_only === true;
+export const SINGLE_CATEGORY_MESSAGE = "This event allows each player to register in only one category.";
+
 // ── Category eligibility (server-side mirror of the player app's check) ──────
 // The player app disables ineligible categories, but that is browser-side only.
 // Without this the gate is cosmetic: a crafted request could enter any category.
@@ -362,19 +375,20 @@ const memberDisplay = (member, user) => {
 
 // ── Duplicate entries ────────────────────────────────────────────────────────
 /**
- * Who already holds a place in each requested category of this event.
+ * Every active category entry of this event and who it puts on court.
  *
  * A registration puts its payer in every category it lists. Its team (when it
  * has one) is in the Doubles/Team categories only: rows from before per-category
  * teams could carry a team_id alongside a singles category, and the team-mates
  * were never entered in that singles draw.
  *
- * Returns Map<categoryId, Set<userId>>.
+ * Returns [{ entry, matchType, payerId, teamUserIds }] — `entry` is the stored
+ * category, `matchType` its stored match type (null on legacy entries), and
+ * `teamUserIds` the captain + members of the row's team (empty without one).
+ * Loaded once per validation and read by both the per-category duplicate check
+ * and the event-wide one-category rule.
  */
-const loadCategoryParticipants = async (event, requestedCats) => {
-    const result = new Map(requestedCats.map((c) => [String(c.id), new Set()]));
-    if (requestedCats.length === 0) return result;
-
+const loadActiveEventEntries = async (event) => {
     const { data: regs, error } = await supabaseAdmin
         .from("event_registrations")
         .select("id, player_id, team_id, categories, status")
@@ -396,30 +410,80 @@ const loadCategoryParticipants = async (event, requestedCats) => {
     const resolveMember = await fetchUsersForMembers(allMembers.filter((m) => !isUuid(m?.id)));
     const memberUserId = (m) => (isUuid(m?.id) ? m.id.trim() : resolveMember(m)?.id || null);
 
-    const targets = requestedCats.map((cat) => ({
-        cat,
-        target: buildCategoryTarget(cat.id, `${cat.name} - ${cat.gender} - ${cat.matchType}`),
-    }));
-
+    const out = [];
     for (const reg of regs || []) {
         const entries = Array.isArray(reg.categories) ? reg.categories : (reg.categories ? [reg.categories] : []);
-        for (const entry of entries) {
-            for (const { cat, target } of targets) {
-                if (!registrationMatchesCategory({ categories: [entry] }, target)) continue;
-                const holders = result.get(String(cat.id));
-                if (reg.player_id) holders.add(String(reg.player_id));
-
-                const entryMatchType = entry && typeof entry === "object" ? entry.matchType : null;
-                const team = reg.team_id ? teamsById.get(String(reg.team_id)) : null;
-                if (team && isTeamMatchType(entryMatchType || cat.matchType)) {
-                    if (team.captain_id) holders.add(String(team.captain_id));
-                    for (const m of memberList(team)) {
-                        const uid = memberUserId(m);
-                        if (uid) holders.add(String(uid));
-                    }
-                }
+        const team = reg.team_id ? teamsById.get(String(reg.team_id)) : null;
+        const teamUserIds = [];
+        if (team) {
+            if (team.captain_id) teamUserIds.push(String(team.captain_id));
+            for (const m of memberList(team)) {
+                const uid = memberUserId(m);
+                if (uid) teamUserIds.push(String(uid));
             }
         }
+        for (const entry of entries) {
+            out.push({
+                entry,
+                matchType: entry && typeof entry === "object" ? entry.matchType || null : null,
+                payerId: reg.player_id ? String(reg.player_id) : null,
+                teamUserIds,
+            });
+        }
+    }
+    return out;
+};
+
+/**
+ * Who already holds a place in each requested category of this event.
+ * Returns Map<categoryId, Set<userId>>.
+ */
+const categoryParticipants = (activeEntries, requestedCats) => {
+    const result = new Map();
+    for (const cat of requestedCats) {
+        const holders = new Set();
+        const target = buildCategoryTarget(cat.id, `${cat.name} - ${cat.gender} - ${cat.matchType}`);
+        for (const e of activeEntries) {
+            if (!registrationMatchesCategory({ categories: [e.entry] }, target)) continue;
+            if (e.payerId) holders.add(e.payerId);
+            if (isTeamMatchType(e.matchType || cat.matchType)) {
+                for (const uid of e.teamUserIds) holders.add(uid);
+            }
+        }
+        result.set(String(cat.id), holders);
+    }
+    return result;
+};
+
+/**
+ * For events limited to one category per player: the category each player
+ * already holds in this event. Returns Map<userId, label>.
+ *
+ * Same "holds a place" rule as above, applied event-wide. A legacy entry with
+ * no stored match type takes it from the event's category of that id/name;
+ * when that category is gone too, a team on the row is taken to have been
+ * entered in it — the safe reading for a rule that only ever blocks.
+ */
+const eventParticipants = (activeEntries, normalizedCategories) => {
+    const result = new Map();
+    for (const e of activeEntries) {
+        const entryId = e.entry && typeof e.entry === "object"
+            ? String(e.entry.id ?? e.entry.name ?? e.entry.category ?? "")
+            : String(e.entry ?? "");
+        const eventCat = findEventCategory(normalizedCategories, entryId);
+        const matchType = e.matchType || eventCat?.matchType || null;
+        const label = e.entry && typeof e.entry === "object"
+            ? categoryLabel({
+                name: e.entry.name || e.entry.category || eventCat?.name,
+                gender: e.entry.gender || eventCat?.gender,
+                matchType,
+            })
+            : (eventCat ? categoryLabel(eventCat) : String(e.entry || "another category"));
+
+        const holders = [];
+        if (e.payerId) holders.push(e.payerId);
+        if (matchType === null || isTeamMatchType(matchType)) holders.push(...e.teamUserIds);
+        for (const uid of holders) if (!result.has(uid)) result.set(uid, label);
     }
     return result;
 };
@@ -487,6 +551,13 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
         }
         const fee = cat.entryFee ?? baseFee;
         resolved.push({ cat, teamId: isTeam ? entry.teamId : null, categoryObject: toCategoryObject(cat, fee), fee });
+    }
+
+    // One-category events: one entry per checkout. Checked before anything is
+    // loaded — no point resolving teams for a request that cannot pass.
+    const oneCategoryOnly = isSingleCategoryOnly(event);
+    if (oneCategoryOnly && resolved.length > 1) {
+        throw badRequest(SINGLE_CATEGORY_MESSAGE + " Please select just one category.", "SINGLE_CATEGORY_ONLY");
     }
 
     assertCategoriesOpen(event, resolved.map((r) => r.cat.id));
@@ -568,7 +639,8 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
     }
 
     // Nobody may be entered twice in the same category.
-    const participants = await loadCategoryParticipants(event, resolved.map((r) => r.cat));
+    const activeEntries = await loadActiveEventEntries(event);
+    const participants = categoryParticipants(activeEntries, resolved.map((r) => r.cat));
     for (const r of resolved) {
         const holders = participants.get(String(r.cat.id));
         const extra = { categoryId: String(r.cat.id) };
@@ -581,6 +653,33 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
                     `${memberDisplay(member, user)} is already registered in "${categoryLabel(r.cat)}". A player can be entered only once per category.`,
                     "ALREADY_REGISTERED", extra
                 );
+            }
+        }
+    }
+
+    // One-category events: nobody on this entry — payer or partner/team-mate —
+    // may already hold a place in any other category of the event. Runs after
+    // the per-category check so "already in THIS category" keeps its own,
+    // more precise message.
+    if (oneCategoryOnly) {
+        const held = eventParticipants(activeEntries, normalized);
+        for (const r of resolved) {
+            const extra = { categoryId: String(r.cat.id) };
+            const payerHolds = held.get(String(userId));
+            if (payerHolds) {
+                throw badRequest(
+                    `${SINGLE_CATEGORY_MESSAGE} You are already registered in "${payerHolds}".`,
+                    "SINGLE_CATEGORY_ONLY", extra
+                );
+            }
+            for (const { member, user } of r.roster || []) {
+                const memberHolds = held.get(String(user.id));
+                if (memberHolds) {
+                    throw badRequest(
+                        `${memberDisplay(member, user)} is already registered in "${memberHolds}". ${SINGLE_CATEGORY_MESSAGE}`,
+                        "SINGLE_CATEGORY_ONLY", extra
+                    );
+                }
             }
         }
     }

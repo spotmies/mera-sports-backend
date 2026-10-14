@@ -11,6 +11,7 @@
     "seed:event": "node scripts/seed_test_event.js",
     "seed:fresh": "node scripts/seed_fresh_test_event.js",
     "check:db": "node scripts/check_db.js",
+    "audit:categories": "node scripts/audit_category_isolation.js",
     "seed:multi": "node scripts/seed_multi_category_event.js",
     "seed:football": "node scripts/seed_football_event.js",
     "seed:team-league": "node scripts/seed_team_league.js",
