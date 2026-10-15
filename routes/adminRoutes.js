@@ -40,6 +40,8 @@ import {
     getPlayerDetails,
     listPlayers
 } from "../controllers/adminPlayerController.js";
+import { getDashboardStatsForRole } from "../controllers/adminDashboardController.js";
+import { getPlayerDetailsForRole, listPlayersForRole } from "../controllers/adminScopedController.js";
 import {
     getBroadcastAudience,
     getBroadcastDetail,
@@ -90,7 +92,7 @@ router.post("/update-admin-role/:id", superOnly, updateAdminRole);
 router.delete("/delete-admin/:id", superOnly, deleteAdmin);
 
 /* ================= DASHBOARD ================= */
-router.get("/dashboard-stats", verifyAdmin, getDashboardStats);
+router.get("/dashboard-stats", verifyAdmin, getDashboardStatsForRole);
 router.post("/upload", verifyAdmin, uploadAsset);
 /* ================= BROADCASTS ================= */
 // /broadcast/audience must be declared before any /broadcast/:something route
@@ -103,8 +105,10 @@ router.post("/broadcasts/:id/retry", verifyAdmin, requirePermission("broadcast")
 router.post("/broadcasts/:id/refresh", verifyAdmin, requirePermission("broadcast"), refreshBroadcast);
 
 /* ================= PLAYER MANAGEMENT ================= */
-router.get("/players", verifyAdmin, listPlayers);
-router.get("/players/:id", verifyAdmin, getPlayerDetails);
+// A super admin sees every player; an admin sees only the players registered in
+// the events assigned to them.
+router.get("/players", verifyAdmin, listPlayersForRole);
+router.get("/players/:id", verifyAdmin, getPlayerDetailsForRole);
 
 /* ================= SETTINGS ================= */
 router.get("/settings", verifyAdmin, getSettings);

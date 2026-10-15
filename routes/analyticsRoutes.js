@@ -5,7 +5,8 @@ import {
     getAnalyticsDashboard,
     getAnalyticsStatus,
 } from "../controllers/analyticsController.js";
-import { verifyAdmin } from "../middleware/rbacMiddleware.js";
+import { getAnalyticsDashboardForRole } from "../controllers/adminScopedController.js";
+import { requireSuperAdmin, verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 /**
  * Two routers because the two halves have opposite trust models, and keeping
@@ -26,8 +27,9 @@ analyticsRoutes.post("/collect", collectEvents);
 // ── Admin reporting ────────────────────────────────────────────────────────
 const adminAnalyticsRoutes = express.Router();
 
-adminAnalyticsRoutes.get("/", verifyAdmin, getAnalyticsDashboard);
-adminAnalyticsRoutes.get("/status", verifyAdmin, getAnalyticsStatus);
+// A super admin gets the whole report; an admin gets the funnel of their assigned events only.
+adminAnalyticsRoutes.get("/", verifyAdmin, getAnalyticsDashboardForRole);
+adminAnalyticsRoutes.get("/status", verifyAdmin, requireSuperAdmin, getAnalyticsStatus);
 
 export { adminAnalyticsRoutes };
 export default analyticsRoutes;

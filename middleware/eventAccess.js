@@ -4,9 +4,11 @@ import { resolveEventIdByIdentifier } from "../utils/eventResolver.js";
 
 // --------------------------------------------------------------------------
 // "Can this admin manage this event?"
-//   A superadmin can manage every event. An admin can manage an event they
-//   created, or one they are assigned to (events.assigned_to or a row in
-//   event_admin_assignments). Everything event-scoped in the admin API —
+//   A superadmin can manage every event. An admin can manage only an event a
+//   super admin assigned them to (events.assigned_to or a row in
+//   event_admin_assignments). Creating an event does not grant access by
+//   itself: an admin who creates one is assigned to it at creation, and a
+//   former super admin keeps nothing from the events they created. Everything event-scoped in the admin API —
 //   editing, draws, matches, scores, leagues, heats, news, media, payment
 //   verification — goes through this one rule.
 // --------------------------------------------------------------------------
@@ -20,7 +22,7 @@ export const invalidateEventAccessCache = (adminId = "*", eventId = "*") =>
 /** Internal ids (as strings) of every event this admin may manage. */
 export const getManageableEventIds = async (adminId) => {
     const [direct, assigned] = await Promise.all([
-        supabaseAdmin.from("events").select("id").or(`created_by.eq.${adminId},assigned_to.eq.${adminId}`),
+        supabaseAdmin.from("events").select("id").eq("assigned_to", adminId),
         supabaseAdmin.from("event_admin_assignments").select("event_id").eq("admin_id", adminId),
     ]);
     if (direct.error) throw direct.error;
@@ -38,14 +40,13 @@ const adminManagesEvent = async (adminId, eventId) => {
     if (cached) return cached.allowed;
 
     const [{ data: event, error: eventError }, assignment] = await Promise.all([
-        supabaseAdmin.from("events").select("created_by, assigned_to").eq("id", eventId).maybeSingle(),
+        supabaseAdmin.from("events").select("assigned_to").eq("id", eventId).maybeSingle(),
         supabaseAdmin.from("event_admin_assignments").select("event_id").eq("event_id", eventId).eq("admin_id", adminId).limit(1),
     ]);
     if (eventError) throw eventError;
     if (assignment.error && assignment.error.code !== "42P01") throw assignment.error;
 
     const allowed = !!event && (
-        String(event.created_by) === String(adminId) ||
         String(event.assigned_to) === String(adminId) ||
         (assignment.data || []).length > 0
     );

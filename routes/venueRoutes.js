@@ -10,7 +10,7 @@ import {
     updateVenueMedia,
     uploadVenueFile,
 } from "../controllers/venueController.js";
-import { verifyAdmin } from "../middleware/rbacMiddleware.js";
+import { requirePermission, verifyAdmin } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
 
@@ -73,13 +73,13 @@ const handleUpload = (req, res, next) => {
 router.get("/media", getVenueMedia);
 
 // Admin — includes hidden rows, and every write.
-router.get("/media/all", verifyAdmin, getAllVenueMedia);
+router.get("/media/all", verifyAdmin, requirePermission("venue_media"), getAllVenueMedia);
 // Declared before "/media/:id" so "upload" and "reorder" are not captured as ids.
-router.post("/media/upload", verifyAdmin, handleUpload, uploadVenueFile);
-router.patch("/media/reorder", verifyAdmin, reorderVenueMedia);
-router.post("/media", verifyAdmin, createVenueMedia);
-router.put("/media/:id", verifyAdmin, updateVenueMedia);
-router.patch("/media/:id/toggle", verifyAdmin, toggleVenueMedia);
-router.delete("/media/:id", verifyAdmin, deleteVenueMedia);
+router.post("/media/upload", verifyAdmin, requirePermission("venue_media"), handleUpload, uploadVenueFile);
+router.patch("/media/reorder", verifyAdmin, requirePermission("venue_media"), reorderVenueMedia);
+router.post("/media", verifyAdmin, requirePermission("venue_media"), createVenueMedia);
+router.put("/media/:id", verifyAdmin, requirePermission("venue_media"), updateVenueMedia);
+router.patch("/media/:id/toggle", verifyAdmin, requirePermission("venue_media"), toggleVenueMedia);
+router.delete("/media/:id", verifyAdmin, requirePermission("venue_media"), deleteVenueMedia);
 
 export default router;

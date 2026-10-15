@@ -13,7 +13,6 @@ dist
 dist-ssr
 *.local
 tests
-scripts
 scripts.zip
 # Editor directories and files
 .vscode/*
@@ -26,3 +25,10 @@ scripts.zip
 *.sln
 *.sw?
 .agents/
+
+# One-off local files: patch scripts, data dumps and seed logs
+fix_*.cjs
+test_events.json
+seed_*_log.txt
+console.log*
+seed_log_*.txt

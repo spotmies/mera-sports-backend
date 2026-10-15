@@ -92,7 +92,10 @@ export const requireSuperAdmin = (req, res, next) => {
 //   reports are each gated by it. Superadmins always pass. A missing row means
 //   everything is allowed, matching getMyPermissions.
 // --------------------------------------------------------------------------
-const PERMISSION_KEYS = ["apartments", "advertisements", "broadcast", "reports"];
+const PERMISSION_KEYS = ["apartments", "advertisements", "broadcast", "reports", "venue_media"];
+// Opt-in: admins never had these, so they stay off until a super admin grants
+// them (a missing row or column counts as off, not as "allowed").
+const OPT_IN_PERMISSION_KEYS = ["venue_media"];
 const adminPermissionCacheKey = (id) => `admin:perm:${id}`;
 
 export const invalidateAdminPermissionCache = (adminId) => cacheDel(adminPermissionCacheKey(adminId));
@@ -102,7 +105,7 @@ const loadAdminPermissions = async (adminId) => {
     if (cached) return cached;
     const { data, error } = await supabaseAdmin
         .from("admin_permissions")
-        .select("permit, apartments, advertisements, broadcast, reports")
+        .select("*")
         .eq("admin_id", adminId)
         .maybeSingle();
     if (error) throw error;
@@ -114,7 +117,8 @@ const loadAdminPermissions = async (adminId) => {
 export const adminHasPermission = async (user, key) => {
     if (user?.role === 'superadmin') return true;
     const permissions = await loadAdminPermissions(user.id);
-    return permissions.permit !== false && permissions[key] !== false;
+    if (permissions.permit === false) return false;
+    return OPT_IN_PERMISSION_KEYS.includes(key) ? permissions[key] === true : permissions[key] !== false;
 };
 
 // Use after verifyAdmin (or after a middleware that sets req.user). Only admin

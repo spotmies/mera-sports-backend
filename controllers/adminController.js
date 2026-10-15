@@ -554,7 +554,7 @@ export const getAllPermissions = async (req, res) => {
         // Fetch all permission rows
         const { data: perms, error: permsError } = await supabaseAdmin
             .from("admin_permissions")
-            .select("admin_id, permit, apartments, advertisements, broadcast, reports");
+            .select("*");
 
         if (permsError) throw permsError;
 
@@ -572,7 +572,9 @@ export const getAllPermissions = async (req, res) => {
                 apartments: perm ? perm.apartments : true,
                 advertisements: perm ? perm.advertisements : true,
                 broadcast: perm ? perm.broadcast : true,
-                reports: perm ? perm.reports : true
+                reports: perm ? perm.reports : true,
+                // Opt-in: off unless a super admin turned it on
+                venue_media: perm?.venue_media === true
             };
         });
 
@@ -591,7 +593,7 @@ export const updatePermissions = async (req, res) => {
         }
 
         const { adminId } = req.params;
-        const { permit, apartments, advertisements, broadcast, reports } = req.body;
+        const { permit, apartments, advertisements, broadcast, reports, venue_media } = req.body;
 
         // Build only the fields that were sent
         const updates = { updated_at: new Date().toISOString(), updated_by: req.user.id };
@@ -600,11 +602,30 @@ export const updatePermissions = async (req, res) => {
         if (advertisements !== undefined) updates.advertisements = advertisements;
         if (broadcast !== undefined) updates.broadcast = broadcast;
         if (reports !== undefined) updates.reports = reports;
+        if (venue_media !== undefined) updates.venue_media = venue_media;
 
         // Upsert: insert if no row, update if one exists
-        const { error } = await supabaseAdmin
+        let { error } = await supabaseAdmin
             .from("admin_permissions")
             .upsert({ admin_id: adminId, ...updates }, { onConflict: "admin_id" });
+
+        // The venue_media column comes from
+        // scripts/add_venue_media_permission.sql. Until that has been applied,
+        // switching it OFF is a no-op (it is already off), so save the rest;
+        // switching it ON cannot be saved and says why.
+        const isMissingColumn = (e) => e && (e.code === "42703" || e.code === "PGRST204");
+        if (isMissingColumn(error)) {
+            if (venue_media === true) {
+                return res.status(409).json({
+                    success: false,
+                    message: "The Venue Media permission needs a database update first. Ask the developer to run add_venue_media_permission.sql.",
+                });
+            }
+            delete updates.venue_media;
+            ({ error } = await supabaseAdmin
+                .from("admin_permissions")
+                .upsert({ admin_id: adminId, ...updates }, { onConflict: "admin_id" }));
+        }
 
         if (error) throw error;
 
@@ -623,20 +644,29 @@ export const getMyPermissions = async (req, res) => {
         if (req.user.role === 'superadmin') {
             return res.json({
                 success: true,
-                permissions: { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true }
+                permissions: { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true, venue_media: true }
             });
         }
 
         const { data: perm, error } = await supabaseAdmin
             .from("admin_permissions")
-            .select("permit, apartments, advertisements, broadcast, reports")
+            .select("*")
             .eq("admin_id", req.user.id)
             .maybeSingle();
 
         if (error) throw error;
 
-        // If no row exists yet, return all true as safe default
-        const permissions = perm || { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true };
+        // If no row exists yet, return all true as safe default, except the
+        // opt-in switch (venue_media), which stays off until granted.
+        const base = perm || { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true };
+        const permissions = {
+            permit: base.permit,
+            apartments: base.apartments,
+            advertisements: base.advertisements,
+            broadcast: base.broadcast,
+            reports: base.reports,
+            venue_media: perm?.venue_media === true,
+        };
 
         res.json({ success: true, permissions });
     } catch (err) {

@@ -209,7 +209,7 @@ export const listEvents = async (req, res) => {
         if (created_by) query = query.eq('created_by', created_by);
         if (admin_id) {
             const multiAssignedEventIds = await getAssignedEventIdsForAdmin(admin_id);
-            const orParts = [`created_by.eq.${admin_id}`, `assigned_to.eq.${admin_id}`];
+            const orParts = [`assigned_to.eq.${admin_id}`];
 
             if (multiAssignedEventIds.length > 0) {
                 orParts.push(`id.in.(${multiAssignedEventIds.join(',')})`);
@@ -511,7 +511,8 @@ export const createEvent = async (req, res) => {
             }
         }
 
-        await syncEventAdminAssignments(data.id, normalizedAssignedAdminIds, created_by);
+        // An admin's own new event is assigned to them here, since creating it grants no access by itself.
+        await syncEventAdminAssignments(data.id, isSuperAdmin ? normalizedAssignedAdminIds : [created_by], created_by);
         const assignedAdmins = await loadAssignedAdminsForEvent(data.id);
         data.assigned_admins = assignedAdmins;
         data.assigned_admin_ids = assignedAdmins.map((admin) => admin.id);
