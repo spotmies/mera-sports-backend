@@ -25,7 +25,7 @@ scripts.zip
 *.sln
 *.sw?
 .agents/
-
+scripts/
 # One-off local files: patch scripts, data dumps and seed logs
 fix_*.cjs
 test_events.json

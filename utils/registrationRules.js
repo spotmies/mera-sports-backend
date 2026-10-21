@@ -232,10 +232,12 @@ export const SINGLE_CATEGORY_MESSAGE = "This event allows each player to registe
 //
 // Age rules are encoded in the category NAME, exactly as the player app parses
 // them: "U-15" => max age 15, "Above 40" => min age 40, "All" => unrestricted.
+// Any run of spaces/hyphens/dashes may separate the word from the number —
+// "Above-55" and "Above -55" used to parse as unrestricted.
 export const parseCategoryAgeRules = (name) => {
     const label = String(name || "");
-    const maxMatch = label.match(/(?:U|Under)[-\s]?(\d+)/i);
-    const minMatch = label.match(/(?:Above|Over)\s*(\d+)|\b(\d+)\s*\+/i);
+    const maxMatch = label.match(/(?:U|Under)[\s\-–—]*(\d+)/i);
+    const minMatch = label.match(/(?:Above|Over)[\s\-–—]*(\d+)|\b(\d+)\s*\+/i);
     return {
         ageLimit: maxMatch ? Number.parseInt(maxMatch[1], 10) : undefined,
         minAge: minMatch ? Number.parseInt(minMatch[1] ?? minMatch[2], 10) : undefined,
