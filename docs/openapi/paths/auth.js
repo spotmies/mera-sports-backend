@@ -264,6 +264,48 @@ export const authPaths = {
         },
     },
 
+    "/api/auth/family-profiles": {
+        get: {
+            tags: AUTH_TAG,
+            summary: "Family profiles this session can switch to",
+            description:
+                "The family head who signed in plus the members they manage (children, and members with no email) — the same set the shared-mobile login chooser offers. A session opened by a member's own password lists only that member.",
+            security: [{ bearerAuth: [] }],
+            responses: {
+                ...ok("Switchable profiles.", obj({
+                    success: { type: "boolean" },
+                    currentId: { type: "string", format: "uuid" },
+                    profiles: {
+                        type: "array",
+                        items: obj({
+                            id: { type: "string", format: "uuid" },
+                            player_id: { type: "string" },
+                            name: { type: "string" },
+                            photos: { type: "string", nullable: true },
+                            age: { type: "integer", nullable: true },
+                            relation: { type: "string", example: "Child" },
+                        }),
+                    },
+                })),
+                ...errors(401, 403, 500),
+            },
+        },
+    },
+
+    "/api/auth/switch-profile": {
+        post: {
+            tags: AUTH_TAG,
+            summary: "Switch the session to another family profile",
+            description: "Returns a new player session for `userId`, which must be one of `GET /api/auth/family-profiles`.",
+            security: [{ bearerAuth: [] }],
+            requestBody: jsonBody(obj({ userId: { type: "string", format: "uuid" } }, ["userId"])),
+            responses: {
+                ...ok("Switched.", { $ref: "#/components/schemas/AuthSuccess" }),
+                ...errors(400, 401, 403, 500),
+            },
+        },
+    },
+
     /* ── admin ───────────────────────────────────────────────────────────── */
 
     "/api/auth/register-admin": {

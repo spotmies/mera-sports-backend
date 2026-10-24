@@ -2,10 +2,12 @@ import express from "express";
 import {
     checkUserConflict,
     getCurrentUser,
+    getSwitchableProfiles,
     loginAdmin,
     loginPlayer,
     reapplyGoogleAdmin,
     selectLoginProfile,
+    switchProfile,
     registerAdmin,
     registerPlayer,
     sendMobileRegistrationOtp,
@@ -21,6 +23,7 @@ import {
     sendInstituteForgotPasswordOtp,
     verifyForgotPasswordOtp
 } from "../controllers/authController.js";
+import { verifyPlayer } from "../middleware/rbacMiddleware.js";
 
 const router = express.Router();
 
@@ -51,6 +54,9 @@ router.post("/register-player", registerPlayer);
 router.post("/login", loginPlayer);
 // Second leg of a shared-mobile login: exchange the selection token for a session.
 router.post("/login/select-profile", selectLoginProfile);
+// In-app family switch: the profiles this session may open, and opening one.
+router.get("/family-profiles", verifyPlayer, getSwitchableProfiles);
+router.post("/switch-profile", verifyPlayer, switchProfile);
 
 /* ================= ADMIN AUTH ================= */
 router.post("/register-admin", registerAdmin);

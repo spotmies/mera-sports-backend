@@ -2,7 +2,7 @@ import { supabaseAdmin } from "../config/supabaseClient.js";
 import { getManageableEventIds } from "../middleware/eventAccess.js";
 import { withoutPassword } from "../utils/userSanitize.js";
 import { getAnalyticsDashboard } from "./analyticsController.js";
-import { getPlayerDetails, listPlayers } from "./adminPlayerController.js";
+import { getPlayerDetails, listPlayers, parsePlayerListQuery, updatePlayerProfile } from "./adminPlayerController.js";
 
 // --------------------------------------------------------------------------
 // Players and analytics for an admin
@@ -14,10 +14,6 @@ import { getPlayerDetails, listPlayers } from "./adminPlayerController.js";
 
 const isSuperAdmin = (req) => req.user?.role === "superadmin";
 
-// Strip PostgREST filter-injection chars and SQL LIKE wildcards
-const sanitizeSearch = (s) =>
-    typeof s === "string" ? s.replace(/[(),;"'\\%_]/g, "").trim().slice(0, 100) : "";
-
 const emptyPlayersResponse = (res) =>
     res.json({ success: true, players: [], total_count: 0, counts: { total: 0, verified: 0, pending: 0, rejected: 0 } });
 
@@ -28,16 +24,8 @@ export const listPlayersForRole = async (req, res) => {
         const eventIds = Array.from(await getManageableEventIds(req.user.id));
         if (eventIds.length === 0) return emptyPlayersResponse(res);
 
-        const { page, limit, search, status } = req.query;
-        const safe = search ? sanitizeSearch(search) : null;
-        const searchExpr = safe
-            ? `first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%,city.ilike.%${safe}%`
-            : null;
-        const statusExpr = {
-            verified: "verification.eq.verified",
-            rejected: "verification.in.(rejected,failed)",
-            pending: "verification.is.null,verification.not.in.(verified,rejected,failed)",
-        }[status] || null;
+        const { page, limit } = req.query;
+        const { searchFilter, rowFilter, columns, withCounts } = parsePlayerListQuery(req.query);
 
         // Players with at least one registration in an assigned event. The inner
         // join keeps each player once however many registrations they have.
@@ -49,18 +37,12 @@ export const listPlayersForRole = async (req, res) => {
                 .in("event_registrations.event_id", eventIds);
         const scoped = (options) => {
             let q = inMyEvents("id", options);
-            if (searchExpr) q = q.or(searchExpr);
+            if (searchFilter) q = q.or(searchFilter);
             return q;
         };
 
-        let query = statusExpr
-            ? inMyEvents("*", { count: "exact" })
-                .or(searchExpr ? `and(or(${searchExpr}),or(${statusExpr}))` : statusExpr)
-            : (() => {
-                let q = inMyEvents("*", { count: "exact" });
-                if (searchExpr) q = q.or(searchExpr);
-                return q;
-            })();
+        let query = inMyEvents(columns, { count: "exact" });
+        if (rowFilter) query = query.or(rowFilter);
         query = query.order("created_at", { ascending: false });
 
         if (page && limit) {
@@ -70,11 +52,13 @@ export const listPlayersForRole = async (req, res) => {
 
         const [rowsRes, verifiedRes, rejectedRes, totalRes] = await Promise.all([
             query,
-            scoped({ count: "exact", head: true }).eq("verification", "verified"),
-            scoped({ count: "exact", head: true }).in("verification", ["rejected", "failed"]),
-            statusExpr ? scoped({ count: "exact", head: true }) : null,
+            withCounts ? scoped({ count: "exact", head: true }).eq("verification", "verified") : null,
+            withCounts ? scoped({ count: "exact", head: true }).in("verification", ["rejected", "failed"]) : null,
+            withCounts && rowFilter !== searchFilter ? scoped({ count: "exact", head: true }) : null,
         ]);
         if (rowsRes.error) throw rowsRes.error;
+        const players = (rowsRes.data || []).map(({ event_registrations, ...player }) => withoutPassword(player));
+        if (!withCounts) return res.json({ success: true, players, total_count: rowsRes.count ?? 0 });
         if (totalRes?.error) throw totalRes.error;
 
         const rowCount = rowsRes.count ?? 0;
@@ -85,7 +69,7 @@ export const listPlayersForRole = async (req, res) => {
 
         res.json({
             success: true,
-            players: (rowsRes.data || []).map(({ event_registrations, ...player }) => withoutPassword(player)),
+            players,
             total_count: rowCount,
             counts: { total, verified, pending, rejected },
         });
@@ -125,6 +109,29 @@ export const getPlayerDetailsForRole = async (req, res) => {
     } catch (err) {
         console.error("ASSIGNED EVENTS PLAYER DETAIL ERROR:", err);
         res.status(500).json({ message: "Failed to fetch player details" });
+    }
+};
+
+// PATCH /api/admin/players/:id/profile
+// An admin may correct the players they can see: those registered in an
+// event assigned to them.
+export const updatePlayerProfileForRole = async (req, res) => {
+    if (isSuperAdmin(req)) return updatePlayerProfile(req, res);
+    try {
+        const eventIds = Array.from(await getManageableEventIds(req.user.id));
+        if (eventIds.length === 0) return res.status(404).json({ success: false, message: "Player not found" });
+        const { data: shared, error } = await supabaseAdmin
+            .from("event_registrations")
+            .select("id")
+            .eq("player_id", req.params.id)
+            .in("event_id", eventIds)
+            .limit(1);
+        if (error) throw error;
+        if ((shared || []).length === 0) return res.status(404).json({ success: false, message: "Player not found" });
+        return updatePlayerProfile(req, res);
+    } catch (err) {
+        console.error("ASSIGNED EVENTS PLAYER UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update player" });
     }
 };
 

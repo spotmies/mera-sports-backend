@@ -1,28 +1,128 @@
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { withoutPassword } from "../utils/userSanitize.js";
+import { isUuid } from "./bracket/bracketHelpers.js";
+import { calculateAge, resolveAge } from "../utils/age.js";
+import { invalidateDashboardCache } from "../utils/dashboardCache.js";
+import { normalizeGender } from "../utils/playerProfileFields.js";
 
-// Strip PostgREST filter-injection chars and SQL LIKE wildcards (% matches all rows, _ matches any char)
-const sanitizeSearch = (s) =>
-    typeof s === 'string' ? s.replace(/[(),;"'\\%_]/g, '').trim().slice(0, 100) : '';
+// Strip PostgREST filter-syntax chars and the % wildcard (it would match every
+// row). "_" is kept: as a LIKE wildcard it still matches a literal underscore,
+// and stripping it made "john_doe@x.com" search for "johndoe@x.com".
+const sanitizeSearchWord = (s) => s.replace(/[(),;"'\\%*]/g, "").slice(0, 100);
+
+const SEARCH_COLUMNS = ["first_name", "last_name", "name", "email", "mobile", "player_id", "city"];
+
+/**
+ * Search text as PostgREST OR-lists, one per word: every word must match some
+ * column. A single phrase compared column by column could never find
+ * "Ravi Kumar" (first and last name are separate columns). A phone number is
+ * reduced to its last 10 digits, so "+91 98765 43210" finds the stored mobile.
+ */
+const searchGroups = (search) => {
+    if (typeof search !== "string" || !search.trim()) return [];
+    const trimmed = search.trim().slice(0, 100);
+    const words = /^[+\d\s()-]{7,}$/.test(trimmed)
+        ? [trimmed.replace(/\D/g, "").slice(-10)]
+        : trimmed.split(/\s+/).map(sanitizeSearchWord).filter(Boolean).slice(0, 5);
+    return words.map((w) => SEARCH_COLUMNS.map((c) => `${c}.ilike.%${w}%`).join(","));
+};
+
+/**
+ * Players whose gender normalizeGender would reject (null, blank, "M", ...).
+ * Exactly the accounts assertPlayerEligible blocks from every category.
+ */
+const MISSING_GENDER_EXPR = "gender.is.null,and(gender.not.ilike.male,gender.not.ilike.female)";
+
+const GENDER_EXPR = { male: "gender.ilike.male", female: "gender.ilike.female", missing: MISSING_GENDER_EXPR };
+const DOB_EXPR = { present: "dob.not.is.null", missing: "dob.is.null" };
+
+// Pending includes null — older rows have none.
+const STATUS_EXPR = {
+    verified: "verification.eq.verified",
+    rejected: "verification.in.(rejected,failed)",
+    pending: "verification.is.null,verification.not.in.(verified,rejected,failed)",
+};
+
+const ageBound = (value) => {
+    const n = Number(value);
+    return value !== undefined && value !== "" && Number.isInteger(n) && n >= 0 && n <= 150 ? n : null;
+};
+
+/** YYYY-MM-DD for today (UTC) minus `years`. */
+const yearsAgo = (years) => {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear() - years, now.getUTCMonth(), now.getUTCDate())).toISOString().slice(0, 10);
+};
+
+/**
+ * Age range as an OR-list. Age follows the DOB where there is one (see
+ * utils/age.js), so for those rows the range becomes a DOB range; rows with no
+ * DOB fall back to the stored age column.
+ */
+const ageExpr = (minRaw, maxRaw) => {
+    const min = ageBound(minRaw);
+    const max = ageBound(maxRaw);
+    if (min === null && max === null) return null;
+    const byDob = ["dob.not.is.null"];
+    const byAge = ["dob.is.null"];
+    if (min !== null) { byDob.push(`dob.lte.${yearsAgo(min)}`); byAge.push(`age.gte.${min}`); }
+    if (max !== null) { byDob.push(`dob.gt.${yearsAgo(max + 1)}`); byAge.push(`age.lte.${max}`); }
+    return `and(${byDob.join(",")}),and(${byAge.join(",")})`;
+};
+
+/**
+ * AND several PostgREST OR-lists into the one `or` value a query can carry:
+ * a single list as-is, several as and(or(a),or(b),...).
+ */
+export const combineOrGroups = (groups) => {
+    const present = groups.filter(Boolean);
+    if (present.length <= 1) return present[0] || null;
+    return `and(${present.map((g) => `or(${g})`).join(",")})`;
+};
+
+// Enough for a player list or the Age & Gender editor; skips addresses, ids, hashes.
+const PROFILE_COLUMNS = "id, player_id, first_name, last_name, email, mobile, photos, dob, age, gender, verification, city, state, created_at";
+
+/**
+ * GET /api/admin/players query → filters, shared by the super admin and the
+ * assigned-events handlers.
+ *   search              words matched across SEARCH_COLUMNS
+ *   status              verified | pending | rejected
+ *   gender              male | female | missing   (missing=gender is the older spelling)
+ *   dob                 present | missing
+ *   ageMin, ageMax      inclusive, in years
+ *   fields=profile      PROFILE_COLUMNS instead of every column
+ *   counts=0            skip the verified/pending/rejected tile counts
+ * `searchFilter` narrows the tiles too; `rowFilter` (everything) only the rows.
+ */
+export const parsePlayerListQuery = (query = {}) => {
+    const search = searchGroups(query.search);
+    const statusExpr = STATUS_EXPR[query.status] || null;
+    const gender = query.gender || (query.missing === "gender" ? "missing" : null);
+    return {
+        searchFilter: combineOrGroups(search),
+        statusExpr,
+        rowFilter: combineOrGroups([
+            ...search,
+            statusExpr,
+            GENDER_EXPR[gender] || null,
+            DOB_EXPR[query.dob] || null,
+            ageExpr(query.ageMin, query.ageMax),
+        ]),
+        columns: query.fields === "profile" ? PROFILE_COLUMNS : "*",
+        withCounts: query.counts !== "0",
+    };
+};
 
 // GET /api/admin/players
 export const listPlayers = async (req, res) => {
     try {
-        const { page, limit, search, status } = req.query;
+        const { page, limit } = req.query;
 
-        const safe = search ? sanitizeSearch(search) : null;
-        const searchExpr = safe
-            ? `first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,email.ilike.%${safe}%,mobile.ilike.%${safe}%,player_id.ilike.%${safe}%,city.ilike.%${safe}%`
-            : null;
-
-        // Status narrows the rows only, never the tiles: the tiles keep
-        // describing the whole (searched) set so the segmented control can show
-        // what each segment holds. Pending includes null — older rows have none.
-        const statusExpr = {
-            verified: "verification.eq.verified",
-            rejected: "verification.in.(rejected,failed)",
-            pending: "verification.is.null,verification.not.in.(verified,rejected,failed)",
-        }[status] || null;
+        // Status and the other filters narrow the rows only, never the tiles:
+        // the tiles keep describing the whole (searched) set so the segmented
+        // control can show what each segment holds.
+        const { searchFilter, rowFilter, columns, withCounts } = parsePlayerListQuery(req.query);
 
         /**
          * One definition of "the players we are talking about", reused by the row
@@ -33,16 +133,13 @@ export const listPlayers = async (req, res) => {
          * these twelve".
          */
         const scoped = (options) => {
-            let q = supabaseAdmin.from("users").select("*", options).eq("role", "player");
-            if (searchExpr) q = q.or(searchExpr);
+            let q = supabaseAdmin.from("users").select("id", options).eq("role", "player");
+            if (searchFilter) q = q.or(searchFilter);
             return q;
         };
 
-        let query = statusExpr
-            ? supabaseAdmin.from("users").select("*", { count: "exact" }).eq("role", "player")
-                // One `or` holding both groups: search OR-list AND status OR-list.
-                .or(searchExpr ? `and(or(${searchExpr}),or(${statusExpr}))` : statusExpr)
-            : scoped({ count: "exact" });
+        let query = supabaseAdmin.from("users").select(columns, { count: "exact" }).eq("role", "player");
+        if (rowFilter) query = query.or(rowFilter);
         query = query.order("created_at", { ascending: false });
 
         if (page && limit) {
@@ -57,11 +154,15 @@ export const listPlayers = async (req, res) => {
         // never serialised or sent, so these stay cheap as the table grows.
         const [rowsRes, verifiedRes, rejectedRes, totalRes] = await Promise.all([
             query,
-            scoped({ count: "exact", head: true }).eq("verification", "verified"),
-            scoped({ count: "exact", head: true }).in("verification", ["rejected", "failed"]),
-            // With a status filter the row count is that segment's size, not the total.
-            statusExpr ? scoped({ count: "exact", head: true }) : null,
+            withCounts ? scoped({ count: "exact", head: true }).eq("verification", "verified") : null,
+            withCounts ? scoped({ count: "exact", head: true }).in("verification", ["rejected", "failed"]) : null,
+            // With a filter the row count is that segment's size, not the total.
+            withCounts && rowFilter !== searchFilter ? scoped({ count: "exact", head: true }) : null,
         ]);
+        if (!withCounts) {
+            if (rowsRes.error) throw rowsRes.error;
+            return res.json({ success: true, players: (rowsRes.data || []).map(withoutPassword), total_count: rowsRes.count ?? 0 });
+        }
 
         if (rowsRes.error) throw rowsRes.error;
         if (totalRes?.error) throw totalRes.error;
@@ -157,5 +258,89 @@ export const getPlayerDetails = async (req, res) => {
     } catch (err) {
         console.error("ADMIN PLAYER DETAIL ERROR:", err);
         res.status(500).json({ message: "Failed to fetch player details" });
+    }
+};
+
+const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const MAX_AGE = 120;
+
+/** A real calendar date as YYYY-MM-DD, not in the future; null otherwise. */
+const cleanDob = (value) => {
+    const m = ISO_DATE_RE.exec(String(value ?? "").trim());
+    if (!m) return null;
+    const [, y, mo, d] = m.map(Number);
+    const date = new Date(Date.UTC(y, mo - 1, d));
+    if (date.getUTCFullYear() !== y || date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return null;
+    const age = calculateAge(m[0]);
+    return age === null || age > MAX_AGE ? null : m[0];
+};
+
+// PATCH /api/admin/players/:id/profile  { dob?, age?, gender? }
+// Admin correction of the fields category eligibility runs on. Unlike the
+// player's own Edit Profile, gender can be changed here at any time.
+//  - dob wins: whenever the row has one, age is recomputed from it and any
+//    age sent alongside is ignored (resolveAge reads dob first anyway).
+//  - age alone is only accepted for an account with no dob on file.
+//  - The password is left alone even though the default one is the DOB: the
+//    player may still be using the old default, and changing it here would
+//    lock them out without telling them.
+// Existing registrations are not re-checked against the new values.
+export const updatePlayerProfile = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const body = req.body || {};
+        if (!isUuid(id)) return res.status(404).json({ success: false, message: "Player not found" });
+
+        const { data: player, error: fetchError } = await supabaseAdmin
+            .from("users").select("id, dob, age, gender").eq("id", id).eq("role", "player").maybeSingle();
+        if (fetchError) throw fetchError;
+        if (!player) return res.status(404).json({ success: false, message: "Player not found" });
+
+        const updates = {};
+
+        if (body.gender !== undefined) {
+            const gender = normalizeGender(body.gender);
+            if (!gender) return res.status(400).json({ success: false, message: "Gender must be Male or Female" });
+            updates.gender = gender;
+        }
+
+        if (body.dob !== undefined) {
+            const dob = cleanDob(body.dob);
+            if (!dob) return res.status(400).json({ success: false, message: "Enter a valid date of birth (not in the future)" });
+            updates.dob = dob;
+            updates.age = calculateAge(dob);
+        } else if (body.age !== undefined) {
+            if (player.dob) {
+                return res.status(400).json({ success: false, message: "Age follows the date of birth. Change the date of birth instead." });
+            }
+            const age = Number(body.age);
+            if (!Number.isInteger(age) || age < 1 || age > MAX_AGE) {
+                return res.status(400).json({ success: false, message: `Age must be a whole number from 1 to ${MAX_AGE}` });
+            }
+            updates.age = age;
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return res.status(400).json({ success: false, message: "Nothing to update" });
+        }
+
+        const { data: updated, error: updateError } = await supabaseAdmin
+            .from("users").update(updates).eq("id", id).select("id, dob, age, gender").maybeSingle();
+        if (updateError) throw updateError;
+
+        // The player's dashboard shows these, and so do the dashboards of
+        // everyone in their family (members are listed with age and gender).
+        const { data: relations } = await supabaseAdmin
+            .from("family_relations")
+            .select("head_player_id, of_player_id")
+            .or(`head_player_id.eq.${id},of_player_id.eq.${id}`);
+        const touched = new Set([id]);
+        (relations || []).forEach((r) => { touched.add(r.head_player_id); touched.add(r.of_player_id); });
+        await Promise.allSettled([...touched].map((uid) => invalidateDashboardCache(uid)));
+
+        res.json({ success: true, player: { ...updated, age: resolveAge(updated) } });
+    } catch (err) {
+        console.error("ADMIN PLAYER PROFILE UPDATE ERROR:", err);
+        res.status(500).json({ success: false, message: "Failed to update player" });
     }
 };

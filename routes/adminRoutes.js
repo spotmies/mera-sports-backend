@@ -41,7 +41,7 @@ import {
     listPlayers
 } from "../controllers/adminPlayerController.js";
 import { getDashboardStatsForRole } from "../controllers/adminDashboardController.js";
-import { getPlayerDetailsForRole, listPlayersForRole } from "../controllers/adminScopedController.js";
+import { getPlayerDetailsForRole, listPlayersForRole, updatePlayerProfileForRole } from "../controllers/adminScopedController.js";
 import {
     getBroadcastAudience,
     getBroadcastDetail,
@@ -109,6 +109,7 @@ router.post("/broadcasts/:id/refresh", verifyAdmin, requirePermission("broadcast
 // the events assigned to them.
 router.get("/players", verifyAdmin, listPlayersForRole);
 router.get("/players/:id", verifyAdmin, getPlayerDetailsForRole);
+router.patch("/players/:id/profile", verifyAdmin, updatePlayerProfileForRole);
 
 /* ================= SETTINGS ================= */
 router.get("/settings", verifyAdmin, getSettings);

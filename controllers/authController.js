@@ -972,13 +972,29 @@ const playerTokenExpiresIn = () => {
     return "7d";
 };
 
-// The signed-in payload. Shared by password login and profile selection so the
-// two entry points can never drift apart.
-const buildPlayerSession = (user) => ({
+// The signed-in payload. Shared by password login, profile selection and the
+// in-app profile switch so the entry points can never drift apart.
+//
+// `familyRoot` is the head whose password opened this session, set only when
+// the session belongs to someone else (a parent who picked or switched to a
+// child). It is what lets the parent switch back; a child who signs in with
+// their own password never carries it, so they can only ever be themselves.
+const buildPlayerSession = (user, familyRoot = null) => ({
     success: true,
-    token: jwt.sign({ id: user.id, role: 'player' }, process.env.JWT_SECRET, { expiresIn: playerTokenExpiresIn() }),
+    token: jwt.sign(
+        {
+            id: user.id,
+            role: 'player',
+            ...(familyRoot && familyRoot !== user.id ? { family_root: familyRoot } : {}),
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: playerTokenExpiresIn() }
+    ),
     user: {
         id: user.id,
+        // The client stores this as the session's playerId; it was missing,
+        // so pages reading it showed "Unknown" until the dashboard loaded.
+        playerId: user.player_id,
         firstName: user.first_name,
         lastName: user.last_name,
         role: 'player',
@@ -1120,8 +1136,10 @@ export const loginPlayer = async (req, res) => {
             // Nothing is authenticated yet beyond "this password opened one of
             // these accounts", so the token pins the exact set — otherwise
             // /login/select-profile could be pointed at any user id at all.
+            // `heads` are the accounts the password itself matched; anyone else
+            // in `ids` was reached through one of them (see selectLoginProfile).
             const selectionToken = jwt.sign(
-                { type: 'profile_selection', ids: profiles.map(p => p.id) },
+                { type: 'profile_selection', ids: profiles.map(p => p.id), heads: matched.map(m => m.id) },
                 process.env.JWT_SECRET,
                 { expiresIn: PROFILE_SELECTION_TTL }
             );
@@ -1172,10 +1190,76 @@ export const selectLoginProfile = async (req, res) => {
         if (!user) return res.status(404).json({ message: "Profile not found" });
         if (user.role !== 'player') return res.status(403).json({ message: "This account is for Admins." });
 
-        res.json(buildPlayerSession(user));
+        // Picking a child from the chooser opens the child's session, but the
+        // password belonged to the head — record which one, so the profile
+        // switcher can take the parent back. Tokens minted before `heads`
+        // existed simply produce a session without a way back.
+        let familyRoot = null;
+        const heads = Array.isArray(decoded.heads) ? decoded.heads : [];
+        if (heads.length > 0 && !heads.includes(userId)) {
+            const { data: link, error: linkError } = await supabaseAdmin
+                .from("family_relations")
+                .select("head_player_id")
+                .eq("of_player_id", userId)
+                .in("head_player_id", heads)
+                .maybeSingle();
+            if (linkError) throw linkError;
+            familyRoot = link?.head_player_id || null;
+        }
+
+        res.json(buildPlayerSession(user, familyRoot));
     } catch (err) {
         console.error("PROFILE SELECT ERROR:", err);
         res.status(500).json({ message: "Failed to open profile" });
+    }
+};
+
+/* ================= FAMILY PROFILE SWITCH ================= */
+
+// Every profile this session may switch to: the head who signed in, plus the
+// members that head manages — exactly the set the login chooser would offer
+// them (expandFamilyProfiles). Recomputed on every call, never trusted from the
+// client, so removing a member or a child gaining their own email takes effect
+// at once. Resolves to [] when the head's account is gone.
+const loadSwitchableProfiles = async (sessionUser) => {
+    const rootId = sessionUser.family_root || sessionUser.id;
+    const { data: root, error } = await supabaseAdmin.from("users").select("*").eq("id", rootId).maybeSingle();
+    if (error) throw error;
+    if (!root || root.role !== 'player') return { rootId, profiles: [] };
+    return { rootId, profiles: await expandFamilyProfiles([root]) };
+};
+
+// GET /api/auth/family-profiles
+export const getSwitchableProfiles = async (req, res) => {
+    try {
+        const { profiles } = await loadSwitchableProfiles(req.user);
+        res.json({
+            success: true,
+            currentId: req.user.id,
+            profiles: profiles.map(toProfileSummary),
+        });
+    } catch (err) {
+        console.error("FAMILY PROFILES ERROR:", err);
+        res.status(500).json({ message: "Failed to load family profiles" });
+    }
+};
+
+// POST /api/auth/switch-profile  { userId }
+export const switchProfile = async (req, res) => {
+    try {
+        const { userId } = req.body || {};
+        if (!userId) return res.status(400).json({ message: "Missing profile" });
+
+        const { rootId, profiles } = await loadSwitchableProfiles(req.user);
+        const target = profiles.find(p => p.id === userId);
+        if (!target) {
+            return res.status(403).json({ message: "That profile is not available to switch to." });
+        }
+
+        res.json(buildPlayerSession(target, rootId));
+    } catch (err) {
+        console.error("PROFILE SWITCH ERROR:", err);
+        res.status(500).json({ message: "Failed to switch profile" });
     }
 };
 
