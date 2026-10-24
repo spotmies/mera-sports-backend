@@ -23,3 +23,11 @@ export const cleanFlatBuildingWing = (value) => clean(value, FLAT_BUILDING_WING_
 
 /** T-shirt size; null when blank. e.g. "Adult - XL", "Kids - 28" or free text. */
 export const cleanTshirtSize = (value) => clean(value, TSHIRT_SIZE_MAX);
+
+/**
+ * A player's gender as stored: "Male" or "Female", or null for anything else.
+ * Signup offers exactly these two, and category eligibility (Male / Female
+ * categories) matches on them, so nothing else is accepted.
+ */
+export const normalizeGender = (value) =>
+    ({ male: "Male", female: "Female" })[String(value ?? "").trim().toLowerCase()] || null;

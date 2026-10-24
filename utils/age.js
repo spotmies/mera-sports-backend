@@ -14,9 +14,10 @@
  */
 
 /**
- * The minor/adult boundary. Anyone at or below this age may share an existing
- * household mobile number and is linked under a head; anyone above it must
- * bring their own number and their own email.
+ * The minor/adult boundary. It limits NOTHING about joining: sharing a mobile
+ * number, signing up without an email, and being added or edited in the
+ * Family tab are open to every age. It only decides what a family head may do
+ * to a member (isHeadManaged) and the relation guessed for a child.
  *
  * This single constant governs registration, the login profile chooser and the
  * dashboard family CRUD. It used to be the literal `15`/`16` scattered across
@@ -49,6 +50,21 @@ export const resolveAge = (user) => {
     const stored = Number(user?.age);
     return Number.isFinite(stored) && stored > 0 ? stored : null;
 };
+
+/** Over MINOR_AGE_LIMIT. An unknown age counts as adult — the stricter reading. */
+export const isAdultUser = (user) => {
+    const age = resolveAge(user);
+    return age === null || age > MINOR_AGE_LIMIT;
+};
+
+/**
+ * Whether a family head manages this member: opens them from login, edits and
+ * removes them. True for children, and for anyone without an email of their
+ * own — a child the head added who has since grown up has no other way in.
+ * Adults who joined by signing up on the family's number (email is required
+ * for them) manage their own accounts. Rows need age, dob, email.
+ */
+export const isHeadManaged = (member) => !isAdultUser(member) || !member?.email;
 
 /**
  * Return a copy of a user row with `age` corrected from `dob`.

@@ -70,6 +70,10 @@ export const getAllCategories = async (req, res) => {
  * The codes are looked up once for the whole response and merged in as
  * `player_id`, leaving every existing member field untouched, so readers that
  * know nothing about the new field are unaffected.
+ *
+ * The member's current `mobile` and `gender` come from the same lookup: the
+ * copy stored on the roster is whatever was typed when the team was made, and
+ * is often blank. Admins see and export them next to every player.
  */
 const attachMemberPlayerCodes = async (registrations) => {
     const rows = Array.isArray(registrations) ? registrations : [];
@@ -94,11 +98,11 @@ const attachMemberPlayerCodes = async (registrations) => {
     // Chunked: a large event's rosters run to thousands of ids, and PostgREST
     // takes `in` as a query string — one unbounded list would blow the URL limit.
     const ids = Array.from(memberIds);
-    const codeById = new Map();
+    const userById = new Map();
     for (let i = 0; i < ids.length; i += 200) {
         const { data, error } = await supabaseAdmin
             .from("users")
-            .select("id, player_id")
+            .select("id, player_id, mobile, gender")
             .in("id", ids.slice(i, i + 200));
         if (error) {
             // Non-fatal by design: without codes the roster still renders, just
@@ -107,7 +111,7 @@ const attachMemberPlayerCodes = async (registrations) => {
             console.warn("[getRegistrations] member player_id lookup failed:", error.message);
             return;
         }
-        for (const user of data || []) codeById.set(String(user.id), user.player_id);
+        for (const user of data || []) userById.set(String(user.id), user);
     }
 
     for (const reg of rows) {
@@ -115,8 +119,14 @@ const attachMemberPlayerCodes = async (registrations) => {
             if (!Array.isArray(team?.members)) continue;
             team.members = team.members.map((member) => {
                 if (!member || typeof member !== "object" || !member.id) return member;
-                const code = codeById.get(String(member.id));
-                return code ? { ...member, player_id: code } : member;
+                const user = userById.get(String(member.id));
+                if (!user) return member;
+                return {
+                    ...member,
+                    ...(user.player_id ? { player_id: user.player_id } : {}),
+                    ...(user.mobile ? { mobile: user.mobile } : {}),
+                    ...(user.gender ? { gender: user.gender } : {}),
+                };
             });
         }
     }
@@ -176,7 +186,8 @@ const matchesRegistrationFilters = (reg, { search, category, apartment }) => {
         const hit = playerName.includes(q)
             || reg.registration_no?.toLowerCase().includes(q)
             || reg.events?.name?.toLowerCase().includes(q)
-            || reg.users?.player_id?.toLowerCase().includes(q);
+            || reg.users?.player_id?.toLowerCase().includes(q)
+            || reg.users?.mobile?.includes(q);
         if (!hit) return false;
     }
     if (category) {
@@ -209,7 +220,7 @@ const applyRegistrationScope = (query, { eventIds, eventId, status }) => {
 const summarizeRegistrations = async ({ eventIds, eventId, search, category, apartment }) => {
     const needsJsFilter = !!(search || category || apartment);
     const fields = needsJsFilter
-        ? "id, status, team_id, registration_no, categories, users:player_id ( first_name, last_name, player_id, apartment ), events ( name )"
+        ? "id, status, team_id, registration_no, categories, users:player_id ( first_name, last_name, player_id, mobile, apartment ), events ( name )"
         : "id, status, team_id, categories";
     const rows = [];
     for (let from = 0; ; from += 1000) {
@@ -260,7 +271,7 @@ export const getRegistrations = async (req, res) => {
             for (let from = 0; ; from += CHUNK) {
                 const { data: chunk, error: scanErr } = await applyRegistrationScope(
                     supabaseAdmin.from("event_registrations")
-                        .select("id, registration_no, categories, users:player_id ( first_name, last_name, player_id, apartment ), events ( name )")
+                        .select("id, registration_no, categories, users:player_id ( first_name, last_name, player_id, mobile, apartment ), events ( name )")
                         .order('created_at', { ascending: false })
                         .order('id', { ascending: true }),
                     { eventIds, eventId, status }
@@ -353,7 +364,7 @@ export const getRegistrationFilters = async (req, res) => {
 const TRANSACTION_ROW_FIELDS = `
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, apartment ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
                 transactions:transaction_id ( id, payment_mode, payment_id, order_id ),
                 player_teams ( id, team_name )
             `;

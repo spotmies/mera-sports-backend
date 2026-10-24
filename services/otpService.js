@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { redis, isRedisReady } from "../config/redisClient.js";
 import { sendOtpEmail } from "../utils/mailer.js";
-import { sendOtpWhatsApp } from "../utils/whatsapp.js";
+import { normalizeWhatsAppNumber, sendOtpWhatsApp } from "../utils/whatsapp.js";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const OTP_TTL_S = Math.ceil(OTP_TTL_MS / 1000);
@@ -126,9 +126,38 @@ export async function sendMobileOtp(mobile) {
         throw new Error("Failed to send WhatsApp OTP. Make sure the number is registered on WhatsApp.");
     }
 
-    const sessionId = `wa_${crypto.randomUUID()}`;
+    // The session id carries a signature of the number it was sent to, so a
+    // verified session can prove WHICH number was verified (see
+    // mobileOtpSessionMatches). Callers treat the id as opaque.
+    const nonce = crypto.randomUUID();
+    const sessionId = `wa_${nonce}.${mobileSessionSignature(nonce, mobile)}`;
     await storeOtp("mobile", sessionId, otp);
     return { success: true, sessionId };
+}
+
+const bareMobile = (mobile) => {
+    const normalized = normalizeWhatsAppNumber(mobile);
+    return normalized ? normalized.slice(2) : String(mobile || "").trim();
+};
+
+const mobileSessionSignature = (nonce, mobile) => {
+    // No fallback: with an empty key anyone could compute a valid signature
+    // and tie an OTP session to a number it was never sent to.
+    const secret = process.env.JWT_SECRET;
+    if (!secret) throw new Error("JWT_SECRET is not configured");
+    return crypto.createHmac("sha256", secret)
+        .update(`${nonce}:${bareMobile(mobile)}`)
+        .digest("hex")
+        .slice(0, 32);
+};
+
+/** True when this WhatsApp OTP session was sent to `mobile`. */
+export function mobileOtpSessionMatches(sessionId, mobile) {
+    const match = /^wa_([0-9a-f-]+)\.([0-9a-f]{32})$/.exec(String(sessionId || ""));
+    if (!match || !mobile) return false;
+    const expected = Buffer.from(mobileSessionSignature(match[1], mobile));
+    const given = Buffer.from(match[2]);
+    return expected.length === given.length && crypto.timingSafeEqual(expected, given);
 }
 
 /**

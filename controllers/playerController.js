@@ -4,12 +4,12 @@ import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { dashboardCacheKey, DASHBOARD_CACHE_TTL, invalidateDashboardCache } from "../utils/dashboardCache.js";
-import { calculateAge, MINOR_AGE_LIMIT, resolveAge, withResolvedAge } from "../utils/age.js";
+import { calculateAge, isHeadManaged, resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
 import { isTeamMatchType } from "../utils/registrationRules.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
-import { cleanFlatBuildingWing, cleanTshirtSize } from "../utils/playerProfileFields.js";
+import { cleanFlatBuildingWing, cleanTshirtSize, normalizeGender } from "../utils/playerProfileFields.js";
 
 /* ================= FAMILY VIEW HELPERS ================= */
 
@@ -336,16 +336,15 @@ export const getPlayerDashboard = async (req, res) => {
     }
 };
 
+const MOBILE_IN_USE_MESSAGE =
+    "This mobile number is already used by another account. To join that family, sign up with the number instead (verified by WhatsApp OTP).";
+
 // POST /api/player/check-conflict
 export const checkConflict = async (req, res) => {
     try {
         const userId = req.user.id;
         const { email, mobile } = req.body;
-        const { data: currentUser } = await supabaseAdmin.from("users").select("age, dob, email, mobile").eq("id", userId).maybeSingle();
-        // Derived from dob — the stored age column is stale for anyone who has
-        // had a birthday since signup.
-        const resolvedAge = resolveAge(currentUser);
-        const allowSharedMobile = resolvedAge !== null && resolvedAge <= 15;
+        const { data: currentUser } = await supabaseAdmin.from("users").select("email, mobile").eq("id", userId).maybeSingle();
 
         // Only a field that is actually being changed can conflict. The client sends
         // both values every time, so without this an unchanged mobile that another
@@ -360,8 +359,14 @@ export const checkConflict = async (req, res) => {
             if (data) return res.status(409).json({ conflict: true, field: 'email', message: "Email already taken" });
         }
         if (mobile && mobileChanged) {
-            const { data } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).maybeSingle();
-            if (data && !allowSharedMobile) return res.status(409).json({ conflict: true, field: 'mobile', message: "Mobile already taken" });
+            // Joining another family's number needs a WhatsApp OTP to it, which
+            // only signup does. A list, not maybeSingle: a shared number holds
+            // several rows, and maybeSingle's error on 2+ rows read as "free".
+            const { data, error } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).limit(1);
+            if (error) throw error;
+            if ((data || []).length > 0) {
+                return res.status(409).json({ conflict: true, field: 'mobile', message: MOBILE_IN_USE_MESSAGE });
+            }
         }
         res.json({ conflict: false });
     } catch (err) { res.status(500).json({ message: "Server error" }); }
@@ -408,15 +413,23 @@ export const updateProfile = async (req, res) => {
             if (data) return res.status(409).json({ message: "Email taken" });
         }
         if (mobile && mobile !== currentUser.mobile) {
-            const { data } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).maybeSingle();
-            const resolvedAge = resolveAge(currentUser);
-            const allowSharedMobile = resolvedAge !== null && resolvedAge <= 15;
-            if (data && !allowSharedMobile) return res.status(409).json({ message: "Mobile taken" });
+            const { data, error } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).limit(1);
+            if (error) throw error;
+            if ((data || []).length > 0) return res.status(409).json({ message: MOBILE_IN_USE_MESSAGE });
         }
 
         let photoUrl = photos;
         if (photos && photos.startsWith('data:')) {
             photoUrl = await uploadBase64(photos, 'player-photos');
+        }
+
+        // Gender can be filled in once, by accounts made before signup required
+        // it. After that it is fixed here: category eligibility depends on it,
+        // so changing it goes through an admin, not the player.
+        let nextGender = currentUser.gender;
+        if (!normalizeGender(currentUser.gender) && gender) {
+            nextGender = normalizeGender(gender);
+            if (!nextGender) return res.status(400).json({ message: "Gender must be Male or Female" });
         }
 
         const updates = {
@@ -430,7 +443,7 @@ export const updateProfile = async (req, res) => {
             state: state !== undefined ? state : currentUser.state,
             pincode: pincode !== undefined ? pincode : currentUser.pincode,
             country: country !== undefined ? country : currentUser.country,
-            gender: gender !== undefined ? gender : currentUser.gender,
+            gender: nextGender,
             photos: photoUrl || currentUser.photos,
             // Only written when the client sent them, so a database without the
             // columns still accepts every other profile edit.
@@ -508,6 +521,16 @@ export const deleteAccount = async (req, res) => {
 
 /* ================= FAMILY MEMBER MANAGEMENT ================= */
 
+// A head edits and removes only the members they manage (isHeadManaged). An
+// adult who joined by signing up on the family's number runs their own account.
+const selfManagedMemberRefusal = async (memberId) => {
+    const { data: member, error } = await supabaseAdmin
+        .from("users").select("name, first_name, last_name, age, dob, email").eq("id", memberId).maybeSingle();
+    if (error) throw error;
+    if (!member || isHeadManaged(member)) return null;
+    return `${displayName(member) || "This member"} manages their own account, so it can't be changed or removed from here.`;
+};
+
 export const addFamilyMember = async (req, res) => {
     try {
         const headUserId = req.user.id;
@@ -551,18 +574,13 @@ export const addFamilyMember = async (req, res) => {
             if (aadhaarExists) return res.status(400).json({ message: "Aadhaar already in use" });
         }
 
-        // Only minors may ride on someone else's mobile. An adult added here
-        // would end up sharing the head's number while being independently
-        // able to log in by that number, which is exactly the ambiguity the
-        // profile chooser resolves by treating the adult as the head.
+        // Any age may be added: a family shares one number however old its
+        // members are (e.g. grown-up children adding their parents). Each
+        // member still logs in with their own password (their DOB), and the
+        // head manages the members they add (isHeadManaged).
         const age = calculateAge(dob);
         if (age === null) {
             return res.status(400).json({ message: "Invalid date of birth" });
-        }
-        if (age > MINOR_AGE_LIMIT) {
-            return res.status(400).json({
-                message: `Only children aged ${MINOR_AGE_LIMIT} or under can be added to your family. Anyone older needs their own account and mobile number.`
-            });
         }
 
         // Password = bcrypt(DDMMYYYY, 12)
@@ -681,6 +699,8 @@ export const updateFamilyMember = async (req, res) => {
         if (relError || !relRecord) {
             return res.status(403).json({ message: "Not your family member" });
         }
+        const refusal = await selfManagedMemberRefusal(familyMemberId);
+        if (refusal) return res.status(403).json({ message: refusal });
 
         const { name, relation: newRelation, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
 
@@ -712,14 +732,7 @@ export const updateFamilyMember = async (req, res) => {
             if (age === null) {
                 return res.status(400).json({ message: "Invalid date of birth" });
             }
-            // The same ceiling as creation. Without it a head could add a child
-            // and then edit the DOB to an adult one, producing an adult account
-            // on a shared number that add-family-member would have refused.
-            if (age > MINOR_AGE_LIMIT) {
-                return res.status(400).json({
-                    message: `A family member can only be ${MINOR_AGE_LIMIT} or under. Use "Unlink" to give them their own independent account.`
-                });
-            }
+            // No age ceiling: family members can be any age (see addFamilyMember).
             updateData.dob = dob;
             updateData.age = age;
             // Password changes with DOB
@@ -805,6 +818,8 @@ export const deleteFamilyMember = async (req, res) => {
         if (!relRecord) {
             return res.status(403).json({ message: "Not your family member" });
         }
+        const refusal = await selfManagedMemberRefusal(familyMemberId);
+        if (refusal) return res.status(403).json({ message: refusal });
 
         // Delete the relation
         await supabaseAdmin.from("family_relations").delete().eq("id", relRecord.id);
