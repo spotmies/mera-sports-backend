@@ -145,7 +145,7 @@ const resolveScopedAdminId = (req) =>
 const REGISTRATION_LIST_FIELDS = `
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories, document_url,
                 events ( id, name, sport, start_date, end_date, start_time, location, venue, categories, status ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, dob, apartment ),
                 player_teams ( id, team_name, captain_name, captain_mobile, members )
             `;
 
@@ -364,7 +364,7 @@ export const getRegistrationFilters = async (req, res) => {
 const TRANSACTION_ROW_FIELDS = `
                 id, event_id, player_id, team_id, registration_no, status, amount_paid, payment_proof:screenshot_url, manual_transaction_id, transaction_id, created_at, categories,
                 events ( id, name, created_by, assigned_to ),
-                users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, apartment ),
+                users:player_id ( id, first_name, last_name, player_id, mobile, email, gender, dob, apartment ),
                 transactions:transaction_id ( id, payment_mode, payment_id, order_id ),
                 player_teams ( id, team_name )
             `;

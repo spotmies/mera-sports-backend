@@ -574,7 +574,8 @@ export const getAllPermissions = async (req, res) => {
                 broadcast: perm ? perm.broadcast : true,
                 reports: perm ? perm.reports : true,
                 // Opt-in: off unless a super admin turned it on
-                venue_media: perm?.venue_media === true
+                venue_media: perm?.venue_media === true,
+                player_profiles: perm?.player_profiles === true
             };
         });
 
@@ -593,7 +594,7 @@ export const updatePermissions = async (req, res) => {
         }
 
         const { adminId } = req.params;
-        const { permit, apartments, advertisements, broadcast, reports, venue_media } = req.body;
+        const { permit, apartments, advertisements, broadcast, reports, venue_media, player_profiles } = req.body;
 
         // Build only the fields that were sent
         const updates = { updated_at: new Date().toISOString(), updated_by: req.user.id };
@@ -603,28 +604,36 @@ export const updatePermissions = async (req, res) => {
         if (broadcast !== undefined) updates.broadcast = broadcast;
         if (reports !== undefined) updates.reports = reports;
         if (venue_media !== undefined) updates.venue_media = venue_media;
+        if (player_profiles !== undefined) updates.player_profiles = player_profiles;
 
-        // Upsert: insert if no row, update if one exists
-        let { error } = await supabaseAdmin
+        const save = () => supabaseAdmin
             .from("admin_permissions")
             .upsert({ admin_id: adminId, ...updates }, { onConflict: "admin_id" });
 
-        // The venue_media column comes from
-        // scripts/add_venue_media_permission.sql. Until that has been applied,
-        // switching it OFF is a no-op (it is already off), so save the rest;
-        // switching it ON cannot be saved and says why.
+        // Upsert: insert if no row, update if one exists
+        let { error } = await save();
+
+        // Each opt-in switch has its own column, added by its own script.
+        // Until that script has been applied, switching it OFF is a no-op (it
+        // is already off), so save the rest; switching it ON cannot be saved
+        // and says why. The error names the missing column.
+        const OPT_IN_COLUMNS = {
+            venue_media: { label: "Venue Media", script: "add_venue_media_permission.sql" },
+            player_profiles: { label: "Age & Gender", script: "add_player_profiles_permission.sql" },
+        };
         const isMissingColumn = (e) => e && (e.code === "42703" || e.code === "PGRST204");
-        if (isMissingColumn(error)) {
-            if (venue_media === true) {
+        for (let attempt = 0; attempt < Object.keys(OPT_IN_COLUMNS).length && isMissingColumn(error); attempt++) {
+            const column = Object.keys(OPT_IN_COLUMNS).find((c) => c in updates && String(error.message || "").includes(c));
+            if (!column) break;
+            if (updates[column] === true) {
+                const { label, script } = OPT_IN_COLUMNS[column];
                 return res.status(409).json({
                     success: false,
-                    message: "The Venue Media permission needs a database update first. Ask the developer to run add_venue_media_permission.sql.",
+                    message: `The ${label} permission needs a database update first. Ask the developer to run ${script}.`,
                 });
             }
-            delete updates.venue_media;
-            ({ error } = await supabaseAdmin
-                .from("admin_permissions")
-                .upsert({ admin_id: adminId, ...updates }, { onConflict: "admin_id" }));
+            delete updates[column];
+            ({ error } = await save());
         }
 
         if (error) throw error;
@@ -644,7 +653,7 @@ export const getMyPermissions = async (req, res) => {
         if (req.user.role === 'superadmin') {
             return res.json({
                 success: true,
-                permissions: { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true, venue_media: true }
+                permissions: { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true, venue_media: true, player_profiles: true }
             });
         }
 
@@ -657,7 +666,7 @@ export const getMyPermissions = async (req, res) => {
         if (error) throw error;
 
         // If no row exists yet, return all true as safe default, except the
-        // opt-in switch (venue_media), which stays off until granted.
+        // opt-in switches (venue_media, player_profiles), which stay off until granted.
         const base = perm || { permit: true, apartments: true, advertisements: true, broadcast: true, reports: true };
         const permissions = {
             permit: base.permit,
@@ -666,6 +675,7 @@ export const getMyPermissions = async (req, res) => {
             broadcast: base.broadcast,
             reports: base.reports,
             venue_media: perm?.venue_media === true,
+            player_profiles: perm?.player_profiles === true,
         };
 
         res.json({ success: true, permissions });

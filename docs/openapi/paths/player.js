@@ -130,9 +130,11 @@ export const playerPaths = {
         delete: {
             tags: ["Player"],
             summary: "Delete the signed-in player account",
-            description: "Destructive — do not run against shared QA fixtures you still need.",
+            description:
+                "Destructive — do not run against shared QA fixtures you still need. Requires the account's own `password`: a family member who switched into this profile has its session, not its password.",
             security: auth,
-            responses: { ...okEnvelope("Account deleted."), ...errors(401, 403, 500) },
+            requestBody: jsonBody(obj({ password: { type: "string", format: "password" } }, ["password"])),
+            responses: { ...okEnvelope("Account deleted."), ...errors(400, 401, 403, 500) },
         },
     },
 

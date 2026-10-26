@@ -269,7 +269,7 @@ export const authPaths = {
             tags: AUTH_TAG,
             summary: "Family profiles this session can switch to",
             description:
-                "The family head who signed in plus the members they manage (children, and members with no email) — the same set the shared-mobile login chooser offers. A session opened by a member's own password lists only that member.",
+                "Everyone in the signed-in player's family (one shared mobile number). Families have no roles, so every member can switch to every other; the shared-mobile login chooser offers the same set.",
             security: [{ bearerAuth: [] }],
             responses: {
                 ...ok("Switchable profiles.", obj({
@@ -283,7 +283,6 @@ export const authPaths = {
                             name: { type: "string" },
                             photos: { type: "string", nullable: true },
                             age: { type: "integer", nullable: true },
-                            relation: { type: "string", example: "Child" },
                         }),
                     },
                 })),

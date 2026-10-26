@@ -2,7 +2,8 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
-import { calculateAge, isHeadManaged, MINOR_AGE_LIMIT, resolveAge } from "../utils/age.js";
+import { calculateAge, resolveAge } from "../utils/age.js";
+import { getFamilyUsers, STORED_RELATION } from "../utils/family.js";
 import { createNotification } from "../services/notificationService.js";
 import {
     mobileOtpSessionMatches,
@@ -70,7 +71,7 @@ export const sendForgotPasswordOtp = async (req, res) => {
                         requiresAccountSelection: true,
                         profiles: profiles.map(p => {
                             const summary = toProfileSummary(p);
-                            return { id: p.id, name: summary.name, age: summary.age, relation: p.__relation };
+                            return { id: p.id, name: summary.name, age: summary.age };
                         }),
                     });
                 }
@@ -104,17 +105,9 @@ export const sendForgotPasswordOtp = async (req, res) => {
 // Verifies a forgot-password OTP and issues a short-lived reset token.
 // This is what binds the reset to a proven OTP — resetPassword below refuses
 // to run without a valid token, so the reset can never be called directly.
-// Labels each account on a shared number as Head or by its family relation, adults first.
-const withFamilyRelations = async (users) => {
-    const { data: rels } = await supabaseAdmin
-        .from("family_relations")
-        .select("of_player_id, relation")
-        .in("of_player_id", users.map(u => u.id));
-    const relById = new Map((rels || []).map(r => [r.of_player_id, r.relation]));
-    return users
-        .map(u => ({ ...u, __relation: relById.get(u.id) || 'Head' }))
-        .sort((x, y) => (resolveAge(y) ?? 0) - (resolveAge(x) ?? 0));
-};
+// Accounts on a shared number, adults first.
+const withFamilyRelations = async (users) =>
+    [...users].sort((x, y) => (resolveAge(y) ?? 0) - (resolveAge(x) ?? 0));
 
 export const verifyForgotPasswordOtp = async (req, res) => {
     try {
@@ -598,20 +591,6 @@ const oldestFirst = (a, b) =>
     (resolveAge(b) ?? -1) - (resolveAge(a) ?? -1)
     || new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
 
-// A head's label for a member, guessed from ages: children are 15 or under or
-// 15+ years younger, parents 15+ years older, anyone else is "Other" (shown as
-// Family). The head can't be asked at signup — they aren't the one signing up.
-const guessRelation = (head, member) => {
-    const headAge = resolveAge(head);
-    const memberAge = resolveAge(member);
-    if (memberAge !== null && memberAge <= MINOR_AGE_LIMIT) return "Child";
-    if (headAge !== null && memberAge !== null) {
-        if (headAge - memberAge >= 15) return "Child";
-        if (memberAge - headAge >= 15) return "Parent";
-    }
-    return "Other";
-};
-
 // Family joins on one number run one after another (per server process).
 // PostgREST gives no transaction across these writes, so this is what stops
 // two simultaneous signups on a number from interleaving their merges.
@@ -631,19 +610,10 @@ const withMobileLock = async (mobile, fn) => {
 /**
  * Link a newly registered account into the family of the number it shares.
  *
- * One number = one family, headed by the OLDEST person on it. Every "root" on
- * the number — an existing head, or an account in no family yet — is merged
- * into that family: when someone older than the current head is on the number
- * (a parent signing up after their children, or a parent the children added)
- * they become head and the rest move under them. Members keep their label
- * unless they move to a new head, when it is re-guessed from ages.
- *
- * Adding someone in the Family tab does NOT re-head the family: the person
- * adding stays head, so they can go on adding (a member can't add). The next
- * signup on the number applies the oldest-is-head rule.
- *
- * A head's extra powers (opening members from login, editing, removing) reach
- * only members aged 15 or under; adults in a family manage themselves.
+ * One number = one family. Every "root" on the number (an existing family's
+ * anchor, or an account in no family yet) is merged into one family anchored
+ * on the oldest person. The anchor is storage only. Everyone in a family has
+ * the same rights, with no roles or tags (see utils/family.js).
  */
 const joinMobileFamily = async (newcomer, onNumber) => {
     const others = onNumber.filter(u => u.id !== newcomer.id);
@@ -701,7 +671,7 @@ const joinMobileFamily = async (newcomer, onNumber) => {
                     ? await supabaseAdmin.from("family_relations").delete().eq("id", rel.id)
                     : await supabaseAdmin
                         .from("family_relations")
-                        .update({ head_player_id: head.id, relation: guessRelation(head, byId.get(rel.of_player_id)) })
+                        .update({ head_player_id: head.id })
                         .eq("id", rel.id);
                 if (error) throw error;
             }
@@ -710,7 +680,7 @@ const joinMobileFamily = async (newcomer, onNumber) => {
         const { error } = await supabaseAdmin
             .from("family_relations")
             .upsert(
-                { head_player_id: head.id, of_player_id: root.id, relation: guessRelation(head, root) },
+                { head_player_id: head.id, of_player_id: root.id, relation: STORED_RELATION },
                 { onConflict: "head_player_id,of_player_id" }
             );
         if (error) throw error;
@@ -974,22 +944,9 @@ const playerTokenExpiresIn = () => {
 
 // The signed-in payload. Shared by password login, profile selection and the
 // in-app profile switch so the entry points can never drift apart.
-//
-// `familyRoot` is the head whose password opened this session, set only when
-// the session belongs to someone else (a parent who picked or switched to a
-// child). It is what lets the parent switch back; a child who signs in with
-// their own password never carries it, so they can only ever be themselves.
-const buildPlayerSession = (user, familyRoot = null) => ({
+const buildPlayerSession = (user) => ({
     success: true,
-    token: jwt.sign(
-        {
-            id: user.id,
-            role: 'player',
-            ...(familyRoot && familyRoot !== user.id ? { family_root: familyRoot } : {}),
-        },
-        process.env.JWT_SECRET,
-        { expiresIn: playerTokenExpiresIn() }
-    ),
+    token: jwt.sign({ id: user.id, role: 'player' }, process.env.JWT_SECRET, { expiresIn: playerTokenExpiresIn() }),
     user: {
         id: user.id,
         // The client stores this as the session's playerId; it was missing,
@@ -1018,47 +975,23 @@ const toProfileSummary = (user) => ({
     name: user.name || `${user.first_name || ""} ${user.last_name || ""}`.trim(),
     photos: user.photos,
     age: resolveAge(user),
-    // "Other" is stored for adults who joined by sharing the number.
-    relation: user.__relation === 'Other' ? 'Family' : (user.__relation || 'Head'),
 });
 
-// Given the accounts a password opened, add the minors linked under any of them
-// so a parent sees the whole household in one chooser.
+// Given the accounts a password opened, add everyone in their families: every
+// family member may switch to every other (utils/family.js), so the chooser
+// offers the same set. The accounts the password matched come first.
+//
+// Errors must not be swallowed: an empty result would collapse the chooser to
+// one profile, indistinguishable from "no family". Fail loudly so the client
+// retries instead of hiding people.
 const expandFamilyProfiles = async (matched) => {
-    const headIds = matched.map(u => u.id);
-    const heads = matched.map(u => ({ ...u, __relation: 'Head' }));
-
-    const { data: relations, error } = await supabaseAdmin
-        .from("family_relations")
-        .select("of_player_id, relation")
-        .in("head_player_id", headIds);
-
-    // This error must not be swallowed. Falling through to `relations || []`
-    // collapses the chooser down to the parent alone, which is indistinguishable
-    // from "this parent has no children" — the exact failure the feature exists
-    // to prevent. Fail loudly so the client retries instead of hiding the kids.
-    if (error) throw error;
-
-    const memberIds = [...new Set(
-        (relations || []).map(r => r.of_player_id).filter(id => id && !headIds.includes(id))
-    )];
-    if (memberIds.length === 0) return heads;
-
-    const { data: members, error: membersError } = await supabaseAdmin
-        .from("users")
-        .select("*")
-        .in("id", memberIds);
-    if (membersError) throw membersError;
-
-    const relationById = new Map((relations || []).map(r => [r.of_player_id, r.relation]));
-    // Only members the head manages open with the head's password. Adults who
-    // joined by sharing the number keep their own login (see isHeadManaged).
-    const linked = (members || [])
-        .filter(m => m.role === 'player' && isHeadManaged(m))
-        .map(m => ({ ...m, __relation: relationById.get(m.id) || 'Child' }))
-        .sort((a, b) => (resolveAge(b) ?? 0) - (resolveAge(a) ?? 0));
-
-    return [...heads, ...linked];
+    const byId = new Map(matched.map(u => [u.id, u]));
+    for (const account of matched) {
+        for (const member of await getFamilyUsers(account.id)) {
+            if (!byId.has(member.id)) byId.set(member.id, member);
+        }
+    }
+    return [...byId.values()];
 };
 
 export const loginPlayer = async (req, res) => {
@@ -1122,11 +1055,9 @@ export const loginPlayer = async (req, res) => {
 
         if (matched.length === 0) return res.status(401).json({ message: "Invalid credentials" });
 
-        // The profile chooser, for mobile logins only. Signing in as the head of
-        // a family also unlocks the minors linked under them, so one parent
-        // password reaches every child. The reverse is deliberately NOT true: a
-        // minor's password only ever opens the minor's own account, otherwise a
-        // child who knows their own DOB could walk into the parent's profile.
+        // The profile chooser, for mobile logins only: any family member's
+        // password offers the whole family, the same set they could switch to
+        // once signed in (the user's decision, 26 Oct 2026).
         let profiles = matched;
         if (resolvedByMobile) {
             profiles = await expandFamilyProfiles(matched);
@@ -1136,10 +1067,8 @@ export const loginPlayer = async (req, res) => {
             // Nothing is authenticated yet beyond "this password opened one of
             // these accounts", so the token pins the exact set — otherwise
             // /login/select-profile could be pointed at any user id at all.
-            // `heads` are the accounts the password itself matched; anyone else
-            // in `ids` was reached through one of them (see selectLoginProfile).
             const selectionToken = jwt.sign(
-                { type: 'profile_selection', ids: profiles.map(p => p.id), heads: matched.map(m => m.id) },
+                { type: 'profile_selection', ids: profiles.map(p => p.id) },
                 process.env.JWT_SECRET,
                 { expiresIn: PROFILE_SELECTION_TTL }
             );
@@ -1190,24 +1119,7 @@ export const selectLoginProfile = async (req, res) => {
         if (!user) return res.status(404).json({ message: "Profile not found" });
         if (user.role !== 'player') return res.status(403).json({ message: "This account is for Admins." });
 
-        // Picking a child from the chooser opens the child's session, but the
-        // password belonged to the head — record which one, so the profile
-        // switcher can take the parent back. Tokens minted before `heads`
-        // existed simply produce a session without a way back.
-        let familyRoot = null;
-        const heads = Array.isArray(decoded.heads) ? decoded.heads : [];
-        if (heads.length > 0 && !heads.includes(userId)) {
-            const { data: link, error: linkError } = await supabaseAdmin
-                .from("family_relations")
-                .select("head_player_id")
-                .eq("of_player_id", userId)
-                .in("head_player_id", heads)
-                .maybeSingle();
-            if (linkError) throw linkError;
-            familyRoot = link?.head_player_id || null;
-        }
-
-        res.json(buildPlayerSession(user, familyRoot));
+        res.json(buildPlayerSession(user));
     } catch (err) {
         console.error("PROFILE SELECT ERROR:", err);
         res.status(500).json({ message: "Failed to open profile" });
@@ -1216,23 +1128,15 @@ export const selectLoginProfile = async (req, res) => {
 
 /* ================= FAMILY PROFILE SWITCH ================= */
 
-// Every profile this session may switch to: the head who signed in, plus the
-// members that head manages — exactly the set the login chooser would offer
-// them (expandFamilyProfiles). Recomputed on every call, never trusted from the
-// client, so removing a member or a child gaining their own email takes effect
-// at once. Resolves to [] when the head's account is gone.
-const loadSwitchableProfiles = async (sessionUser) => {
-    const rootId = sessionUser.family_root || sessionUser.id;
-    const { data: root, error } = await supabaseAdmin.from("users").select("*").eq("id", rootId).maybeSingle();
-    if (error) throw error;
-    if (!root || root.role !== 'player') return { rootId, profiles: [] };
-    return { rootId, profiles: await expandFamilyProfiles([root]) };
-};
+// Every profile this session may switch to: everyone in the signed-in
+// player's family. Recomputed on every call, never trusted from the client, so
+// adding or removing a member takes effect at once.
+const loadSwitchableProfiles = (sessionUser) => getFamilyUsers(sessionUser.id);
 
 // GET /api/auth/family-profiles
 export const getSwitchableProfiles = async (req, res) => {
     try {
-        const { profiles } = await loadSwitchableProfiles(req.user);
+        const profiles = await loadSwitchableProfiles(req.user);
         res.json({
             success: true,
             currentId: req.user.id,
@@ -1250,13 +1154,13 @@ export const switchProfile = async (req, res) => {
         const { userId } = req.body || {};
         if (!userId) return res.status(400).json({ message: "Missing profile" });
 
-        const { rootId, profiles } = await loadSwitchableProfiles(req.user);
+        const profiles = await loadSwitchableProfiles(req.user);
         const target = profiles.find(p => p.id === userId);
         if (!target) {
-            return res.status(403).json({ message: "That profile is not available to switch to." });
+            return res.status(403).json({ message: "That profile is not in your family." });
         }
 
-        res.json(buildPlayerSession(target, rootId));
+        res.json(buildPlayerSession(target));
     } catch (err) {
         console.error("PROFILE SWITCH ERROR:", err);
         res.status(500).json({ message: "Failed to switch profile" });

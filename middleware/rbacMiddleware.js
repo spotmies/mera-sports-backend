@@ -92,10 +92,11 @@ export const requireSuperAdmin = (req, res, next) => {
 //   reports are each gated by it. Superadmins always pass. A missing row means
 //   everything is allowed, matching getMyPermissions.
 // --------------------------------------------------------------------------
-const PERMISSION_KEYS = ["apartments", "advertisements", "broadcast", "reports", "venue_media"];
+const PERMISSION_KEYS = ["apartments", "advertisements", "broadcast", "reports", "venue_media", "player_profiles"];
 // Opt-in: admins never had these, so they stay off until a super admin grants
 // them (a missing row or column counts as off, not as "allowed").
-const OPT_IN_PERMISSION_KEYS = ["venue_media"];
+// player_profiles is the Age & Gender tab (editing a player's DOB/age/gender).
+const OPT_IN_PERMISSION_KEYS =["venue_media", "player_profiles"];
 const adminPermissionCacheKey = (id) => `admin:perm:${id}`;
 
 export const invalidateAdminPermissionCache = (adminId) => cacheDel(adminPermissionCacheKey(adminId));

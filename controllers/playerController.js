@@ -4,44 +4,23 @@ import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { cacheGet, cacheSet } from "../config/redisClient.js";
 import { dashboardCacheKey, DASHBOARD_CACHE_TTL, invalidateDashboardCache } from "../utils/dashboardCache.js";
-import { calculateAge, isHeadManaged, resolveAge, withResolvedAge } from "../utils/age.js";
+import { calculateAge, resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
 import { isTeamMatchType } from "../utils/registrationRules.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { cleanFlatBuildingWing, cleanTshirtSize, normalizeGender } from "../utils/playerProfileFields.js";
+import { getFamily, getFamilyUsers, inSameFamily, leaveFamily, STORED_RELATION } from "../utils/family.js";
 
 /* ================= FAMILY VIEW HELPERS ================= */
-
-// The head stores one label per member ("Child"). A member opening their own
-// dashboard has to see the inverse of it, or every child would be told their
-// parent is their "Child".
-const REVERSED_RELATION = {
-    Child: 'Parent',
-    Parent: 'Child',
-    Spouse: 'Spouse',
-    Sibling: 'Sibling',
-    Other: 'Family',
-};
-
-// And how one member should be labelled to another member, keyed by the head's
-// label for that other person.
-const SIBLING_RELATION = {
-    Child: 'Sibling',
-    Spouse: 'Parent',
-    Parent: 'Family',
-    Sibling: 'Family',
-    Other: 'Family',
-};
 
 const displayName = (user) =>
     user?.name || `${user?.first_name || ""} ${user?.last_name || ""}`.trim();
 
-const toFamilyMember = (user, relation) => ({
+const toFamilyMember = (user) => ({
     id: user.id,
     player_id: user.player_id,
     name: displayName(user),
-    relation,
     dob: user.dob,
     // Derived, never the stored column — see utils/age.js.
     age: resolveAge(user),
@@ -60,111 +39,40 @@ const toFamilyMember = (user, relation) => ({
 });
 
 /**
- * Everything the dashboard needs to render the Family tab, from the point of
- * view of whoever is signed in.
- *
- * A head sees their minors and every event those minors are entered in. A minor
- * sees the head and their siblings, read-only, and no registrations — those
- * belong to the head to manage.
+ * The Family tab: everyone else in the family, and the events they are entered
+ * in. Every member sees the same thing, because families have no roles (see
+ * utils/family.js).
  */
-const buildFamilyView = async (userId, headRelations, memberRelation) => {
-    // Anyone who is not linked *under* someone is a head — including a brand new
-    // account with no children yet. Gating this on "has children" instead would
-    // hide the Add Member button from exactly the people who need it first.
-    const isHead = !memberRelation;
+const buildFamilyView = async (userId) => {
+    const others = (await getFamilyUsers(userId)).filter(u => u.id !== userId);
+    if (others.length === 0) return { familyMembers: [], familyRegistrations: [] };
 
-    if (isHead) {
-        const memberIds = (headRelations || []).map(r => r.of_player_id).filter(Boolean);
-        if (memberIds.length === 0) {
-            return { familyMembers: [], familyRegistrations: [], isHead: true, registeredBy: null };
-        }
+    const { data: memberRegs, error: memberRegsError } = await supabaseAdmin
+        .from("event_registrations")
+        .select(`id, registration_no, status, created_at, event_id, player_id, categories, amount_paid, events ( id, public_id, name, sport, start_date, location )`)
+        .in("player_id", others.map(u => u.id))
+        .order("created_at", { ascending: false });
+    if (memberRegsError) throw memberRegsError;
 
-        const relationById = new Map((headRelations || []).map(r => [r.of_player_id, r.relation]));
-
-        // One query for all members and one for all their registrations — not
-        // one pair per child.
-        const [
-            { data: memberUsers, error: memberUsersError },
-            { data: memberRegs, error: memberRegsError },
-        ] = await Promise.all([
-            supabaseAdmin.from("users").select("*").in("id", memberIds),
-            supabaseAdmin
-                .from("event_registrations")
-                .select(`id, registration_no, status, created_at, event_id, player_id, categories, amount_paid, events ( id, public_id, name, sport, start_date, location )`)
-                .in("player_id", memberIds)
-                .order("created_at", { ascending: false }),
-        ]);
-        if (memberUsersError) throw memberUsersError;
-        if (memberRegsError) throw memberRegsError;
-
-        const usersById = new Map((memberUsers || []).map(u => [u.id, u]));
-
-        const familyMembers = memberIds
-            .map(id => usersById.get(id))
-            .filter(Boolean)
-            .map(u => toFamilyMember(u, relationById.get(u.id) || 'Child'))
-            .sort((a, b) => (b.age ?? 0) - (a.age ?? 0));
-
-        const familyRegistrations = (memberRegs || []).map(reg => {
-            const member = usersById.get(reg.player_id);
-            return {
-                ...reg,
-                events: reg.events
-                    ? { ...reg.events, public_id: getPublicEventId(reg.events) }
-                    : reg.events,
-                member_name: member ? displayName(member) : null,
-                member_player_id: member?.player_id || null,
-                relation: relationById.get(reg.player_id) || 'Child',
-            };
-        });
-
-        return { familyMembers, familyRegistrations, isHead: true, registeredBy: null };
-    }
-
-    // ---- Signed in as a family member ----
-    const headId = memberRelation.head_player_id;
-    const [
-        { data: headUser, error: headUserError },
-        { data: siblingRels, error: siblingRelsError },
-    ] = await Promise.all([
-        supabaseAdmin.from("users").select("*").eq("id", headId).maybeSingle(),
-        supabaseAdmin.from("family_relations").select("of_player_id, relation").eq("head_player_id", headId),
-    ]);
-    if (headUserError) throw headUserError;
-    if (siblingRelsError) throw siblingRelsError;
-
-    const familyMembers = [];
-    let registeredBy = null;
-
-    if (headUser) {
-        const asSeenByMember = REVERSED_RELATION[memberRelation.relation] || 'Family';
-        familyMembers.push(toFamilyMember(headUser, asSeenByMember));
-        registeredBy = {
-            id: headUser.id,
-            name: displayName(headUser),
-            player_id: headUser.player_id,
-            relation: asSeenByMember,
+    const usersById = new Map(others.map(u => [u.id, u]));
+    const familyRegistrations = (memberRegs || []).map(reg => {
+        const member = usersById.get(reg.player_id);
+        return {
+            ...reg,
+            events: reg.events
+                ? { ...reg.events, public_id: getPublicEventId(reg.events) }
+                : reg.events,
+            member_name: member ? displayName(member) : null,
+            member_player_id: member?.player_id || null,
         };
-    }
+    });
 
-    const siblingIds = (siblingRels || []).map(r => r.of_player_id).filter(id => id && id !== userId);
-    if (siblingIds.length > 0) {
-        const { data: siblings, error: siblingsError } = await supabaseAdmin
-            .from("users").select("*").in("id", siblingIds);
-        if (siblingsError) throw siblingsError;
-
-        const siblingRelationById = new Map((siblingRels || []).map(r => [r.of_player_id, r.relation]));
-        (siblings || [])
-            .sort((a, b) => (resolveAge(b) ?? 0) - (resolveAge(a) ?? 0))
-            .forEach(u => {
-                familyMembers.push(toFamilyMember(u, SIBLING_RELATION[siblingRelationById.get(u.id)] || 'Family'));
-            });
-    }
-
-    // A member's own registrations already come back in `registrations`; the
-    // family list is the head's management view and stays empty here.
-    return { familyMembers, familyRegistrations: [], isHead: false, registeredBy };
+    return { familyMembers: others.map(toFamilyMember), familyRegistrations };
 };
+
+/** Clear the cached dashboard of everyone in the given families. */
+const invalidateFamilyDashboards = (ids) =>
+    Promise.all([...new Set(ids.filter(Boolean))].map(id => invalidateDashboardCache(id)));
 
 // GET /api/player/dashboard
 export const getPlayerDashboard = async (req, res) => {
@@ -191,8 +99,6 @@ export const getPlayerDashboard = async (req, res) => {
             { data: memberTeams, error: memberTeamsError },
             { data: allTeams, error: allTeamsError },
             { data: transactions },
-            { data: headRelations, error: headRelationsError },
-            { data: memberRelations, error: memberRelationsError },
         ] = await Promise.all([
             supabaseAdmin.from("player_school_details").select("*").eq("player_id", userId).maybeSingle(),
             supabaseAdmin.from("player_teams").select("id").eq("captain_id", userId),
@@ -204,9 +110,6 @@ export const getPlayerDashboard = async (req, res) => {
                 : Promise.resolve({ data: [] }),
             supabaseAdmin.from("player_teams").select("id, members"),
             supabaseAdmin.from("transactions").select("*").eq("user_id", userId),
-            // Who this player heads, and who (if anyone) heads them.
-            supabaseAdmin.from("family_relations").select("of_player_id, relation").eq("head_player_id", userId),
-            supabaseAdmin.from("family_relations").select("head_player_id, relation").eq("of_player_id", userId),
         ]);
 
         // These three decide `relevantTeamIds`, which decides whether team
@@ -216,12 +119,6 @@ export const getPlayerDashboard = async (req, res) => {
         // schoolDetails and transactions are presentational and stay tolerant.
         const teamLookupError = captainTeamsError || memberTeamsError || allTeamsError;
         if (teamLookupError) throw teamLookupError;
-
-        // Same reasoning for the family lookups: a swallowed error here renders
-        // a parent's dashboard as though they have no children, and the lie is
-        // then cached for DASHBOARD_CACHE_TTL.
-        const familyLookupError = headRelationsError || memberRelationsError;
-        if (familyLookupError) throw familyLookupError;
 
         if (schoolDetails) player.schoolDetails = schoolDetails;
 
@@ -312,8 +209,9 @@ export const getPlayerDashboard = async (req, res) => {
             };
         });
 
-        const { familyMembers, familyRegistrations, isHead, registeredBy } =
-            await buildFamilyView(userId, headRelations, (memberRelations || [])[0] || null);
+        // Throws rather than returning an empty family: a swallowed error would
+        // render (and cache) a family as though it had no members.
+        const { familyMembers, familyRegistrations } = await buildFamilyView(userId);
 
         const payload = {
             success: true,
@@ -322,8 +220,6 @@ export const getPlayerDashboard = async (req, res) => {
             registrations: detailedRegistrations,
             familyMembers,
             familyRegistrations,
-            isHead,
-            registeredBy
         };
 
         // Fire-and-forget: a cache write must not delay the response.
@@ -335,6 +231,9 @@ export const getPlayerDashboard = async (req, res) => {
         res.status(500).json({ message: "Failed to load dashboard" });
     }
 };
+
+const FAMILY_MOBILE_LOCKED_MESSAGE =
+    "This mobile number is shared by your family, so it can't be changed here.";
 
 const MOBILE_IN_USE_MESSAGE =
     "This mobile number is already used by another account. To join that family, sign up with the number instead (verified by WhatsApp OTP).";
@@ -396,7 +295,9 @@ export const updateProfile = async (req, res) => {
         const { data: currentUser, error: fetchError } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
         if (fetchError || !currentUser) return res.status(404).json({ message: "User not found" });
 
-        const isSensitiveChange = (email && email.toLowerCase().trim() !== currentUser.email.toLowerCase().trim()) || (mobile && mobile !== currentUser.mobile);
+        // currentUser.email is null for members added without one; reading
+        // .toLowerCase() off it crashed the save the first time they typed one.
+        const isSensitiveChange = (email && email.toLowerCase().trim() !== (currentUser.email || "").toLowerCase().trim()) || (mobile && mobile !== currentUser.mobile);
 
         if (isSensitiveChange) {
             const token = req.headers['x-verification-token'];
@@ -412,7 +313,14 @@ export const updateProfile = async (req, res) => {
             const { data } = await supabaseAdmin.from("users").select("id").eq("email", email).neq("id", userId).maybeSingle();
             if (data) return res.status(409).json({ message: "Email taken" });
         }
+        let family = null;
         if (mobile && mobile !== currentUser.mobile) {
+            // A family is one number. One member moving to another number would
+            // split it in two, so a shared number can't be changed from here.
+            family = await getFamily(userId);
+            if (family.ids.length > 1) {
+                return res.status(409).json({ message: FAMILY_MOBILE_LOCKED_MESSAGE });
+            }
             const { data, error } = await supabaseAdmin.from("users").select("id").eq("mobile", mobile).neq("id", userId).limit(1);
             if (error) throw error;
             if ((data || []).length > 0) return res.status(409).json({ message: MOBILE_IN_USE_MESSAGE });
@@ -454,7 +362,8 @@ export const updateProfile = async (req, res) => {
         const { data: updatedPlayer, error } = await supabaseAdmin.from("users").update(updates).eq("id", userId).select();
         if (error) throw error;
 
-        await invalidateDashboardCache(userId);
+        // Name and photo also show in the rest of the family's Family tab.
+        await invalidateFamilyDashboards((family || await getFamily(userId)).ids);
         res.json({ success: true, player: withResolvedAge(updatedPlayer?.[0] || updates), message: "Profile updated" });
 
     } catch (err) {
@@ -501,17 +410,49 @@ export const changePassword = async (req, res) => {
 };
 
 // DELETE /api/player/delete-account
+/**
+ * Check an account's own password: the proof needed before deleting it or
+ * removing it from the family. Switching profiles gives anyone in a family
+ * that member's session, but not their password.
+ */
+const passwordMatches = async (userId, password) => {
+    if (!password) return false;
+    const { data: user, error } = await supabaseAdmin.from("users").select("password").eq("id", userId).maybeSingle();
+    if (error) throw error;
+    if (!user?.password) return false;
+    return bcrypt.compare(String(password), user.password);
+};
+
+const PASSWORD_REQUIRED_MESSAGE = "Enter this player's own password to confirm.";
+const WRONG_PASSWORD_MESSAGE = "That password is not correct for this player.";
+
+/**
+ * Delete an account and everything under it. The family is re-anchored
+ * first: deleting a user cascades their family_relations rows, which would
+ * otherwise dissolve the family if this was its anchor.
+ */
+const deletePlayerAccount = async (userId) => {
+    const touched = await leaveFamily(userId);
+    await supabaseAdmin.from("player_school_details").delete().eq("player_id", userId);
+    await supabaseAdmin.from("event_registrations").delete().eq("player_id", userId);
+    await supabaseAdmin.from("transactions").delete().eq("user_id", userId);
+    await supabaseAdmin.from("player_teams").delete().eq("captain_id", userId);
+    const { error } = await supabaseAdmin.from("users").delete().eq("id", userId);
+    if (error) throw error;
+    await invalidateFamilyDashboards([userId, ...touched]);
+};
+
+// DELETE /api/player/delete-account  { password }
 export const deleteAccount = async (req, res) => {
     try {
         const userId = req.user.id;
-        await supabaseAdmin.from("player_school_details").delete().eq("player_id", userId);
-        await supabaseAdmin.from("event_registrations").delete().eq("player_id", userId);
-        await supabaseAdmin.from("transactions").delete().eq("user_id", userId);
-        await supabaseAdmin.from("player_teams").delete().eq("captain_id", userId);
-        const { error } = await supabaseAdmin.from("users").delete().eq("id", userId);
+        const { password } = req.body || {};
+        if (!password) return res.status(400).json({ message: PASSWORD_REQUIRED_MESSAGE });
+        if (!(await passwordMatches(userId, password))) {
+            return res.status(401).json({ message: WRONG_PASSWORD_MESSAGE });
+        }
 
-        if (error) throw error;
-        await invalidateDashboardCache(userId);
+        await deletePlayerAccount(userId);
         res.json({ success: true, message: "Account deleted" });
     } catch (err) {
         console.error("DELETE ACCOUNT ERROR:", err);
@@ -521,44 +462,46 @@ export const deleteAccount = async (req, res) => {
 
 /* ================= FAMILY MEMBER MANAGEMENT ================= */
 
-// A head edits and removes only the members they manage (isHeadManaged). An
-// adult who joined by signing up on the family's number runs their own account.
-const selfManagedMemberRefusal = async (memberId) => {
-    const { data: member, error } = await supabaseAdmin
-        .from("users").select("name, first_name, last_name, age, dob, email").eq("id", memberId).maybeSingle();
-    if (error) throw error;
-    if (!member || isHeadManaged(member)) return null;
-    return `${displayName(member) || "This member"} manages their own account, so it can't be changed or removed from here.`;
+// Everyone in a family manages it equally (see utils/family.js): anyone can
+// add a member and edit another member's details. Removing a member needs
+// that member's own password.
+
+const FAMILY_ONLY_MESSAGE = "That player is not in your family.";
+
+const GENDER_VALUES_MESSAGE = "Gender must be Male or Female";
+
+const IDENTITY_LOCKED_MESSAGE = (field) =>
+    `A player's ${field} can't be changed once it is set. If it is wrong, please contact the organisers to correct it.`;
+
+/** Default password: the date of birth as DDMMYYYY. */
+const dobPassword = (dob) => {
+    const [year, month, day] = String(dob).slice(0, 10).split("-");
+    return `${day}${month}${year}`;
 };
 
 export const addFamilyMember = async (req, res) => {
     try {
-        const headUserId = req.user.id;
-        const { name, relation, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
+        const userId = req.user.id;
+        const { name, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
 
-        if (!name || !relation || !dob || !gender) {
-            return res.status(400).json({ message: "Name, Relation, DOB, and Gender are required" });
+        if (!name?.trim() || !dob || !gender) {
+            return res.status(400).json({ message: "Name, DOB, and Gender are required" });
+        }
+        // Same rule as Edit Profile: categories need Male or Female, and once
+        // saved it is locked (see updateFamilyMember).
+        if (!normalizeGender(gender)) {
+            return res.status(400).json({ message: GENDER_VALUES_MESSAGE });
         }
 
-        // Single-level only: head cannot itself be a family member
-        const { data: isFamily } = await supabaseAdmin
-            .from("family_relations")
-            .select("id")
-            .eq("of_player_id", headUserId)
-            .maybeSingle();
-
-        if (isFamily) {
-            return res.status(403).json({ message: "Family members cannot add their own family members" });
-        }
-
-        // Get head player's mobile
-        const { data: headPlayer } = await supabaseAdmin
+        // The member joins the family's number. That is the anchor's number,
+        // which every member shares.
+        const { anchorId, ids: familyIds } = await getFamily(userId);
+        const { data: anchor } = await supabaseAdmin
             .from("users")
             .select("mobile")
-            .eq("id", headUserId)
+            .eq("id", anchorId)
             .maybeSingle();
-
-        if (!headPlayer) return res.status(404).json({ message: "Player not found" });
+        if (!anchor) return res.status(404).json({ message: "Player not found" });
 
         // Check email uniqueness (if provided)
         if (email) {
@@ -574,19 +517,15 @@ export const addFamilyMember = async (req, res) => {
             if (aadhaarExists) return res.status(400).json({ message: "Aadhaar already in use" });
         }
 
-        // Any age may be added: a family shares one number however old its
-        // members are (e.g. grown-up children adding their parents). Each
-        // member still logs in with their own password (their DOB), and the
-        // head manages the members they add (isHeadManaged).
+        // Any age may be added. Each member logs in with their own password
+        // (their DOB) and everyone in the family can switch to them.
         const age = calculateAge(dob);
         if (age === null) {
             return res.status(400).json({ message: "Invalid date of birth" });
         }
 
         // Password = bcrypt(DDMMYYYY, 12)
-        const [year, month, day] = dob.split("-");
-        const plainPassword = `${day}${month}${year}`;
-        const password = await bcrypt.hash(plainPassword, 12);
+        const password = await bcrypt.hash(dobPassword(dob), 12);
 
         // Generate player_id
         let newPlayerId;
@@ -613,10 +552,10 @@ export const addFamilyMember = async (req, res) => {
                 last_name: lastName,
                 name: name.trim(),
                 email: email || null,
-                mobile: headPlayer.mobile,
+                mobile: anchor.mobile || null,
                 dob,
                 age,
-                gender,
+                gender: normalizeGender(gender),
                 apartment: apartment || null,
                 street: street || null,
                 ...(cleanFlatBuildingWing(flat_building_wing) ? { flat_building_wing: cleanFlatBuildingWing(flat_building_wing) } : {}),
@@ -635,13 +574,12 @@ export const addFamilyMember = async (req, res) => {
 
         if (insertError) throw insertError;
 
-        // Create family relation
         const { error: relError } = await supabaseAdmin
             .from("family_relations")
             .insert({
-                head_player_id: headUserId,
+                head_player_id: anchorId,
                 of_player_id: newUserId,
-                relation
+                relation: STORED_RELATION
             });
 
         if (relError) {
@@ -650,33 +588,9 @@ export const addFamilyMember = async (req, res) => {
             throw relError;
         }
 
-        // The head's list changed, and so did the new member's own family view.
-        await Promise.all([
-            invalidateDashboardCache(headUserId),
-            invalidateDashboardCache(newUserId),
-        ]);
-        res.status(201).json({
-            success: true,
-            familyMember: {
-                id: newUser.id,
-                name: newUser.name,
-                player_id: newUser.player_id,
-                relation,
-                dob: newUser.dob,
-                age: newUser.age,
-                gender: newUser.gender,
-                email: newUser.email,
-                aadhaar: newUser.aadhaar,
-                apartment: newUser.apartment,
-                street: newUser.street,
-                flat_building_wing: newUser.flat_building_wing ?? null,
-                tshirt_size: newUser.tshirt_size ?? null,
-                city: newUser.city,
-                state: newUser.state,
-                pincode: newUser.pincode,
-                country: newUser.country
-            }
-        });
+        // Every member's Family tab now lists the new member.
+        await invalidateFamilyDashboards([...familyIds, newUserId]);
+        res.status(201).json({ success: true, familyMember: toFamilyMember(newUser) });
     } catch (err) {
         console.error("ADD FAMILY MEMBER ERROR:", err);
         res.status(500).json({ message: err.message || "Failed to add family member" });
@@ -685,24 +599,34 @@ export const addFamilyMember = async (req, res) => {
 
 export const updateFamilyMember = async (req, res) => {
     try {
-        const headUserId = req.user.id;
+        const userId = req.user.id;
         const familyMemberId = req.params.id;
 
-        // Verify ownership via family_relations
-        const { data: relRecord, error: relError } = await supabaseAdmin
-            .from("family_relations")
-            .select("id, relation")
-            .eq("head_player_id", headUserId)
-            .eq("of_player_id", familyMemberId)
-            .maybeSingle();
-
-        if (relError || !relRecord) {
-            return res.status(403).json({ message: "Not your family member" });
+        // Your own details are edited from Player Info, which verifies
+        // email/mobile changes by OTP.
+        if (familyMemberId === userId) {
+            return res.status(400).json({ message: "Edit your own details from Player Info." });
         }
-        const refusal = await selfManagedMemberRefusal(familyMemberId);
-        if (refusal) return res.status(403).json({ message: refusal });
+        const { ids: familyIds } = await getFamily(userId);
+        if (!familyIds.includes(familyMemberId)) {
+            return res.status(403).json({ message: FAMILY_ONLY_MESSAGE });
+        }
 
-        const { name, relation: newRelation, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
+        const { data: member, error: memberError } = await supabaseAdmin
+            .from("users").select("email, dob, gender").eq("id", familyMemberId).maybeSingle();
+        if (memberError) throw memberError;
+        if (!member) return res.status(404).json({ message: "Family member not found" });
+
+        const { name, dob, gender, email, aadhaar, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country } = req.body;
+
+        // An email someone already has is their login and where their codes go.
+        // Changing it needs their own verification, from their profile.
+        const normalizedEmail = (email || "").trim().toLowerCase();
+        if (member.email && email !== undefined && normalizedEmail !== member.email.trim().toLowerCase()) {
+            return res.status(403).json({
+                message: "This member's email can only be changed from their own profile. Switch to them and use Edit Profile.",
+            });
+        }
 
         // Uniqueness, excluding the member being edited — otherwise re-saving a
         // form without touching the email would collide with the member's own
@@ -719,28 +643,42 @@ export const updateFamilyMember = async (req, res) => {
             if (aadhaarExists) return res.status(400).json({ message: "Aadhaar already in use" });
         }
 
+        // Date of birth and gender decide which categories a player may enter.
+        // Once either is set, no family member can change it, and the player
+        // can't either (Edit Profile doesn't accept them). Only an admin can
+        // correct a wrong one, so an entry can't be made eligible by editing
+        // a birth year. A member who has none yet can have it filled in once.
+        const sameDob = String(dob ?? "").slice(0, 10) === String(member.dob ?? "").slice(0, 10);
+        if (dob !== undefined && member.dob && !sameDob) {
+            return res.status(403).json({ message: IDENTITY_LOCKED_MESSAGE("date of birth") });
+        }
+        const storedGender = normalizeGender(member.gender);
+        if (gender !== undefined && storedGender && normalizeGender(gender) !== storedGender) {
+            return res.status(403).json({ message: IDENTITY_LOCKED_MESSAGE("gender") });
+        }
+
         // Build update object
         const updateData = {};
         if (name !== undefined) {
+            if (!name.trim()) return res.status(400).json({ message: "Name is required" });
             updateData.name = name.trim();
             const parts = name.trim().split(/\s+/);
             updateData.first_name = parts[0];
             updateData.last_name = parts.slice(1).join(" ") || "";
         }
-        if (dob !== undefined) {
+        // Only reached when filling in a missing value (see the lock above).
+        if (dob && !member.dob) {
             const age = calculateAge(dob);
             if (age === null) {
                 return res.status(400).json({ message: "Invalid date of birth" });
             }
-            // No age ceiling: family members can be any age (see addFamilyMember).
             updateData.dob = dob;
             updateData.age = age;
-            // Password changes with DOB
-            const [year, month, day] = dob.split("-");
-            const plainPassword = `${day}${month}${year}`;
-            updateData.password = await bcrypt.hash(plainPassword, 12);
         }
-        if (gender !== undefined) updateData.gender = gender;
+        if (gender && !storedGender) {
+            if (!normalizeGender(gender)) return res.status(400).json({ message: GENDER_VALUES_MESSAGE });
+            updateData.gender = normalizeGender(gender);
+        }
         if (email !== undefined) updateData.email = email || null;
         if (aadhaar !== undefined) updateData.aadhaar = aadhaar || null;
         if (apartment !== undefined) updateData.apartment = apartment || null;
@@ -761,87 +699,50 @@ export const updateFamilyMember = async (req, res) => {
 
         if (updateError) throw updateError;
 
-        // Update relation if changed
-        if (newRelation && newRelation !== relRecord.relation) {
-            await supabaseAdmin
-                .from("family_relations")
-                .update({ relation: newRelation })
-                .eq("id", relRecord.id);
-        }
-
-        await Promise.all([
-            invalidateDashboardCache(headUserId),
-            invalidateDashboardCache(familyMemberId),
-        ]);
-        res.json({
-            success: true,
-            familyMember: {
-                id: updatedUser.id,
-                name: updatedUser.name,
-                player_id: updatedUser.player_id,
-                relation: newRelation || relRecord.relation,
-                dob: updatedUser.dob,
-                age: updatedUser.age,
-                gender: updatedUser.gender,
-                email: updatedUser.email,
-                aadhaar: updatedUser.aadhaar,
-                apartment: updatedUser.apartment,
-                street: updatedUser.street,
-                flat_building_wing: updatedUser.flat_building_wing ?? null,
-                tshirt_size: updatedUser.tshirt_size ?? null,
-                city: updatedUser.city,
-                state: updatedUser.state,
-                pincode: updatedUser.pincode,
-                country: updatedUser.country
-            }
-        });
+        await invalidateFamilyDashboards(familyIds);
+        res.json({ success: true, familyMember: toFamilyMember(updatedUser) });
     } catch (err) {
         console.error("UPDATE FAMILY MEMBER ERROR:", err);
         res.status(500).json({ message: "Failed to update family member" });
     }
 };
 
+// DELETE /api/player/delete-family-member/:id  { mode: 'full' | 'unlink', password }
 export const deleteFamilyMember = async (req, res) => {
     try {
-        const headUserId = req.user.id;
+        const userId = req.user.id;
         const familyMemberId = req.params.id;
-        const { mode } = req.body || {}; // 'full' or 'unlink'
-
-        // Verify ownership
-        const { data: relRecord } = await supabaseAdmin
-            .from("family_relations")
-            .select("id")
-            .eq("head_player_id", headUserId)
-            .eq("of_player_id", familyMemberId)
-            .maybeSingle();
-
-        if (!relRecord) {
-            return res.status(403).json({ message: "Not your family member" });
+        const { mode, password } = req.body || {};
+        if (mode !== "full" && mode !== "unlink") {
+            return res.status(400).json({ message: "Choose how to remove this member." });
         }
-        const refusal = await selfManagedMemberRefusal(familyMemberId);
-        if (refusal) return res.status(403).json({ message: refusal });
-
-        // Delete the relation
-        await supabaseAdmin.from("family_relations").delete().eq("id", relRecord.id);
-
-        if (mode === 'full') {
-            // Delete the user entirely
-            await supabaseAdmin.from("users").delete().eq("id", familyMemberId);
-            await invalidateDashboardCache(headUserId);
-            res.json({ success: true, message: "Family member removed and account deleted" });
-        } else {
-            // Unlink — clear mobile so they operate independently. Their only
-            // remaining sign-in routes are Player ID, email or aadhaar, so the
-            // client warns before choosing this for a child with no email.
-            await supabaseAdmin.from("users").update({ mobile: null }).eq("id", familyMemberId);
-            await Promise.all([
-                invalidateDashboardCache(headUserId),
-                invalidateDashboardCache(familyMemberId),
-            ]);
-            res.json({ success: true, message: "Family member unlinked. They can now operate independently." });
+        if (familyMemberId === userId) {
+            return res.status(400).json({ message: "You can't remove yourself here. Switch to another family member to remove this profile." });
         }
+
+        if (!(await inSameFamily(userId, familyMemberId))) {
+            return res.status(403).json({ message: FAMILY_ONLY_MESSAGE });
+        }
+        if (!password) return res.status(400).json({ message: PASSWORD_REQUIRED_MESSAGE });
+        if (!(await passwordMatches(familyMemberId, password))) {
+            return res.status(401).json({ message: WRONG_PASSWORD_MESSAGE });
+        }
+
+        if (mode === "full") {
+            await deletePlayerAccount(familyMemberId);
+            return res.json({ success: true, message: "Family member removed and account deleted" });
+        }
+
+        // Unlink: out of the family, and off its number so the next signup on
+        // that number doesn't merge them straight back in. Their remaining
+        // sign-in routes are Player ID, email or aadhaar.
+        const touched = await leaveFamily(familyMemberId);
+        const { error } = await supabaseAdmin.from("users").update({ mobile: null }).eq("id", familyMemberId);
+        if (error) throw error;
+        await invalidateFamilyDashboards([familyMemberId, ...touched]);
+        res.json({ success: true, message: "Family member unlinked. They can now operate independently." });
     } catch (err) {
         console.error("DELETE FAMILY MEMBER ERROR:", err);
-        res.status(500).json({ message: "Failed to delete family member" });
+        res.status(500).json({ message: "Failed to remove family member" });
     }
 };
