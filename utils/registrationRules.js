@@ -97,6 +97,16 @@ export const parseEntryFee = (value) => {
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 };
 
+/**
+ * True when the event has categories and every one is explicitly free (fee 0).
+ * A category with no fee recorded is "not set", not free, so one missing fee
+ * keeps the event paid. Such an event takes no payment, so it needs no QR.
+ */
+export const allCategoriesFree = (categories) =>
+    Array.isArray(categories) &&
+    categories.length > 0 &&
+    categories.every((c) => c && typeof c === "object" && parseEntryFee(c.entryFee ?? c.fee) === 0);
+
 const parsePositiveInt = (value) => {
     const n = Number.parseInt(value, 10);
     return Number.isFinite(n) && n > 0 ? n : null;
