@@ -5,8 +5,20 @@ dotenv.config({ quiet: true });
 
 // WhatsApp Cloud API (Meta Graph) — business-initiated messages must use pre-approved templates
 const API_VERSION = process.env.WHATSAPP_API_VERSION || 'v25.0';
-const PHONE_ID = process.env.WHATSAPP_PHONE_ID;
-const TOKEN = process.env.WHATSAPP_TOKEN;
+// Numbers that must never send for this app again. "AV Sports Club" was the
+// old test sender; a server (or a teammate's laptop) still holding its id would
+// keep messaging players under that name. Refusing it makes the mistake loud
+// (an error at startup and on every send) instead of a wrong sender name.
+const RETIRED_PHONE_IDS = new Set(['989797254211062']);
+const RETIRED_SENDER = RETIRED_PHONE_IDS.has(String(process.env.WHATSAPP_PHONE_ID || '').trim());
+if (RETIRED_SENDER) {
+    console.error(
+        '❌ WHATSAPP_PHONE_ID is the retired "AV Sports Club" number. WhatsApp sending is DISABLED on this server. ' +
+        'Set WHATSAPP_PHONE_ID and WHATSAPP_TOKEN to the Sports Paramount number (see docs/WHATSAPP_TEMPLATES.md).'
+    );
+}
+const PHONE_ID = RETIRED_SENDER ? undefined : process.env.WHATSAPP_PHONE_ID;
+const TOKEN = RETIRED_SENDER ? undefined : process.env.WHATSAPP_TOKEN;
 
 // Template names (override via env if renamed in WhatsApp Manager)
 const TEMPLATES = {
@@ -26,6 +38,16 @@ const TEMPLATES = {
 };
 
 export const isWhatsAppEnabled = () => Boolean(PHONE_ID && TOKEN);
+
+// Which business number this server sends from. Recipients see that number's
+// verified name, so a server still holding an old WHATSAPP_PHONE_ID shows up
+// to players as the old sender (e.g. "AV Sports Club"). Only the last digits
+// are logged.
+console.log(
+    PHONE_ID
+        ? `📱 WhatsApp sender phone id: ...${String(PHONE_ID).slice(-4)}`
+        : '📱 WhatsApp sender: not configured (WHATSAPP_PHONE_ID missing)'
+);
 
 /**
  * Normalize an Indian mobile number to WhatsApp international format (91XXXXXXXXXX)
