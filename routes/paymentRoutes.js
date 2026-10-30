@@ -1,5 +1,5 @@
 import express from "express";
-import { checkTeamsForCategory, createRazorpayOrder, validateRegistration, downloadRegistrationReceipt, getRazorpayOrderStatus, getRegistrationStatus, submitManualPayment, verifyRazorpayPayment } from "../controllers/paymentController.js";
+import { checkTeamsForCategory, createRazorpayOrder, validateRegistration, downloadRegistrationReceipt, getRazorpayOrderStatus, getRegistrationStatus, registerFree, submitManualPayment, verifyRazorpayPayment } from "../controllers/paymentController.js";
 import { authenticateUser as verifyToken } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
@@ -9,6 +9,8 @@ router.post("/validate-registration", verifyToken, validateRegistration);
 // Which saved teams can enter one category, with the reason for the rest
 router.post("/check-teams", verifyToken, checkTeamsForCategory);
 router.post("/submit-manual-payment", verifyToken, submitManualPayment);
+// Selections that total ₹0: no payment, registered as confirmed
+router.post("/register-free", verifyToken, registerFree);
 router.post("/create-razorpay-order", verifyToken, createRazorpayOrder);
 router.post("/verify-razorpay-payment", verifyToken, verifyRazorpayPayment);
 // Recovery path when the browser callback never fires (UPI app-switch / 3DS redirect)
