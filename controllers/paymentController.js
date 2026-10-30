@@ -116,34 +116,45 @@ const findExistingOrderRecord = async (orderId) => {
  * insert fails the transaction row is removed, so a retry re-attempts both.
  * Returns { transaction, registrationNo, rows }.
  */
-const insertRegistrationRows = async ({ transaction, userId, eventId, groups, rowFields }) => {
-    const registrationNo = `REG-${Date.now()}`;
-    const rows = groups.map((g) => ({
+const buildRegistrationRows = ({ registrationNo, transactionId, userId, eventId, groups, rowFields }) =>
+    groups.map((g) => ({
         event_id: eventId,
         player_id: userId,
         registration_no: registrationNo,
         categories: g.categories,
         amount_paid: g.fee,
-        transaction_id: transaction.id,
+        transaction_id: transactionId,
         team_id: g.teamId || null,
         ...rowFields,
     }));
 
-    const { error: regError } = await supabaseAdmin.from("event_registrations").insert(rows);
-    if (regError) {
-        await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
-        throw regError;
-    }
-
-    // The player's dashboard is cached for 15 minutes. Without this the person
-    // who just paid — and every partner/team-mate they entered — keeps seeing
-    // "No events found" until the TTL lapses, while the admin screen already
-    // shows the registration.
+// The player's dashboard is cached for 15 minutes. Without this the person
+// who just paid — and every partner/team-mate they entered — keeps seeing
+// "No events found" until the TTL lapses, while the admin screen already
+// shows the registration.
+const invalidateDashboardsFor = async (userId, groups) => {
     const teamIds = [...new Set(groups.map((g) => g.teamId).filter(Boolean))];
     await Promise.allSettled([
         invalidateDashboardForRegistration({ userId }),
         ...teamIds.map((teamId) => invalidateDashboardForRegistration({ userId, teamId })),
     ]);
+};
+
+const insertRegistrationRows = async ({ transaction, userId, eventId, groups, rowFields }) => {
+    const registrationNo = `REG-${Date.now()}`;
+    const rows = buildRegistrationRows({ registrationNo, transactionId: transaction.id, userId, eventId, groups, rowFields });
+
+    const { error: regError } = await supabaseAdmin.from("event_registrations").insert(rows);
+    if (regError) {
+        const { error: cleanupError } = await supabaseAdmin.from("transactions").delete().eq("id", transaction.id);
+        if (cleanupError) {
+            // Without this the orphan stays in the payment reports with no trace of why.
+            console.error(`[insertRegistrationRows] orphaned transaction ${transaction.id} (${transaction.order_id}) could not be removed:`, cleanupError);
+        }
+        throw regError;
+    }
+
+    await invalidateDashboardsFor(userId, groups);
 
     return { transaction, registrationNo, rows };
 };
@@ -429,7 +440,7 @@ export const createRazorpayOrder = async (req, res) => {
         // Razorpay rejects orders below ₹1, so a free (₹0) selection cannot go
         // through checkout. Fail here with a clear message rather than letting
         // the SDK throw something opaque. Free registration needs its own
-        // no-payment path — see FREE_ENTRY note in the admin CreateEvent form.
+        // no-payment path: registerFree below.
         if (!(fee > 0)) {
             return res.status(400).json({
                 message: "This selection totals ₹0. Free registration is not supported yet — contact the organiser.",
@@ -906,6 +917,151 @@ export const submitManualPayment = async (req, res) => {
     } catch (err) {
         console.error("Manual Payment Error:", err);
         res.status(500).json({ message: "Internal Server Error" });
+    }
+};
+
+// user+event pairs with a free registration in progress on this server. A
+// double-click or client retry arriving while the first request is still
+// validating / writing would otherwise pass the duplicate check too, as nothing
+// is saved yet. Per process only: a unique constraint is the cross-instance fix.
+const freeRegistrationsInFlight = new Set();
+
+// POST /api/payment/register-free
+// Registration for a selection that totals ₹0. No payment is taken and there is
+// nothing for an admin to verify, so the rows go in as `verified` straight away
+// (which also releases the receipt). Runs the same rules as the paid paths, and
+// refuses any selection with a non-zero fee, so this can never be used to skip
+// paying for a paid category.
+export const registerFree = async (req, res) => {
+    let inFlightKey = null;
+    try {
+        const { eventId, document } = req.body;
+        const userId = req.user?.id;
+
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+        if (!eventId || entriesFromRequest(req.body).length === 0) return res.status(400).json({ message: "Missing fields" });
+        if (isStaffRole(req.user.role)) return res.status(403).json({ message: "Admins cannot register." });
+
+        const event = await resolveEventByIdentifier(eventId, "*");
+        if (!event) return res.status(404).json({ message: "Event not found" });
+        const resolvedEventId = event.id;
+
+        inFlightKey = `${userId}:${resolvedEventId}`;
+        if (freeRegistrationsInFlight.has(inFlightKey)) {
+            inFlightKey = null; // not ours to release
+            return res.status(409).json({
+                message: "Your registration is already being processed. Please wait a moment.",
+                code: "REGISTRATION_IN_PROGRESS",
+            });
+        }
+        freeRegistrationsInFlight.add(inFlightKey);
+
+        let fee;
+        let groups;
+        try {
+            ({ fee, groups } = await validateRequestForUser(event, userId, req.body));
+        } catch (eligErr) {
+            // A known rule failure (400 today; any 4xx later) is the player's to fix, not a server error.
+            if (eligErr.statusCode >= 400 && eligErr.statusCode < 500) return res.status(eligErr.statusCode).json(badRequestBody(eligErr));
+            throw eligErr;
+        }
+
+        if (fee !== 0) {
+            return res.status(400).json({
+                message: "This selection is not free. Please pay to register.",
+                code: "PAYMENT_REQUIRED",
+            });
+        }
+
+        // The document is optional; a supplied one that fails to upload is an
+        // error, not a silently missing file.
+        let documentUrl = null;
+        if (document) {
+            documentUrl = await uploadBase64(document, "event-documents", "user-docs");
+            if (!documentUrl) return res.status(500).json({ message: "Failed to upload document" });
+        }
+
+        // transactions.payment_mode is kept to the values already in use
+        // ("manual" / "razorpay"); the FREE_ prefix marks this as a no-payment
+        // entry. The reference is unique per registration, so nothing keyed on
+        // manual_transaction_id (a unique index, reports) can collide.
+        const freeRef = `FREE_${crypto.randomUUID()}`;
+        const transactionPayload = {
+            order_id: freeRef,
+            manual_transaction_id: freeRef,
+            payment_mode: "manual",
+            amount: 0,
+            currency: "INR",
+            user_id: userId,
+        };
+        const rowFields = { manual_transaction_id: freeRef, document_url: documentUrl, status: "verified" };
+
+        // Preferred: one database function writes the transaction and every
+        // registration row together, so a failure leaves nothing behind
+        // (scripts/add_register_free_entry_fn.sql). Until that is applied the
+        // function does not exist, and the two-step write below is used instead.
+        let transaction;
+        let registrationNo;
+        const registrationNoForRpc = `REG-${Date.now()}`;
+        const { data: rpcTransaction, error: rpcError } = await supabaseAdmin.rpc("register_free_entry", {
+            p_transaction: transactionPayload,
+            p_rows: buildRegistrationRows({ registrationNo: registrationNoForRpc, transactionId: null, userId, eventId: resolvedEventId, groups, rowFields }),
+        });
+
+        if (!rpcError && rpcTransaction) {
+            transaction = rpcTransaction;
+            registrationNo = registrationNoForRpc;
+            await invalidateDashboardsFor(userId, groups);
+        } else if (rpcError?.code === "P0001" && /ALREADY_REGISTERED/.test(rpcError.message || "")) {
+            // Lost a race with another request for the same player and category.
+            return res.status(400).json({
+                message: "You are already registered in this category.",
+                code: "ALREADY_REGISTERED",
+            });
+        } else if (rpcError && (rpcError.code === "PGRST202" || rpcError.code === "42883")) {
+            // Function not installed yet. The two-step write below cannot be made
+            // atomic: a crash between its writes can leave a transactions row behind.
+            // Set REQUIRE_ATOMIC_FREE_REGISTRATION=true once the SQL is applied to
+            // refuse it, rather than silently falling back.
+            if (process.env.REQUIRE_ATOMIC_FREE_REGISTRATION === "true") {
+                console.error("register_free_entry() is not installed; refusing the non-atomic fallback.");
+                return res.status(503).json({ message: "Free registration is temporarily unavailable. Please try again later." });
+            }
+            const { data: tx, error: txError } = await supabaseAdmin.from("transactions").insert(transactionPayload).select().maybeSingle();
+            if (txError || !tx) throw txError || new Error("Tx Insert Failed");
+            transaction = tx;
+            ({ registrationNo } = await insertRegistrationRows({ transaction, userId, eventId: resolvedEventId, groups, rowFields }));
+        } else {
+            // The function ran and failed: it rolled back, so nothing was written.
+            throw rpcError || new Error("Free registration failed");
+        }
+
+        // The registration is already saved; a notification problem must not
+        // turn it into an error response (the player would retry and hit "already registered").
+        // dispatchRegistrationSideEffects is not async: its email / WhatsApp work
+        // runs in an inner IIFE with its own try/catch, so nothing here can become
+        // an unhandled rejection. This catch covers only a synchronous throw.
+        try {
+            dispatchRegistrationSideEffects({
+                userId,
+                eventId: resolvedEventId,
+                registrationNo,
+                amount: 0,
+                groups,
+                paymentId: null,
+                paymentMode: "manual",
+                status: "Confirmed",
+            });
+        } catch (sideEffectError) {
+            console.error("Free registration side effects failed:", sideEffectError);
+        }
+
+        res.json({ success: true, message: "Registered", transactionId: transaction.id, registrationNo });
+    } catch (err) {
+        console.error("Free registration error:", err);
+        res.status(500).json({ message: "Internal Server Error" });
+    } finally {
+        if (inFlightKey) freeRegistrationsInFlight.delete(inFlightKey);
     }
 };
 

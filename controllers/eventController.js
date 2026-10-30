@@ -6,7 +6,7 @@ import { PAYMENT_GATEWAYS, PAYMENT_SETTING_FIELDS, acceptsManual, normalizePayme
 import { invalidateEventAccessCache } from "../middleware/eventAccess.js";
 import { isCategoryDeadlinePassed } from "../utils/registrationWindow.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
-import { isActiveRegistrationStatus, tallyRegistrationEntries } from "../utils/registrationRules.js";
+import { allCategoriesFree, isActiveRegistrationStatus, tallyRegistrationEntries } from "../utils/registrationRules.js";
 import { loadCommunities, normalizeCommunityIds, normalizeInstituteNames, normalizeRestrictionMessage, resolveCommunityNames, validateCommunityIds } from "../utils/communityRestriction.js";
 
 /**
@@ -406,7 +406,8 @@ export const createEvent = async (req, res) => {
         if (!PAYMENT_GATEWAYS.includes(payment_gateway)) {
             return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
         }
-        if (acceptsManual(payment_gateway) && !paymentQrInput) {
+        // A free event (every category at ₹0) takes no payment, so there is no QR to upload.
+        if (acceptsManual(payment_gateway) && !paymentQrInput && !allCategoriesFree(rest.categories)) {
             return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
         }
 
@@ -564,13 +565,14 @@ export const updateEvent = async (req, res) => {
                 return res.status(400).json({ message: "Payment method must be manual, razorpay or both" });
             }
             const { data: current, error: currentError } = await supabaseAdmin
-                .from('events').select('payment_gateway, payment_qr_image').eq('id', id).maybeSingle();
+                .from('events').select('payment_gateway, payment_qr_image, categories').eq('id', id).maybeSingle();
             if (currentError) throw currentError;
             const nextGateway = normalizePaymentGateway(
                 updates.hasOwnProperty('payment_gateway') ? updates.payment_gateway : current?.payment_gateway
             );
             const nextQr = updates.hasOwnProperty('payment_qr_image') ? updates.payment_qr_image : current?.payment_qr_image;
-            if (acceptsManual(nextGateway) && !nextQr) {
+            const nextCategories = updates.hasOwnProperty('categories') ? updates.categories : current?.categories;
+            if (acceptsManual(nextGateway) && !nextQr && !allCategoriesFree(nextCategories)) {
                 return res.status(400).json({ message: "A payment QR image is required when QR payment is enabled" });
             }
         }

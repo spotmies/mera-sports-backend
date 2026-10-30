@@ -62,7 +62,7 @@ const pickText = (normalizedRow, ...aliases) => {
  * Mirrors STUDENT_FIELDS in the frontend's InstituteDashboard.
  */
 const DIGIT_FIELDS = {
-    aadhaar: { label: "Aadhaar Number", length: 12, required: true },
+    aadhaar: { label: "Aadhaar Number", length: 12 }, // optional, same as the player sign-up form
     mobile: { label: "Mobile", length: 10, allowCountryCode: true },
     pincode: { label: "Pincode", length: 6 },
 };
