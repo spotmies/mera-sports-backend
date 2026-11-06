@@ -533,6 +533,77 @@ export const createEvent = async (req, res) => {
     }
 };
 
+/**
+ * Registrations per category id for one event. A "failed" row is a payment
+ * that never completed, so it does not hold a category. Rejected rows do:
+ * a super admin can verify one later, and it must still find its category.
+ */
+const countRegistrationsByCategory = async (eventId) => {
+    const counts = {};
+    const { data, error } = await supabaseAdmin
+        .from("event_registrations")
+        .select("categories, status")
+        .eq("event_id", eventId)
+        .neq("status", "failed");
+    if (error) throw error;
+    for (const reg of data || []) {
+        const cats = Array.isArray(reg.categories) ? reg.categories : reg.categories ? [reg.categories] : [];
+        for (const cat of cats) {
+            const catId = cat && typeof cat === "object" ? String(cat.id ?? "") : "";
+            if (catId) counts[catId] = (counts[catId] || 0) + 1;
+        }
+    }
+    return counts;
+};
+
+const categoryLabel = (cat) =>
+    [cat?.category || cat?.name || "Category", cat?.gender, cat?.matchType].filter(Boolean).join(" · ");
+
+/**
+ * Refusal when a save would drop a category that still has registrations.
+ *
+ * Registrations, draws, leagues and matches all point at a category by its id.
+ * Dropping the category (deleting it in Edit Event, or a stale edit form that
+ * never had it) left those registrations pointing at nothing: the player kept
+ * showing as registered and paid, but never appeared in the category's draws.
+ * Saves are checked here, server-side, so no client or race can get past it.
+ */
+export const categoryRemovalRefusal = async (eventId, nextCategories) => {
+    const { data: current, error } = await supabaseAdmin
+        .from("events").select("categories").eq("id", eventId).maybeSingle();
+    if (error) throw error;
+    const keep = new Set((Array.isArray(nextCategories) ? nextCategories : [])
+        .map((cat) => String(cat?.id ?? "")).filter(Boolean));
+    const removed = (Array.isArray(current?.categories) ? current.categories : [])
+        .filter((cat) => cat?.id !== undefined && cat?.id !== null && !keep.has(String(cat.id)));
+    if (removed.length === 0) return null;
+
+    const counts = await countRegistrationsByCategory(eventId);
+    const blocked = removed
+        .filter((cat) => counts[String(cat.id)] > 0)
+        .map((cat) => ({ id: String(cat.id), label: categoryLabel(cat), registrations: counts[String(cat.id)] }));
+    if (blocked.length === 0) return null;
+
+    return {
+        success: false,
+        code: "CATEGORY_HAS_REGISTRATIONS",
+        message: `Cannot remove ${blocked.map((b) => `"${b.label}" (${b.registrations} registration${b.registrations === 1 ? "" : "s"})`).join(", ")}. `
+            + "Players are registered in it. Close its registration instead, or move those players to another category first.",
+        categories: blocked,
+    };
+};
+
+// GET /api/events/:id/category-registrations — { counts: { [categoryId]: n } }
+// Lets Edit Event show which categories hold registrations before a delete.
+export const getCategoryRegistrationCounts = async (req, res) => {
+    try {
+        res.json({ success: true, counts: await countRegistrationsByCategory(req.params.id) });
+    } catch (err) {
+        console.error("Category registration counts error:", err);
+        res.status(500).json({ success: false, message: "Failed to load registration counts" });
+    }
+};
+
 // PUT /api/events/:id
 export const updateEvent = async (req, res) => {
     try {
@@ -633,6 +704,11 @@ export const updateEvent = async (req, res) => {
 
         if (Object.keys(updates).length === 0) {
             return res.status(400).json({ message: "Nothing in this request can be changed by you" });
+        }
+
+        if (updates.hasOwnProperty('categories')) {
+            const refusal = await categoryRemovalRefusal(id, updates.categories);
+            if (refusal) return res.status(409).json(refusal);
         }
 
         const { data, error } = await supabaseAdmin.from('events').update(updates).eq('id', id).select().single();

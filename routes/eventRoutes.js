@@ -3,6 +3,7 @@ import express from "express";
 import {
     createEvent,
     deleteEvent,
+    getCategoryRegistrationCounts,
     getEventBrackets,
     getEventDetails,
     getEventSponsors,
@@ -22,7 +23,8 @@ const router = express.Router();
 router.post('/create', verifyAdmin, createEvent);
 router.get('/list', cacheRoute('events-list', 20), listEvents);
 router.get('/:id', getEventDetails);
-router.get('/:id/brackets', cacheRoute('brackets', 60), getEventBrackets);
+router.get('/:id/category-registrations', verifyAdmin, eventAccess, getCategoryRegistrationCounts);
+router.get('/:id/brackets',cacheRoute('brackets', 60), getEventBrackets);
 router.get('/:id/matches', getPublicMatches); // Public scoreboard endpoint
 router.get('/:id/sponsors', cacheRoute('sponsors', 60), getEventSponsors);
 router.patch('/:id/categories/:categoryId/registration', verifyAdmin, eventAccess, setCategoryRegistrationStatus);
