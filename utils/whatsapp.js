@@ -47,6 +47,15 @@ const sanitizeParam = (value) =>
 
 const textParam = (value) => ({ type: 'text', text: sanitizeParam(value) });
 
+// HEADER text params are stricter than body params: Meta also rejects emoji and
+// the WhatsApp formatting characters (* _ ~ `) there, failing every send with
+// 132007 "Format character policy violated". Seen on PROD 3 Nov 2026 with the
+// title "🏓 **Zenith Sports Fest 2026 – Table Tennis**". Body params allow both,
+// so this is applied to the header only.
+const HEADER_FORBIDDEN = /[\p{Extended_Pictographic}\p{Regional_Indicator}\u{1F3FB}-\u{1F3FF}‍︎️⃣*_~`]/gu;
+export const sanitizeHeaderParam = (value) =>
+    sanitizeParam(String(value ?? '').replace(HEADER_FORBIDDEN, ' '));
+
 /**
  * Send a template message via the WhatsApp Cloud API
  * @param {string} mobile - Recipient number (10-digit Indian or 91-prefixed)
@@ -269,7 +278,7 @@ export const BROADCAST_TITLE_MAX = 60;
  * @param {string} recipientName
  */
 export const renderBroadcastPreview = ({ title, message }, recipientName = 'Player') => ({
-    header: sanitizeParam(title).slice(0, BROADCAST_TITLE_MAX),
+    header: sanitizeHeaderParam(title).slice(0, BROADCAST_TITLE_MAX),
     body: `Hi ${sanitizeParam(recipientName)},\n\n${sanitizeParam(message).slice(0, BROADCAST_MESSAGE_MAX)}\n\nOpen the Sports Paramount app for full details.`,
     footer: 'Sports Paramount',
 });
@@ -304,7 +313,7 @@ export const sendBroadcastWhatsApp = (mobile, { title, message, imageUrl } = {},
     }
 
     return sendWhatsAppTemplateDetailed(mobile, TEMPLATES.broadcast, [
-        { type: 'header', parameters: [textParam(String(title ?? '').slice(0, BROADCAST_TITLE_MAX))] },
+        { type: 'header', parameters: [{ type: 'text', text: sanitizeHeaderParam(title).slice(0, BROADCAST_TITLE_MAX) || '-' }] },
         { type: 'body', parameters: bodyParams },
     ]);
 };
