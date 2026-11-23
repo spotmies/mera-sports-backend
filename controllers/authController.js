@@ -3,6 +3,7 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { supabaseAdmin } from "../config/supabaseClient.js";
 import { calculateAge, resolveAge } from "../utils/age.js";
+import { INDIAN_MOBILE_MESSAGE, cleanMobileDigits, normalizeIndianMobile } from "../utils/phone.js";
 import { getFamilyUsers, STORED_RELATION } from "../utils/family.js";
 import { createNotification } from "../services/notificationService.js";
 import {
@@ -469,7 +470,8 @@ export const verifyRegistrationOtp = async (req, res) => {
 
 export const sendMobileRegistrationOtp = async (req, res) => {
     try {
-        const { mobile } = req.body;
+        const mobile = normalizeIndianMobile(req.body.mobile);
+        if (!mobile) return res.status(400).json({ success: false, message: INDIAN_MOBILE_MESSAGE });
         const result = await sendMobileOtp(mobile);
         res.json({ success: true, sessionId: result.sessionId, message: "OTP sent to mobile" });
     } catch (err) {
@@ -510,7 +512,8 @@ export const verifyMobileRegistrationOtp = async (req, res) => {
 
 export const checkUserConflict = async (req, res) => {
     try {
-        const { mobile, email, aadhaar, dob } = req.body;
+        const { email, aadhaar, dob } = req.body;
+        const mobile = cleanMobileDigits(req.body.mobile);
         if (!mobile) {
             return res.status(400).json({ message: "Mobile is required for check." });
         }
@@ -698,7 +701,7 @@ const joinMobileFamily = async (newcomer, onNumber) => {
 export const registerPlayer = async (req, res) => {
     try {
         const {
-            firstName, lastName, mobile, email, dob,
+            firstName, lastName, mobile: rawMobile, email, dob,
             apartment, street, flatBuildingWing, tshirtSize, city, state, pincode, country,
             aadhaar, schoolDetails, photos, isVerified, gender
         } = req.body;
@@ -706,13 +709,17 @@ export const registerPlayer = async (req, res) => {
         const missing = [];
         if (!firstName) missing.push("First Name");
         if (!lastName) missing.push("Last Name");
-        if (!mobile) missing.push("Mobile");
+        if (!rawMobile) missing.push("Mobile");
         if (!dob) missing.push("Date of Birth");
         if (!gender) missing.push("Gender");
 
         if (missing.length > 0) {
             return res.status(400).json({ message: `Missing required fields: ${missing.join(', ')}` });
         }
+        // Stored as the bare 10 digits whatever the person typed (+91, spaces...).
+        const mobile = normalizeIndianMobile(rawMobile);
+        if (!mobile) return res.status(400).json({ message: INDIAN_MOBILE_MESSAGE });
+
         // The signup form offers Male / Female; category eligibility matches on it.
         const normalizedGender = normalizeGender(gender);
         if (!normalizedGender) {
@@ -1220,7 +1227,7 @@ export const registerInstitute = async (req, res) => {
         // produce an account nobody can ever sign in to.
         const instituteName = String(raw.instituteName || "").trim();
         const email = String(raw.email || "").trim();
-        const contactNumber = String(raw.contactNumber || "").replace(/\D/g, "");
+        const contactNumber = normalizeIndianMobile(raw.contactNumber) || "";
         const website = String(raw.website || "").trim();
         const address = String(raw.address || "").trim();
         const password = String(raw.password || "");
@@ -1243,8 +1250,8 @@ export const registerInstitute = async (req, res) => {
             return res.status(400).json({ message: "Please provide a valid email address." });
         }
 
-        if (!/^\d{10}$/.test(contactNumber)) {
-            return res.status(400).json({ message: "Contact number must be exactly 10 digits." });
+        if (!contactNumber) {
+            return res.status(400).json({ message: INDIAN_MOBILE_MESSAGE });
         }
 
         // Was unchecked: registration accepted a 1-character password while

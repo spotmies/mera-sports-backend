@@ -8,6 +8,7 @@ import { calculateAge, resolveAge, withResolvedAge } from "../utils/age.js";
 import { getPublicEventId } from "../utils/eventResolver.js";
 import { isTeamMatchType } from "../utils/registrationRules.js";
 import { getNextPlayerId } from "../utils/playerIdHelper.js";
+import { INDIAN_MOBILE_MESSAGE, cleanMobileDigits, normalizeIndianMobile } from "../utils/phone.js";
 import { uploadBase64 } from "../utils/uploadHelper.js";
 import { cleanFlatBuildingWing, cleanTshirtSize, normalizeGender } from "../utils/playerProfileFields.js";
 import { getFamily, getFamilyUsers, inSameFamily, leaveFamily, STORED_RELATION } from "../utils/family.js";
@@ -242,7 +243,8 @@ const MOBILE_IN_USE_MESSAGE =
 export const checkConflict = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { email, mobile } = req.body;
+        const { email } = req.body;
+        const mobile = cleanMobileDigits(req.body.mobile);
         const { data: currentUser } = await supabaseAdmin.from("users").select("email, mobile").eq("id", userId).maybeSingle();
 
         // Only a field that is actually being changed can conflict. The client sends
@@ -290,10 +292,23 @@ export const checkPassword = async (req, res) => {
 export const updateProfile = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { email, mobile, photos, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country, gender, first_name, last_name } = req.body;
+        const { email, mobile: rawMobile, photos, apartment, street, flat_building_wing, tshirt_size, city, state, pincode, country, gender, first_name, last_name } = req.body;
 
         const { data: currentUser, error: fetchError } = await supabaseAdmin.from("users").select("*").eq("id", userId).maybeSingle();
         if (fetchError || !currentUser) return res.status(404).json({ message: "User not found" });
+
+        // Same 10-digit rule as signup, but only when the number is being CHANGED:
+        // an existing account whose stored number predates the rule can still
+        // save an unrelated edit.
+        let mobile = rawMobile;
+        if (rawMobile) {
+            if (cleanMobileDigits(rawMobile) === currentUser.mobile) {
+                mobile = currentUser.mobile;
+            } else {
+                mobile = normalizeIndianMobile(rawMobile);
+                if (!mobile) return res.status(400).json({ message: INDIAN_MOBILE_MESSAGE });
+            }
+        }
 
         // currentUser.email is null for members added without one; reading
         // .toLowerCase() off it crashed the save the first time they typed one.
