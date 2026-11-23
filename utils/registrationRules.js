@@ -306,11 +306,32 @@ export const resolveBirthYear = (user, currentYear) => {
  */
 export const GENDER_REQUIRED_CODE = "GENDER_REQUIRED";
 
-export const assertPlayerEligible = (user, categoryObjects, who = null) => {
+/**
+ * The year an event's age groups are counted in.
+ *
+ * OPT-IN per event (events.age_by_event_year, set in the admin event form).
+ * Off — every existing event — it is this year, exactly as before. On, it is
+ * the year of the event's start date, so "Under 12" means the same thing
+ * whether the player registers in December or January.
+ * Read straight off the YYYY-MM-DD text, not through Date, so a timezone shift
+ * can never move 1 Jan into the previous year. An unreadable start date also
+ * falls back to this year.
+ */
+export const eventAgeYear = (event, fallbackYear = new Date().getFullYear()) => {
+    if (event?.age_by_event_year !== true) return fallbackYear;
+    const match = /^(\d{4})-\d{2}-\d{2}/.exec(String(event?.start_date ?? ""));
+    const year = match ? Number.parseInt(match[1], 10) : NaN;
+    return Number.isFinite(year) && year >= 1900 ? year : fallbackYear;
+};
+
+export const assertPlayerEligible = (user, categoryObjects, who = null, ageYear = new Date().getFullYear()) => {
     const normalized = normalizeGender(user?.gender);
     const playerGender = normalized ? normalized.toLowerCase() : "";
-    const currentYear = new Date().getFullYear();
-    const birthYear = resolveBirthYear(user, currentYear);
+    // A stored age (no date of birth on file) is "age today", so the birth year
+    // it implies is worked out from TODAY's year; only the category limits use
+    // the event's year.
+    const birthYear = resolveBirthYear(user, new Date().getFullYear());
+    const currentYear = ageYear;
     const subject = who ? `${who} is` : "You are";
 
     if (!playerGender && categoryObjects.length > 0) {
@@ -337,12 +358,12 @@ export const assertPlayerEligible = (user, categoryObjects, who = null) => {
 
         // Event categories (normalizeEventCategories) carry their resolved rule.
         const { ageLimit, minAge } = cat.ageRules ?? parseCategoryAgeRules(cat.name);
-        // "Under 9" is strictly under 9 — the player must not turn 9 this year,
-        // so the earliest allowed birth year is (currentYear - ageLimit + 1).
-        // In 2026: U-9 => 2018, U-12 => 2015, U-15 => 2012.
+                // "Under 9" is strictly under 9 — the player must not turn 9 in the
+        // event's year, so the earliest allowed birth year is
+        // (event year - ageLimit + 1). For a 2026 event: U-9 => 2018, U-12 => 2015.
         if (ageLimit !== undefined && birthYear < currentYear - ageLimit + 1) {
             throw badRequest(
-                `${subject} not eligible for "${cat.name}" — born ${currentYear - ageLimit + 1} or later required`,
+                `${subject} not eligible for "${cat.name}" — born ${currentYear - ageLimit + 1} or later required (age is counted in ${currentYear}, the event year)`,
                 extra.code, extra
             );
         }
@@ -616,7 +637,8 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
     }
 
     assertCategoriesOpen(event, resolved.map((r) => r.cat.id));
-    assertPlayerEligible(payingUser, resolved.map((r) => r.cat));
+    const ageYear = eventAgeYear(event);
+    assertPlayerEligible(payingUser, resolved.map((r) => r.cat), null, ageYear);
 
     // Teams: existence, captaincy, roster.
     const teamIds = [...new Set(resolved.map((r) => r.teamId).filter(Boolean))];
@@ -687,7 +709,7 @@ export const validateRegistrationEntries = async ({ event, userId, payingUser, e
         if (max !== null && size > max) throw badRequest(`"${categoryLabel(r.cat)}" allows at most ${max} players including you. "${team.team_name}" has ${size}.`, "TEAM_SIZE", extra);
 
         for (const { member, user } of roster) {
-            assertPlayerEligible(user, [r.cat], memberDisplay(member, user));
+            assertPlayerEligible(user, [r.cat], memberDisplay(member, user), ageYear);
         }
         r.team = team;
         r.roster = roster;

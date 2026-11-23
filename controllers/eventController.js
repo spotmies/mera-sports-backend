@@ -70,6 +70,8 @@ const EVENT_EDITABLE_FIELDS = [
     "registration_message",
     // Limit every player to one category of the event (registrationRules.js).
     "single_category_only",
+    // Count age groups in the event's year instead of the registration year (registrationRules.eventAgeYear).
+    "age_by_event_year",
 ];
 // Who runs an event and its lifecycle status are the superadmin's call.
 const SUPERADMIN_ONLY_EVENT_FIELDS = ["assigned_admin_ids", "assigned_to", "status"];
@@ -344,6 +346,7 @@ export const getEventDetails = async (req, res) => {
         eventData.registration_message = eventData.registration_message || null;
         // Events from before the column existed read as "off".
         eventData.single_category_only = eventData.single_category_only === true;
+        eventData.age_by_event_year = eventData.age_by_event_year === true;
         eventData.allowed_institute_names = normalizeInstituteNames(eventData.allowed_institute_names);
         try {
             eventData.allowed_communities = eventData.community_restrictions_enabled
@@ -444,6 +447,9 @@ export const createEvent = async (req, res) => {
         }
         if (Object.prototype.hasOwnProperty.call(pickedFields, "single_category_only")) {
             pickedFields.single_category_only = pickedFields.single_category_only === true;
+        }
+        if (Object.prototype.hasOwnProperty.call(pickedFields, "age_by_event_year")) {
+            pickedFields.age_by_event_year = pickedFields.age_by_event_year === true;
         }
         const communityError = await applyCommunityRestriction(pickedFields);
         if (communityError) return res.status(400).json({ message: communityError });
@@ -621,6 +627,9 @@ export const updateEvent = async (req, res) => {
         }
         if (updates.hasOwnProperty('single_category_only')) {
             updates.single_category_only = updates.single_category_only === true;
+        }
+        if (updates.hasOwnProperty('age_by_event_year')) {
+            updates.age_by_event_year = updates.age_by_event_year === true;
         }
         const touchesCommunity = ['community_restrictions_enabled', 'allowed_community_ids', 'allowed_community_names', 'allowed_institute_names'].some((k) => updates.hasOwnProperty(k));
         let currentCommunity = null;
