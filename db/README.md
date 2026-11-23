@@ -27,9 +27,15 @@ on every Railway deploy (QA and PROD) as the **pre-deploy command**.
 - `MIGRATION_DATABASE_URL` — the database OWNER (`postgres`) connection.
   The app's PostgREST role cannot change tables.
 - Railway (each environment): backend service → Variables →
-  `MIGRATION_DATABASE_URL = ${{Postgres.DATABASE_URL}}`
-  and Settings → Deploy → Pre-deploy command: `npm run db:migrate:deploy`.
+  `MIGRATION_DATABASE_URL = ${{Postgres.DATABASE_URL}}`. That is all: migrations
+  run from the Dockerfile start command, no Pre-deploy setting needed.
+  (If one is set, it is harmless: a lock and the tracking table stop a double run.)
 - Local: put the same variable in `.env` (use the Postgres PUBLIC url).
+
+A migration problem (missing variable, unreachable database, failed file) is
+printed in the deploy log with a ❌ line, and the server starts anyway so a
+working site is never taken down. The failed file is rolled back whole and
+retried on the next start.
 
 Applied files are recorded in `ops.schema_migrations`. A change applied locally
 (local dev uses the QA database) is skipped when QA deploys, and vice versa.

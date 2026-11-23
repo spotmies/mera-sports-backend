@@ -15,4 +15,9 @@ COPY . .
 
 # Railway sets PORT; server.js reads it.
 EXPOSE 5000
-CMD ["node", "server.js"]
+
+# Apply pending database migrations, then start the server. `--soft` means a
+# migration problem is logged loudly but never stops the server from starting
+# (see db/migrate.mjs). `exec` keeps node as PID 1 so Railway's stop signal
+# still reaches it.
+CMD ["sh", "-c", "node db/migrate.mjs --soft; exec node server.js"]
