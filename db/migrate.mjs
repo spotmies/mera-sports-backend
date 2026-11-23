@@ -1,12 +1,16 @@
 // Database migration runner — the same command on local, QA and PROD.
 //
 //   npm run db:migrate           apply every pending migration in db/migrations
+//   node db/migrate.mjs --soft   same, but NEVER blocks the app from starting
 //   npm run db:migrate:status    list applied / pending, change nothing
 //   node db/migrate.mjs --dry-run   same as status (kept for habit)
 //
-// On Railway it runs as the service's PRE-DEPLOY COMMAND, before the new
-// version starts. If a migration fails the deploy fails and the running
-// version stays up — users never see a half-migrated app.
+// On Railway it runs from the Dockerfile start command (`--soft`), just before
+// the server starts — nothing to configure in the Railway UI except the
+// MIGRATION_DATABASE_URL variable. In --soft mode a missing variable, an
+// unreachable database or a failed migration is reported loudly in the log but
+// the server still starts, so a migration problem can never take a working
+// site down. (A failed file is rolled back whole; the next start retries it.)
 //
 // How it stays safe
 //   - Applied files are recorded in ops.schema_migrations, so a file runs once
@@ -41,15 +45,17 @@ const FILE_RE = /^\d{12}_[a-z0-9_]+\.sql$/;
 
 const args = new Set(process.argv.slice(2));
 const statusOnly = args.has("--status") || args.has("--dry-run");
+const soft = args.has("--soft");
 
 const url = process.env.MIGRATION_DATABASE_URL;
 if (!url) {
     console.error(
-        "❌ MIGRATION_DATABASE_URL is not set.\n" +
-        "   Set it to the database OWNER connection (Railway Postgres → `postgres` user).\n" +
-        "   The app's own POSTGREST/LOCAL_POSTGRES_URL role cannot run migrations."
+        "❌ MIGRATION_DATABASE_URL is not set — migrations were NOT run." + "\n" +
+        "   Set it to the database OWNER connection (Railway Postgres → `postgres` user)." + "\n" +
+        "   The app's own POSTGREST/LOCAL_POSTGRES_URL role cannot run migrations." +
+        (soft ? "\n   Starting the server anyway." : "")
     );
-    process.exit(1);
+    process.exit(soft ? 0 : 1);
 }
 
 let host = "?";
@@ -75,8 +81,22 @@ const loadFiles = () => {
     });
 };
 
-const client = new pg.Client({ connectionString: url, ssl: useSsl ? { rejectUnauthorized: false } : false });
+const client = new pg.Client({
+    connectionString: url,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
+    // An unreachable database must not hang the start-up.
+    connectionTimeoutMillis: 15000,
+});
 client.on("notice", (msg) => console.log(`   ℹ️  ${msg.message}`));
+
+// Hard stop for start-up: whatever goes wrong, --soft never delays the server
+// by more than this.
+if (soft) {
+    setTimeout(() => {
+        console.error("❌ Migration step took longer than 2 minutes — giving up. Starting the server anyway.");
+        process.exit(0);
+    }, 120000).unref();
+}
 
 let exitCode = 0;
 try {
@@ -85,6 +105,9 @@ try {
     console.log(`Database: ${host}${statusOnly ? "  (status only — nothing will change)" : ""}`);
 
     // One migrator at a time per database. Released when the connection closes.
+    // lock_timeout also bounds this wait, so a second container migrating at the
+    // same moment cannot make the start-up hang.
+    await client.query("set lock_timeout = '30s'");
     await client.query("select pg_advisory_lock($1)", [LOCK_KEY]);
 
     // `ops`, not `public`: PostgREST only exposes public, so this bookkeeping
@@ -177,7 +200,8 @@ try {
     }
 } catch (err) {
     console.error(`❌ Migration stopped: ${err.message}`);
-    exitCode = 1;
+    if (soft) console.error("   Starting the server anyway. Fix the problem and redeploy; the failed file is retried on every start.");
+    exitCode = soft ? 0 : 1;
 } finally {
     await client.end().catch(() => {});
 }
