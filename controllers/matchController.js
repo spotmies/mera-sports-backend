@@ -805,6 +805,16 @@ export const generateLeagueMatches = async (req, res) => {
         const toInsert = [];
 
         if (customMatches && customMatches.length > 0) {
+            // A doubles side of a team tie lists its two players, so each can be credited.
+            const partnersOf = (list) => {
+                if (!Array.isArray(list)) return {};
+                const partners = list
+                    .slice(0, 2)
+                    .filter((p) => p && p.id && p.name)
+                    .map((p) => ({ id: String(p.id), name: String(p.name) }));
+                return partners.length === 2 ? { partners } : {};
+            };
+
             // Team League mode: use admin-configured match pairs
             customMatches.forEach((cm) => {
                 const groupKey = cm.group || "A";
@@ -829,14 +839,16 @@ export const generateLeagueMatches = async (req, res) => {
                         name: cm.playerAName || cm.player_a_name || pAId,
                         group: groupKey,
                         ...(cm.teamAId ? { teamId: cm.teamAId, teamName: cm.teamAName || "" } : {}),
-                        ...(teamMatchupId ? { teamMatchupId, matchNumber: matchNum } : {})
+                        ...(teamMatchupId ? { teamMatchupId, matchNumber: matchNum } : {}),
+                        ...partnersOf(cm.partnersA)
                     },
                     player_b: {
                         id: pBId,
                         name: cm.playerBName || cm.player_b_name || pBId,
                         group: groupKey,
                         ...(cm.teamBId ? { teamId: cm.teamBId, teamName: cm.teamBName || "" } : {}),
-                        ...(teamMatchupId ? { teamMatchupId, matchNumber: matchNum } : {})
+                        ...(teamMatchupId ? { teamMatchupId, matchNumber: matchNum } : {}),
+                        ...partnersOf(cm.partnersB)
                     },
                     status: 'SCHEDULED',
                     score: null,
