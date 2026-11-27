@@ -3847,6 +3847,75 @@ export const recordResult = async (req, res) => {
     }
 };
 
+// Doubles pairs the admin made from singles players: one bracket entrant, id "pair_…",
+// with the two players listed in its `members`. The id itself belongs to no user.
+const isAdminPairId = (id) => String(id ?? "").startsWith("pair_");
+
+/**
+ * The players behind each winning pair, as user ids that can receive notifications.
+ * Members are read from the saved draw and carry either a user uuid or a player code.
+ *
+ * @returns {Promise<Map<string, Array<{ userId: string, partnerName: string }>>>}
+ */
+const resolvePairRecipients = async (eventId, categoryId, categoryLabel, pairIds) => {
+    const wanted = new Set(pairIds);
+    const membersByPair = new Map();
+    const collect = (entrant) => {
+        const id = String(entrant?.id ?? "");
+        if (!wanted.has(id) || membersByPair.has(id)) return;
+        if (Array.isArray(entrant.members) && entrant.members.length > 0) {
+            membersByPair.set(id, entrant.members);
+        }
+    };
+
+    const rows = await fetchCategoryBracketRows(eventId, categoryId, categoryLabel, { mode: "BRACKET" });
+    const bracketData = rows?.[0]?.bracket_data || {};
+    (bracketData.players || []).forEach(collect);
+    (bracketData.rounds || []).forEach((round) => {
+        (round?.matches || []).forEach((match) => {
+            collect(match?.player1);
+            collect(match?.player2);
+        });
+    });
+
+    const codes = Array.from(new Set(
+        Array.from(membersByPair.values())
+            .flat()
+            .map((member) => String(member?.id ?? "").trim())
+            .filter((id) => id && !isUuid(id))
+    ));
+    const userIdByCode = new Map();
+    if (codes.length > 0) {
+        const { data: users, error } = await supabaseAdmin
+            .from("users")
+            .select("id, player_id")
+            .in("player_id", codes);
+        if (error) throw error;
+        (users || []).forEach((user) => userIdByCode.set(String(user.player_id), user.id));
+    }
+
+    const recipients = new Map();
+    membersByPair.forEach((members, pairId) => {
+        const list = [];
+        members.forEach((member) => {
+            const memberId = String(member?.id ?? "").trim();
+            const userId = isUuid(memberId) ? memberId : userIdByCode.get(memberId);
+            if (!userId) {
+                console.warn(`[notifyBracketPromotions] No user found for pair member: ${memberId}`);
+                return;
+            }
+            const partnerName = members
+                .filter((other) => other !== member)
+                .map((other) => String(other?.name || "").trim())
+                .filter(Boolean)
+                .join(", ");
+            list.push({ userId, partnerName });
+        });
+        recipients.set(pairId, list);
+    });
+    return recipients;
+};
+
 /**
  * Send promotion notifications to winning players
  * POST /api/admin/events/:id/categories/:categoryId/bracket/notify-promotions
@@ -3902,34 +3971,28 @@ export const notifyBracketPromotions = async (req, res) => {
             return { player1: p1, player2: p2 };
         };
 
-        // For each promotion, look up the player's registered user id in event_registrations.
-        // NOTE: In this schema, `player_id` stores the user UUID (there is no `user_id` column).
-        const notificationPromises = promotions.map(async (promotion) => {
+        const winningPairIds = promotions
+            .map((promotion) => String(promotion?.winnerId ?? ""))
+            .filter(isAdminPairId);
+        // A failed pair lookup must not stop the other winners from being notified.
+        let pairRecipients = new Map();
+        if (winningPairIds.length > 0) {
             try {
-                const { winnerId, winnerName, opponentName, score, winnerIsPlayer1 } = promotion;
-                if (!winnerId) {
-                    return { status: "skipped" };
-                }
+                pairRecipients = await resolvePairRecipients(
+                    eventId,
+                    categoryId || req.body?.categoryId,
+                    categoryLabel,
+                    winningPairIds
+                );
+            } catch (err) {
+                console.error("[notifyBracketPromotions] Pair member lookup failed:", err);
+            }
+        }
 
-                // Look up player_id from event_registrations (acts as user id for notifications)
-                const { data: registration, error: regError } = await supabaseAdmin
-                    .from("event_registrations")
-                    .select("player_id")
-                    .eq("event_id", eventId)
-                    .eq("player_id", winnerId)
-                    .order("created_at", { ascending: false })
-                    .limit(1)
-                    .maybeSingle();
-
-                if (regError) {
-                    console.error(`[notifyBracketPromotions] Lookup error for player ${winnerId}:`, regError);
-                }
-
-                const userId = registration?.player_id || winnerId;
-                if (!userId) {
-                    return { status: "skipped" };
-                }
-
+        // Deliver one winner's message to one user, once.
+        const notifyUser = async (promotion, userId, partnerName) => {
+            try {
+                const { winnerId, opponentName, score, winnerIsPlayer1 } = promotion;
                 const normalizedScore = extractScores(score);
                 const yourScore = winnerIsPlayer1 ? normalizedScore.player1 : normalizedScore.player2;
                 const opponentScore = winnerIsPlayer1 ? normalizedScore.player2 : normalizedScore.player1;
@@ -3938,7 +4001,8 @@ export const notifyBracketPromotions = async (req, res) => {
                     : "N/A";
 
                 const title = `🏆 You're Promoted to the ${nextRoundName}!`;
-                const message = `You won your ${completedRoundName} match against ${opponentName} with a score of ${scoreText}. Get ready for the ${nextRoundName}!`;
+                const winnerText = partnerName ? `You and ${partnerName} won your` : "You won your";
+                const message = `${winnerText} ${completedRoundName} match against ${opponentName} with a score of ${scoreText}. Get ready for the ${nextRoundName}!`;
 
                 const categoryKey = categoryId || categoryLabel || "unknown-category";
                 const dedupeLink = `promotion:${eventId}:${categoryKey}:${completedRoundName}:${nextRoundName}:${winnerId}`;
@@ -3965,12 +4029,51 @@ export const notifyBracketPromotions = async (req, res) => {
                 console.error("[notifyBracketPromotions] Error creating notification:", err);
                 return { status: "error" };
             }
+        };
+
+        // For each promotion, work out who receives it: both partners of a pair, otherwise
+        // the winner looked up in event_registrations.
+        // NOTE: In this schema, `player_id` stores the user UUID (there is no `user_id` column).
+        const notificationPromises = promotions.map(async (promotion) => {
+            try {
+                const { winnerId } = promotion;
+                if (!winnerId) {
+                    return [{ status: "skipped" }];
+                }
+
+                if (isAdminPairId(winnerId)) {
+                    const partners = pairRecipients.get(String(winnerId)) || [];
+                    return Promise.all(
+                        partners.map(({ userId, partnerName }) => notifyUser(promotion, userId, partnerName))
+                    );
+                }
+
+                // Look up player_id from event_registrations (acts as user id for notifications)
+                const { data: registration, error: regError } = await supabaseAdmin
+                    .from("event_registrations")
+                    .select("player_id")
+                    .eq("event_id", eventId)
+                    .eq("player_id", winnerId)
+                    .order("created_at", { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                if (regError) {
+                    console.error(`[notifyBracketPromotions] Lookup error for player ${winnerId}:`, regError);
+                }
+
+                const userId = registration?.player_id || winnerId;
+                return [await notifyUser(promotion, userId)];
+            } catch (err) {
+                console.error("[notifyBracketPromotions] Error creating notification:", err);
+                return [{ status: "error" }];
+            }
         });
 
         const results = await Promise.allSettled(notificationPromises);
         const fulfilled = results
             .filter((r) => r.status === "fulfilled")
-            .map((r) => r.value || {});
+            .flatMap((r) => r.value || []);
 
         const notified = fulfilled.filter((r) => r.status === "sent").length;
         const duplicates = fulfilled.filter((r) => r.status === "duplicate").length;
